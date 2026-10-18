@@ -142,12 +142,13 @@ impl GpuRenderer {
     }
 
     async fn new_async(scenes: &[Scene4D]) -> Result<Self, String> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::default();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: None,
+                apply_limit_buckets: false,
             })
             .await
             .map_err(|e| format!("no GPU adapter: {e}"))?;
