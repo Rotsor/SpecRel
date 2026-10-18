@@ -57,13 +57,13 @@ impl Camera4D {
     }
 }
 
-/// Controls how rays slice 4D Minkowski spacetime from the camera event `O^mu`.
+/// Controls how rays view 4D Minkowski spacetime from the camera event `O^mu`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SliceMode {
-    /// True relativistic past light-cone (`ds^2 = 0`): `k^mu = -e_0 + n^a e_a`.
+pub enum ViewMode {
+    /// Real camera: True relativistic past light-cone (`ds^2 = 0`): `k^mu = -e_0 + n^a e_a`.
     /// Includes both Lorentz geometry and finite speed-of-light delay (Terrell-Penrose rotation & aberration).
     PastLightCone,
-    /// Instantaneous 3D hyperplane of simultaneity in the CAMERA'S boosted rest frame (`dt' = 0`):
+    /// God's eye: Instantaneous 3D hyperplane of simultaneity in the CAMERA'S boosted rest frame (`dt' = 0`):
     /// `<X - O, u_cam>_eta = 0`, i.e., `k^mu = n^1 e_1 + n^2 e_2 + n^3 e_3`.
     /// Strips away light-travel delay in the camera's own frame so you see pure Lorentz contraction
     /// and simultaneity as defined by the camera's current velocity!
@@ -71,7 +71,10 @@ pub enum SliceMode {
     CameraSimultaneity,
 }
 
-impl SliceMode {
+/// Backwards-compatible alias for [`ViewMode`].
+pub type SliceMode = ViewMode;
+
+impl ViewMode {
     pub fn next(self) -> Self {
         match self {
             Self::PastLightCone => Self::CameraSimultaneity,
@@ -81,8 +84,8 @@ impl SliceMode {
 
     pub fn name(self) -> &'static str {
         match self {
-            Self::PastLightCone => "PAST LIGHT-CONE (DS2=0)",
-            Self::CameraSimultaneity => "CAMERA SLICE (DT'=0)",
+            Self::PastLightCone => "REAL CAMERA (DS2=0)",
+            Self::CameraSimultaneity => "GOD'S EYE (DT'=0)",
         }
     }
 }

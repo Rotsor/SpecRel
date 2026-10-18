@@ -7,10 +7,10 @@ pub mod renderer;
 pub mod scene;
 
 use gpu::GpuRenderer;
-use hud::{draw_text, fill_rect_alpha};
+use hud::{draw_text_scaled, fill_rect_alpha};
 use minkowski::{Vec3, Vec4};
 use minifb::{Key, KeyRepeat, Window, WindowOptions};
-use renderer::{render_frame, Camera4D, RenderConfig, RenderMode, ShadowMode, SliceMode};
+use renderer::{render_frame, Camera4D, RenderConfig, RenderMode, ShadowMode, ViewMode};
 use scene::{DemoScene, Scene4D};
 use std::time::Instant;
 
@@ -84,7 +84,7 @@ fn main() {
         height: HEIGHT,
         mode: RenderMode::RelativisticShaded,
         shadow_mode: ShadowMode::LorentzInvariant,
-        slice_mode: SliceMode::PastLightCone,
+        slice_mode: ViewMode::PastLightCone,
     };
 
     let mut framebuffer = vec![0u32; WIDTH * HEIGHT];
@@ -142,6 +142,11 @@ fn main() {
         }
         return;
     }
+
+    let mut res_scale: usize = if use_gpu { 2 } else { 1 };
+    cfg.width = WIDTH * res_scale;
+    cfg.height = HEIGHT * res_scale;
+    framebuffer.resize(cfg.width * cfg.height, 0);
 
     let mut window = Window::new(
         "SpecRel 4D - Special Relativistic Spacetime Raytracer (Keys 1-5: Switch Paradox Scene)",
@@ -226,6 +231,18 @@ fn main() {
         }
         if window.is_key_pressed(Key::F, KeyRepeat::No) && gpu.is_some() {
             use_gpu = !use_gpu;
+            res_scale = if use_gpu { 2 } else { 1 };
+            cfg.width = WIDTH * res_scale;
+            cfg.height = HEIGHT * res_scale;
+            framebuffer.resize(cfg.width * cfg.height, 0);
+        }
+        if window.is_key_pressed(Key::Z, KeyRepeat::No)
+            || window.is_key_pressed(Key::Y, KeyRepeat::No)
+        {
+            res_scale = if res_scale == 1 { 2 } else { 1 };
+            cfg.width = WIDTH * res_scale;
+            cfg.height = HEIGHT * res_scale;
+            framebuffer.resize(cfg.width * cfg.height, 0);
         }
         if window.is_key_pressed(Key::R, KeyRepeat::No) {
             camera = Camera4D::new(scene.demo.initial_camera_pos(), 65.0);
@@ -378,7 +395,7 @@ fn main() {
         }
 
         window
-            .update_with_buffer(&framebuffer, WIDTH, HEIGHT)
+            .update_with_buffer(&framebuffer, cfg.width, cfg.height)
             .expect("Failed to update window buffer");
     }
 }
@@ -394,7 +411,9 @@ fn draw_hud(
     fps: f32,
     backend: &str,
 ) {
-    fill_rect_alpha(fb, WIDTH, HEIGHT, 12, 12, 1140, 200);
+    let s = (cfg.width / WIDTH).max(1);
+    let box_w = (cfg.width - 24 * s).min(1240 * s);
+    fill_rect_alpha(fb, cfg.width, cfg.height, 12 * s, 12 * s, box_w, 200 * s);
 
     let beta = camera.tetrad.beta();
     let speed = beta.length();
@@ -421,11 +440,11 @@ fn draw_hud(
         time_status
     );
     let line2 = format!(
-        "OBS 3-VEL: ({:+5.3}, {:+5.3}, {:+5.3})  |V|: {:5.3}C  GAMMA: {:6.3}  FPS: {:4.0} [F] {}",
-        beta.x, beta.y, beta.z, speed, gamma, fps, backend
+        "OBS 3-VEL: ({:+5.3}, {:+5.3}, {:+5.3})  |V|: {:5.3}C  GAMMA: {:6.3}  FPS: {:4.0} [F] {}  RES: {}x{} [Z]",
+        beta.x, beta.y, beta.z, speed, gamma, fps, backend, cfg.width, cfg.height
     );
     let line3 = format!(
-        "MODE [M]: {} | SLICE [G]: {} | SHADOWS [H]: {}",
+        "MODE [M]: {} | VIEW [G]: {} | SHADOWS [H]: {}",
         cfg.mode.name(),
         cfg.slice_mode.name(),
         cfg.shadow_mode.name(),
@@ -435,11 +454,12 @@ fn draw_hud(
     let line5 =
         "THRUST: WASD/SPC/C | MATCH VEL: [V] | BRAKE: [X] | LOOK: ARROWS/QE | MOVE: IJKL/UO";
 
-    draw_text(fb, WIDTH, HEIGHT, 22, 22, &line_scene, 0xFF9944);
-    draw_text(fb, WIDTH, HEIGHT, 22, 46, line_desc, 0xFFD980);
-    draw_text(fb, WIDTH, HEIGHT, 22, 74, &line1, 0xFFE866);
-    draw_text(fb, WIDTH, HEIGHT, 22, 98, &line2, 0x66F2FF);
-    draw_text(fb, WIDTH, HEIGHT, 22, 122, &line3, 0xA8FF80);
-    draw_text(fb, WIDTH, HEIGHT, 22, 148, line4, 0xDDDDDD);
-    draw_text(fb, WIDTH, HEIGHT, 22, 174, line5, 0xAAAAAA);
+    let text_scale = 2 * s;
+    draw_text_scaled(fb, cfg.width, cfg.height, 22 * s, 22 * s, &line_scene, 0xFF9944, text_scale);
+    draw_text_scaled(fb, cfg.width, cfg.height, 22 * s, 46 * s, line_desc, 0xFFD980, text_scale);
+    draw_text_scaled(fb, cfg.width, cfg.height, 22 * s, 74 * s, &line1, 0xFFE866, text_scale);
+    draw_text_scaled(fb, cfg.width, cfg.height, 22 * s, 98 * s, &line2, 0x66F2FF, text_scale);
+    draw_text_scaled(fb, cfg.width, cfg.height, 22 * s, 122 * s, &line3, 0xA8FF80, text_scale);
+    draw_text_scaled(fb, cfg.width, cfg.height, 22 * s, 148 * s, line4, 0xDDDDDD, text_scale);
+    draw_text_scaled(fb, cfg.width, cfg.height, 22 * s, 174 * s, line5, 0xAAAAAA, text_scale);
 }

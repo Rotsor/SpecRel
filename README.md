@@ -26,8 +26,8 @@ Every relativistic optical and geometric phenomenon—**time dilation**, **Loren
   * Achieves **~1.5–2.0 ms per frame** at 1280x800 resolution (over **500 FPS**, a **17x–39x speedup** over multithreaded CPU rendering).
   * Automatically detects and uses the GPU backend by default, falling back gracefully to the multithreaded CPU reference renderer if no compatible adapter is found.
   * The CPU path remains an exact **reference renderer** with automated bit-level image comparison tests ensuring pixel-accurate cross-backend consistency.
-* **Interactive Spacetime Slicing & Shadow Modes**:
-  * Toggle between **Past Light-Cone ($ds^2 = 0$)** (what a physical camera sees) and **Camera Simultaneity Slice ($dt' = 0$)** (an instantaneous 3D slice across the observer's current Lorentz frame $\langle X - O, u_{\text{cam}} \rangle_\eta = 0$).
+* **Interactive Spacetime View & Shadow Modes**:
+  * Toggle between **Real Camera ($ds^2 = 0$)** (what a physical camera sees down the past light-cone) and **God's Eye ($dt' = 0$)** (an instantaneous 3D simultaneity slice across the observer's current Lorentz frame $\langle X - O, u_{\text{cam}} \rangle_\eta = 0$).
   * Cycle between **Lorentz-Invariant Null Shadows** ($t_{\text{emit}} = t_{\text{hit}} - \|\mathbf{x}_L - \mathbf{x}_{\text{hit}}\|$), **Camera-Slice Faked Shadows** ($\langle X_{\text{emit}} - X_{\text{hit}}, u_{\text{cam}} \rangle_\eta = 0$), and **Shadows Off**.
 
 ---
@@ -40,7 +40,7 @@ Switch scenes at any time with keys **`1`–`5`** or **`N` / `B`**:
    * Two twins start synchronized ($\tau = 0$) at $t = -14\text{s}$. The right twin executes a smooth relativistic round-trip peaking near $0.94c$ ($\gamma \approx 3$) and parks back next to the stay-at-home twin at $t = +14\text{s}$ with an **$\sim 8\text{s}$ proper-time gap** visible on both their analog/digital dials and their comoving Einstein light clocks. During the high-speed cruise, the traveler's front and rear clock faces also display the Born-rigid proper-time offset ($\Delta\tau = 2 p\,\text{atanh}(\beta) \approx 2\text{s}$) before resynchronizing upon return.
 2. **`[2]` Barn & Pole (Ladder) Paradox ($8\text{m}$ Pole in $5\text{m}$ Barn at $0.85c$)**
    * An $8\text{m}$ rest-length pole (tiled with 8 synchronized comoving clocks) flies at $0.85c$ ($\gamma \approx 1.90$) through a $5\text{m}$ barn.
-   * Pause (`P`) near $t = 0$ and switch to Camera Slice (`G`): in the barn's frame (`X`), the pole is contracted to $4.21\text{m}$ and fits completely inside the barn, with its rear end reading $\beta L_0 = +6.8\text{s}$ ahead of its front end ($+4.84\text{s}$ across a $3\text{m}$ lab separation $\gamma \beta \Delta x$). Press `V` to boost into the pole's rest frame: the pole's clocks all synchronize to $+0.0\text{s}$, the pole stretches back to $8.0\text{m}$, and the barn contracts to $2.63\text{m}$!
+   * Pause (`P`) near $t = 0$ and switch to God's Eye (`G`): in the barn's frame (`X`), the pole is contracted to $4.21\text{m}$ and fits completely inside the barn, with its rear end reading $\beta L_0 = +6.8\text{s}$ ahead of its front end ($+4.84\text{s}$ across a $3\text{m}$ lab separation $\gamma \beta \Delta x$). Press `V` to boost into the pole's rest frame: the pole's clocks all synchronize to $+0.0\text{s}$, the pole stretches back to $8.0\text{m}$, and the barn contracts to $2.63\text{m}$!
 3. **`[3]` Terrell–Penrose Rotation & Penrose Sphere Street**
    * High-speed clock cubes ($0.85c$) fly down a colonnade of stationary reference clocks alongside a relativistic sphere ($0.86c$), an oscillating clock, and an orbiting clock. Demonstrates how light-travel delay rotates the trailing face of a cube into view while a sphere's apparent silhouette remains strictly circular.
 4. **`[4]` Einstein's Train & Platform Synchronization (Relativity of Simultaneity)**
@@ -83,13 +83,14 @@ cargo test --release
 
 | Key | Action |
 | :--- | :--- |
-| **`F`** | Toggle between **GPU Compute** and **CPU Reference** rendering backend in real time |
+| **`F`** | Toggle between **GPU Compute** (defaults to 2X 2560x1600) and **CPU Reference** (1X 1280x800) backend |
+| **`Z`** / **`Y`** | Toggle resolution scale: **1X (1280x800)** vs. **2X (2560x1600)** |
 | **`1` – `5`** / **`N`**, **`B`** | Switch between the 5 Special Relativity demo scenes |
 | **`W` `A` `S` `D`** / **`Space`** / **`C`** | Fire proper-acceleration thrusters (Lorentz boost in local frame) |
 | **`V`** | Toggle velocity match with the scene's moving object (Pole / Train / Traveler) |
 | **`X`** | Brake immediately to the Lab rest frame ($\boldsymbol{\beta} = 0$) |
 | **`Arrow Keys`** / **`Q` `E`** | Rotate local camera look direction (Yaw / Pitch / Roll) |
-| **`G`** | Toggle Spacetime Slice: **Past Light-Cone ($ds^2 = 0$)** vs. **Camera Slice ($dt' = 0$)** |
+| **`G`** | Toggle Spacetime View: **Real Camera ($ds^2 = 0$)** vs. **God's Eye ($dt' = 0$)** |
 | **`H`** | Cycle Shadow Mode: **Lorentz-Invariant (Null)** $\to$ **Camera-Slice Faked** $\to$ **Off** |
 | **`M`** | Cycle Render Mode: **Shaded** $\to$ **Lookback Isochrones** $\to$ **4D Tetrahedral Mesh** |
 | **`P`** | Pause / Resume observer worldline evolution |

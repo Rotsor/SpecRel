@@ -1,3 +1,24 @@
+/// Minimal 5x7 ASCII bitmap font for on-screen telemetry HUD with custom scale.
+pub fn draw_text_scaled(
+    fb: &mut [u32],
+    fb_w: usize,
+    fb_h: usize,
+    x: usize,
+    y: usize,
+    text: &str,
+    color: u32,
+    scale: usize,
+) {
+    let mut cx = x;
+    for ch in text.chars() {
+        if ch == '\n' {
+            continue;
+        }
+        draw_char(fb, fb_w, fb_h, cx, y, ch, color, scale);
+        cx += 6 * scale;
+    }
+}
+
 /// Minimal 5x7 ASCII bitmap font for on-screen telemetry HUD.
 pub fn draw_text(
     fb: &mut [u32],
@@ -9,14 +30,7 @@ pub fn draw_text(
     color: u32,
 ) {
     let scale = if fb_w >= 1000 { 2 } else { 1 };
-    let mut cx = x;
-    for ch in text.chars() {
-        if ch == '\n' {
-            continue;
-        }
-        draw_char(fb, fb_w, fb_h, cx, y, ch, color, scale);
-        cx += 6 * scale;
-    }
+    draw_text_scaled(fb, fb_w, fb_h, x, y, text, color, scale);
 }
 
 pub fn fill_rect_alpha(

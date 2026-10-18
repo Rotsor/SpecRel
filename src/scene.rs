@@ -60,7 +60,7 @@ impl DemoScene {
                 "LEFT=HOME (V=0), RIGHT=TRAVELER (0.94C PEAK). REUNITE AT T=+14S WITH 8S CLOCK GAP!"
             }
             Self::BarnAndPole => {
-                "PAUSE [P] NEAR T=0, PRESS [G] FOR CAMERA SLICE & [V] TO MATCH POLE VELOCITY!"
+                "PAUSE [P] NEAR T=0, PRESS [G] FOR GOD'S EYE & [V] TO MATCH POLE VELOCITY!"
             }
             Self::TerrellPenroseStreet => {
                 "FLYING CUBES (0.85C) ROTATE TRAILING CLOCK FACES INTO VIEW; SPHERE STAYS CIRCULAR."
