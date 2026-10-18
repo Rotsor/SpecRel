@@ -5,8 +5,11 @@ edition = "2021"
 description = "A special-relativity-aware 4D spacetime raytracer in Rust"
 
 [dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
 minifb = "0.27"
+pollster = "1.0.1"
 rayon = "1.10"
+wgpu = "30.0.1"
 
 [profile.release]
 opt-level = 3

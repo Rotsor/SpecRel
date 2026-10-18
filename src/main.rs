@@ -1,10 +1,12 @@
 pub mod bvh4d;
+pub mod gpu;
 pub mod hud;
 pub mod mesh4d;
 pub mod minkowski;
 pub mod renderer;
 pub mod scene;
 
+use gpu::GpuRenderer;
 use hud::{draw_text, fill_rect_alpha};
 use minkowski::{Vec3, Vec4};
 use minifb::{Key, KeyRepeat, Window, WindowOptions};
@@ -18,6 +20,22 @@ const HEIGHT: usize = 800;
 const TIME_SCALES: [f32; 10] = [
     -4.0, -2.0, -1.0, -0.5, -0.25, 0.25, 0.5, 1.0, 2.0, 4.0,
 ];
+
+/// Render one frame with the GPU backend if it's available and selected, else on the CPU.
+fn render_with_backend(
+    gpu: Option<&mut GpuRenderer>,
+    use_gpu: bool,
+    scenes: &[Scene4D],
+    scene_idx: usize,
+    camera: &Camera4D,
+    cfg: &RenderConfig,
+    framebuffer: &mut [u32],
+) {
+    match gpu {
+        Some(g) if use_gpu => g.render(scene_idx, camera, cfg, framebuffer),
+        _ => render_frame(&scenes[scene_idx], camera, cfg, framebuffer),
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -36,6 +54,29 @@ fn main() {
         build_start.elapsed()
     );
 
+    // GPU compute backend (wgpu). `--cpu` forces the CPU reference renderer.
+    let mut gpu = if args.iter().any(|a| a == "--cpu") {
+        println!("GPU backend disabled (--cpu); using CPU renderer");
+        None
+    } else {
+        let t0 = Instant::now();
+        match GpuRenderer::new(&scenes) {
+            Ok(g) => {
+                println!(
+                    "GPU backend ready on {} (init + upload {:.2?})",
+                    g.adapter_name(),
+                    t0.elapsed()
+                );
+                Some(g)
+            }
+            Err(e) => {
+                println!("GPU backend unavailable ({e}); falling back to CPU renderer");
+                None
+            }
+        }
+    };
+    let mut use_gpu = gpu.is_some();
+
     let mut scene_idx: usize = 0; // Starts on Scene 1: Twin Paradox
     let mut camera = Camera4D::new(scenes[scene_idx].demo.initial_camera_pos(), 65.0);
     let mut cfg = RenderConfig {
@@ -49,6 +90,7 @@ fn main() {
     let mut framebuffer = vec![0u32; WIDTH * HEIGHT];
 
     if args.iter().any(|a| a == "--smoke-test") {
+        let mut gpu_fb = vec![0u32; WIDTH * HEIGHT];
         for (i, scene) in scenes.iter().enumerate() {
             let cam = Camera4D::new(scene.demo.initial_camera_pos(), 65.0);
             let t0 = Instant::now();
@@ -56,7 +98,7 @@ fn main() {
             let dt = t0.elapsed();
             let non_zero = framebuffer.iter().filter(|&&px| px != 0).count();
             println!(
-                "Scene {} [{}] ({} simplices): rendered {}x{} in {:.2?} ({}/{} non-zero px)",
+                "Scene {} [{}] ({} simplices): CPU rendered {}x{} in {:.2?} ({}/{} non-zero px)",
                 i + 1,
                 scene.demo.title(),
                 scene.bvh.simplices.len(),
@@ -66,6 +108,37 @@ fn main() {
                 non_zero,
                 framebuffer.len()
             );
+
+            if let Some(g) = gpu.as_mut() {
+                g.render(i, &cam, &cfg, &mut gpu_fb); // warm-up (pipeline/driver caches)
+                const RUNS: u32 = 10;
+                let t0 = Instant::now();
+                for _ in 0..RUNS {
+                    g.render(i, &cam, &cfg, &mut gpu_fb);
+                }
+                let dt_gpu = t0.elapsed() / RUNS;
+                let mut max_diff = 0u32;
+                let mut differing = 0usize;
+                for (&a, &b) in framebuffer.iter().zip(&gpu_fb) {
+                    let d = (0..3)
+                        .map(|c| ((a >> (8 * c)) & 0xFF).abs_diff((b >> (8 * c)) & 0xFF))
+                        .max()
+                        .unwrap();
+                    max_diff = max_diff.max(d);
+                    if d > 4 {
+                        differing += 1;
+                    }
+                }
+                println!(
+                    "    GPU rendered in {:.2?} (avg of {} incl. readback, {:.1}x faster); vs CPU: {} px differ by >4 ({:.3}%), max channel diff {}",
+                    dt_gpu,
+                    RUNS,
+                    dt.as_secs_f64() / dt_gpu.as_secs_f64(),
+                    differing,
+                    100.0 * differing as f64 / gpu_fb.len() as f64,
+                    max_diff
+                );
+            }
         }
         return;
     }
@@ -150,6 +223,9 @@ fn main() {
         }
         if window.is_key_pressed(Key::Tab, KeyRepeat::No) {
             show_hud = !show_hud;
+        }
+        if window.is_key_pressed(Key::F, KeyRepeat::No) && gpu.is_some() {
+            use_gpu = !use_gpu;
         }
         if window.is_key_pressed(Key::R, KeyRepeat::No) {
             camera = Camera4D::new(scene.demo.initial_camera_pos(), 65.0);
@@ -277,9 +353,18 @@ fn main() {
             }
         }
 
-        render_frame(scene, &camera, &cfg, &mut framebuffer);
+        render_with_backend(
+            gpu.as_mut(),
+            use_gpu,
+            &scenes,
+            scene_idx,
+            &camera,
+            &cfg,
+            &mut framebuffer,
+        );
 
         if show_hud {
+            let backend = if gpu.is_some() && use_gpu { "GPU" } else { "CPU" };
             draw_hud(
                 &mut framebuffer,
                 scene.demo,
@@ -288,6 +373,7 @@ fn main() {
                 paused_worldline,
                 time_scale,
                 fps_smooth,
+                backend,
             );
         }
 
@@ -297,6 +383,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_hud(
     fb: &mut [u32],
     demo: DemoScene,
@@ -305,6 +392,7 @@ fn draw_hud(
     paused: bool,
     time_scale: f32,
     fps: f32,
+    backend: &str,
 ) {
     fill_rect_alpha(fb, WIDTH, HEIGHT, 12, 12, 1140, 200);
 
@@ -333,8 +421,8 @@ fn draw_hud(
         time_status
     );
     let line2 = format!(
-        "OBS 3-VEL: ({:+5.3}, {:+5.3}, {:+5.3})  |V|: {:5.3}C  GAMMA: {:6.3}  FPS: {:4.0}",
-        beta.x, beta.y, beta.z, speed, gamma, fps
+        "OBS 3-VEL: ({:+5.3}, {:+5.3}, {:+5.3})  |V|: {:5.3}C  GAMMA: {:6.3}  FPS: {:4.0} [F] {}",
+        beta.x, beta.y, beta.z, speed, gamma, fps, backend
     );
     let line3 = format!(
         "MODE [M]: {} | SLICE [G]: {} | SHADOWS [H]: {}",

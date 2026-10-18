@@ -2,12 +2,12 @@ use crate::mesh4d::{Aabb4D, HitRecord4D, Simplex4D, SimplexGeom4D};
 use crate::minkowski::Vec4;
 
 #[derive(Clone, Copy, Debug)]
-struct BvhNode4D {
-    aabb: Aabb4D,
+pub(crate) struct BvhNode4D {
+    pub(crate) aabb: Aabb4D,
     /// For leaf nodes (`count > 0`): start index into `simplices` / `hot_geoms`.
     /// For internal nodes (`count == 0`): index of the right child node (left child is `node_idx + 1`).
-    right_or_first: u32,
-    count: u32,
+    pub(crate) right_or_first: u32,
+    pub(crate) count: u32,
 }
 
 /// 4D Spacetime Bounding Volume Hierarchy over `Simplex4D` primitives.
@@ -30,6 +30,16 @@ impl Bvh4D {
             hot_geoms,
             simplices,
         }
+    }
+
+    /// Flat node array (depth-first; left child of internal node `i` is `i + 1`).
+    pub(crate) fn nodes(&self) -> &[BvhNode4D] {
+        &self.nodes
+    }
+
+    /// Compact hot intersection records, indexed identically to `simplices`.
+    pub(crate) fn hot_geoms(&self) -> &[SimplexGeom4D] {
+        &self.hot_geoms
     }
 
     fn build_recursive(

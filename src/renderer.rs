@@ -753,9 +753,9 @@ fn hsv_to_rgb(h_deg: f32, s: f32, v: f32) -> Vec3 {
     Vec3::new(r + m, g + m, b + m)
 }
 
-const GAMMA_LUT_SIZE: usize = 4096;
+pub(crate) const GAMMA_LUT_SIZE: usize = 4096;
 
-fn gamma_lut() -> &'static [u8; GAMMA_LUT_SIZE] {
+pub(crate) fn gamma_lut() -> &'static [u8; GAMMA_LUT_SIZE] {
     static LUT: OnceLock<[u8; GAMMA_LUT_SIZE]> = OnceLock::new();
     LUT.get_or_init(|| {
         let mut table = [0u8; GAMMA_LUT_SIZE];
