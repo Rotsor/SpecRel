@@ -157,21 +157,17 @@ fn main() {
             paused_worldline = false;
         }
         if window.is_key_pressed(Key::X, KeyRepeat::No) {
-            // Brake to lab rest frame while preserving local spatial orientation via Fermi-Walker transport
-            camera
-                .tetrad
-                .fermi_walker_transport(Vec4::new(1.0, 0.0, 0.0, 0.0));
+            // Brake to lab rest frame via a single pure planar Lorentz boost
+            camera.tetrad.boost_to(Vec4::new(1.0, 0.0, 0.0, 0.0));
         }
         if window.is_key_pressed(Key::V, KeyRepeat::No) {
             // Toggle between Lab Rest Frame and the moving object's Comoving Rest Frame (Pole / Train / Traveler)!
             if camera.tetrad.beta().length() > 0.1 {
-                camera
-                    .tetrad
-                    .fermi_walker_transport(Vec4::new(1.0, 0.0, 0.0, 0.0));
+                camera.tetrad.boost_to(Vec4::new(1.0, 0.0, 0.0, 0.0));
             } else {
                 let target_beta = scene.demo.comoving_beta(camera.position.t);
                 let target_u = Vec4::four_velocity_from_beta(target_beta);
-                camera.tetrad.fermi_walker_transport(target_u);
+                camera.tetrad.boost_to(target_u);
             }
         }
 
@@ -225,17 +221,17 @@ fn main() {
         }
         camera.tetrad.boost_local(d_rapidity);
 
-        // 3. Direct coordinate-space & time scrubbing (hold `[` to rewind/scrub back, `]` to scrub forward)
+        // 3. Direct coordinate-space & time scrubbing (hold `[` to rewind/scrub back, `]` to scrub forward).
+        // Because scrubbing `t` at fixed `(x, y, z)` is a coordinate translation rather than motion
+        // along the observer's timelike worldline, `camera.proper_time` is left unchanged.
         let scrub_speed = 6.0 * dt_wall;
         let mut time_changed = false;
         if window.is_key_down(Key::LeftBracket) {
             camera.position.t -= scrub_speed;
-            camera.proper_time -= scrub_speed / camera.tetrad.gamma();
             time_changed = true;
         }
         if window.is_key_down(Key::RightBracket) {
             camera.position.t += scrub_speed;
-            camera.proper_time += scrub_speed / camera.tetrad.gamma();
             time_changed = true;
         }
         if window.is_key_down(Key::I) {

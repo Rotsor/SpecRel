@@ -189,7 +189,11 @@ impl Vec4 {
         self.minkowski_dot(self)
     }
 
-    /// Euclidean 4D inner product (used for affine 4D hyperplane equations and dual basis)
+    /// Dual pairing `<alpha, v>` evaluated in standard coordinates `(t, x, y, z)`.
+    /// Ray-hyperplane and barycentric coordinates in 4D are purely affine (metric-independent)
+    /// operations: hyperplane normals and dual basis vectors are covectors (1-forms), and
+    /// `euclidean_dot` evaluates the linear functional `alpha(v) = alpha_mu v^mu`.
+    /// (To convert a covector `N_mu` into a Minkowski normal vector `n^mu`, raise the index: `eta^{mu nu} N_nu`.)
     #[inline]
     pub fn euclidean_dot(self, other: Self) -> f32 {
         self.t * other.t + self.x * other.x + self.y * other.y + self.z * other.z
@@ -235,9 +239,10 @@ impl Vec4 {
         }
     }
 
-    /// 4D triple cross product (Hodge dual *(u ^ v ^ w) in R^4).
-    /// Returns a 4-vector N such that for any w' in R^4, euclidean_dot(w', N) = det([w', u, v, w]).
-    /// In particular, N is strictly orthogonal (in Euclidean 4D dot product) to u, v, and w.
+    /// 4D triple cross product (covector `*(u ^ v ^ w)` in R^4).
+    /// Returns the hyperplane 1-form `N` such that for any `w'` in R^4,
+    /// `euclidean_dot(w', N) = det([w', u, v, w])`.
+    /// `N` annihilates `span(u, v, w)` without reference to any metric.
     #[inline]
     pub fn cross4(u: Self, v: Self, w: Self) -> Self {
         // Precompute 2x2 minors of (v, w)
@@ -353,6 +358,27 @@ impl Neg for Vec4 {
     }
 }
 
+/// Spatial part of `v` as measured by an observer with unit future-directed 4-velocity `u`:
+/// `v_perp = v + <v, u>_eta * u` (satisfies `<v_perp, u>_eta = 0`).
+#[inline]
+pub fn project_to_rest_space(v: Vec4, u: Vec4) -> Vec4 {
+    v + u * v.minkowski_dot(u)
+}
+
+/// Cosine (in the instantaneous rest frame of 4-velocity `u`) of the angle between `v`
+/// and a unit spacelike normal `n` (where `<n, u>_eta = 0` and `<n, n>_eta = 1`).
+/// Works for any 4-vector `v` (null, timelike, or spacelike).
+#[inline]
+pub fn rest_frame_cos(v: Vec4, n: Vec4, u: Vec4) -> f32 {
+    let vp = project_to_rest_space(v, u);
+    let len_sq = vp.minkowski_norm_sq();
+    if len_sq > 1e-12 {
+        (vp.minkowski_dot(n) / len_sq.sqrt()).clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 /// Exact planar Lorentz boost mapping unit future-directed timelike 4-velocity `u1` to `u2`,
 /// while leaving the Minkowski-orthogonal complement of span(u1, u2) invariant.
 #[inline]
@@ -398,12 +424,18 @@ impl Tetrad {
     pub fn from_beta(beta: Vec3) -> Self {
         let mut tetrad = Self::rest();
         let u = Vec4::four_velocity_from_beta(beta);
-        tetrad.fermi_walker_transport(u);
+        tetrad.boost_to(u);
         tetrad
     }
 
-    /// Transport this tetrad without local rotation (Fermi-Walker step) to a new 4-velocity `new_u0`.
-    pub fn fermi_walker_transport(&mut self, new_u0: Vec4) {
+    /// Apply a single pure planar Lorentz boost mapping the current 4-velocity `e[0]` to `new_u0`
+    /// without rotation in the plane orthogonal to `span(e[0], new_u0)`.
+    ///
+    /// Note on physics: A single finite boost `u1 -> u2` is a pure Lorentz boost. Chaining
+    /// differential boosts along a curved worldline implements **Fermi-Walker transport**;
+    /// because non-collinear boosts do not commute, a closed velocity loop accumulates
+    /// **Thomas-Wigner spatial rotation**.
+    pub fn boost_to(&mut self, new_u0: Vec4) {
         // Normalize new_u0 to unit timelike (-1)
         let norm_sq = new_u0.minkowski_norm_sq();
         let u2 = if norm_sq < -1e-12 {
@@ -422,6 +454,13 @@ impl Tetrad {
         self.reorthonormalize();
     }
 
+    /// Perform one Fermi-Walker transport step to a neighboring 4-velocity `new_u0`
+    /// (implemented as an infinitesimal/stepwise planar boost `e[0] -> new_u0`).
+    #[inline]
+    pub fn fermi_walker_transport(&mut self, new_u0: Vec4) {
+        self.boost_to(new_u0);
+    }
+
     /// Apply a pure Lorentz boost specified as a rapidity vector `d_rapidity` in the observer's
     /// instantaneous local spatial frame (e[1], e[2], e[3]).
     /// Because rapidity adds hyperbolically, this never exceeds the speed of light.
@@ -436,7 +475,7 @@ impl Tetrad {
         let ch = eta.cosh();
         let sh = eta.sinh();
         let new_u0 = self.e[0] * ch + s * sh;
-        self.fermi_walker_transport(new_u0);
+        self.boost_to(new_u0);
     }
 
     /// Rotate the spatial triad (e[1], e[2], e[3]) inside the observer's instantaneous rest frame.
@@ -477,6 +516,29 @@ impl Tetrad {
     #[inline]
     pub fn local_to_world(&self, local: Vec4) -> Vec4 {
         self.e[0] * local.t + self.e[1] * local.x + self.e[2] * local.y + self.e[3] * local.z
+    }
+
+    /// Map a lab 4D vector `v` into local tetrad coordinates `v^(a) = eta^(ab) <v, e_(b)>_eta`.
+    /// This is the exact inverse of `local_to_world` and answers "what components does this
+    /// observer measure in their comoving orthonormal frame?".
+    #[inline]
+    pub fn world_to_local(&self, v: Vec4) -> Vec4 {
+        Vec4::new(
+            -v.minkowski_dot(self.e[0]),
+            v.minkowski_dot(self.e[1]),
+            v.minkowski_dot(self.e[2]),
+            v.minkowski_dot(self.e[3]),
+        )
+    }
+
+    /// Spatial components `(v^(1), v^(2), v^(3))` of a lab 4-vector `v` in this tetrad's rest frame.
+    #[inline]
+    pub fn world_to_local_spatial(&self, v: Vec4) -> Vec3 {
+        Vec3::new(
+            v.minkowski_dot(self.e[1]),
+            v.minkowski_dot(self.e[2]),
+            v.minkowski_dot(self.e[3]),
+        )
     }
 
     /// Construct a past-directed null ray 4-direction in lab coordinates from a unit spatial
@@ -556,9 +618,52 @@ mod tests {
             }
         }
 
+        // Verify world_to_local is the exact inverse of local_to_world
+        let v_local = Vec4::new(2.3, -1.1, 0.7, 3.4);
+        let v_world = tetrad.local_to_world(v_local);
+        let recovered = tetrad.world_to_local(v_world);
+        assert!((recovered.t - v_local.t).abs() < 1e-5);
+        assert!((recovered.x - v_local.x).abs() < 1e-5);
+        assert!((recovered.y - v_local.y).abs() < 1e-5);
+        assert!((recovered.z - v_local.z).abs() < 1e-5);
+
         // Verify any camera ray is strictly null (<k, k>_eta == 0) and past-directed (k.t < 0)
         let k = tetrad.past_light_ray_direction(Vec3::new(0.3, -0.4, 1.0));
         assert!(k.minkowski_norm_sq().abs() < 1e-5);
         assert!(k.t < 0.0);
+    }
+
+    #[test]
+    fn test_relativistic_aberration_formula() {
+        // An observer boosted along +Z at speed beta looks at a distant star whose past-directed
+        // ray in the lab frame makes angle theta with +Z: k_lab = (-1, sin(theta), 0, cos(theta)).
+        // Note: a ray reaching the observer from viewing direction n_lab = (sin(theta), 0, cos(theta))
+        // has past light ray vector k_lab = (-1, n_lab).
+        // In the observer's boosted frame, the apparent viewing direction cosine with +Z must obey
+        // the textbook aberration formula: cos(theta') = (cos(theta) + beta) / (1 + beta * cos(theta))
+        // (or for incoming photon propagation direction -n_lab, (cos - beta)/(1 - beta*cos)).
+        let beta = 0.75f32;
+        let tetrad = Tetrad::from_beta(Vec3::new(0.0, 0.0, beta));
+
+        for &deg in &[0.0f32, 30.0, 60.0, 90.0, 120.0, 150.0, 180.0] {
+            let theta = deg.to_radians();
+            // Past-directed ray from observer toward lab direction (sin(theta), 0, cos(theta)):
+            let k_lab = Vec4::new(-1.0, theta.sin(), 0.0, theta.cos());
+            let k_obs = tetrad.world_to_local(k_lab);
+            // Apparent viewing direction in observer's sky is the normalized spatial part of k_obs
+            // (or equivalently rest_frame_cos(k_lab, tetrad.e[3], tetrad.e[0])):
+            let cos_theta_prime = rest_frame_cos(k_lab, tetrad.e[3], tetrad.e[0]);
+            let expected = (theta.cos() + beta) / (1.0 + beta * theta.cos());
+            assert!(
+                (cos_theta_prime - expected).abs() < 1e-5,
+                "deg={}: got {}, expected {}",
+                deg,
+                cos_theta_prime,
+                expected
+            );
+            // Also check agreement with normalized spatial part of world_to_local:
+            let dir_obs = k_obs.spatial().normalized();
+            assert!((dir_obs.z - expected).abs() < 1e-5);
+        }
     }
 }

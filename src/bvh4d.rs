@@ -1,4 +1,4 @@
-use crate::mesh4d::{Aabb4D, HitRecord4D, Simplex4D};
+use crate::mesh4d::{Aabb4D, HitRecord4D, Simplex4D, SimplexGeom4D};
 use crate::minkowski::Vec4;
 
 #[derive(Clone, Copy, Debug)]
@@ -8,69 +8,6 @@ struct BvhNode4D {
     /// For internal nodes (`count == 0`): index of the right child node (left child is `node_idx + 1`).
     right_or_first: u32,
     count: u32,
-}
-
-/// Compact 80-byte hot intersection data for a 4D tetrahedron (`Simplex4D`),
-/// keeping cold shading attributes out of CPU L1/L2 cache during BVH traversal.
-#[derive(Clone, Copy, Debug)]
-struct SimplexGeom4D {
-    v0: Vec4,
-    hyperplane_normal: Vec4,
-    dual_b1: Vec4,
-    dual_b2: Vec4,
-    dual_b3: Vec4,
-}
-
-impl SimplexGeom4D {
-    #[inline]
-    fn from_simplex(s: &Simplex4D) -> Self {
-        Self {
-            v0: s.v0,
-            hyperplane_normal: s.hyperplane_normal,
-            dual_b1: s.dual_b1,
-            dual_b2: s.dual_b2,
-            dual_b3: s.dual_b3,
-        }
-    }
-
-    #[inline]
-    fn intersect_fast(
-        &self,
-        origin: Vec4,
-        dir: Vec4,
-        t_min: f32,
-        t_max: f32,
-    ) -> Option<(f32, Vec4, [f32; 4])> {
-        let denom = self.hyperplane_normal.euclidean_dot(dir);
-        if denom.abs() < 1e-9 {
-            return None;
-        }
-
-        let lambda = self.hyperplane_normal.euclidean_dot(self.v0 - origin) / denom;
-        if lambda <= t_min || lambda >= t_max {
-            return None;
-        }
-
-        let event = origin + dir * lambda;
-        let q = event - self.v0;
-
-        let eps = -1e-5;
-        let u = self.dual_b1.euclidean_dot(q);
-        if u < eps || u > 1.0 - eps {
-            return None;
-        }
-        let v = self.dual_b2.euclidean_dot(q);
-        if v < eps || u + v > 1.0 - eps {
-            return None;
-        }
-        let w = self.dual_b3.euclidean_dot(q);
-        if w < eps || u + v + w > 1.0 - eps {
-            return None;
-        }
-
-        let w0 = 1.0 - u - v - w;
-        Some((lambda, event, [w0, u, v, w]))
-    }
 }
 
 /// 4D Spacetime Bounding Volume Hierarchy over `Simplex4D` primitives.
@@ -324,29 +261,7 @@ impl Bvh4D {
         }
 
         let (idx, lambda, event, tet_bary) = best_hit?;
-        let s = &self.simplices[idx];
-        let [w0, u, v, w] = tet_bary;
-
-        let tri_bary =
-            s.tri_bary[0] * w0 + s.tri_bary[1] * u + s.tri_bary[2] * v + s.tri_bary[3] * w;
-        let uv_u = s.uv[0].0 * w0 + s.uv[1].0 * u + s.uv[2].0 * v + s.uv[3].0 * w;
-        let uv_v = s.uv[0].1 * w0 + s.uv[1].1 * u + s.uv[2].1 * v + s.uv[3].1 * w;
-        let proper_time = s.proper_time[0] * w0
-            + s.proper_time[1] * u
-            + s.proper_time[2] * v
-            + s.proper_time[3] * w;
-
-        Some(HitRecord4D {
-            lambda,
-            event,
-            tet_bary,
-            tri_bary,
-            uv: (uv_u, uv_v),
-            proper_time,
-            surface_normal_4d: s.surface_normal_4d,
-            four_velocity: s.four_velocity,
-            material_id: s.material_id,
-        })
+        Some(self.simplices[idx].interpolate_hit(lambda, event, tet_bary))
     }
 
     /// Fast shadow / occlusion query along a 4D ray `origin + lambda * dir` for `lambda in (t_min, t_max)`.

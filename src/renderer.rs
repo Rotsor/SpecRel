@@ -1,14 +1,15 @@
 use crate::hud::glyph_5x7;
 use crate::mesh4d::{HitRecord4D, Material, SurfacePattern};
-use crate::minkowski::{Tetrad, Vec3, Vec4};
+use crate::minkowski::{rest_frame_cos, Tetrad, Vec3, Vec4};
 use crate::scene::Scene4D;
 use rayon::prelude::*;
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderMode {
     /// Standard shaded view with rest-frame surface textures (clocks/checkerboard), wireframe, and 4D shadows
     RelativisticShaded,
-    /// Past-light-cone lookback time (t_obs - t_hit) & proper-time isochrone contours
+    /// Past-light-cone lookback time (lambda) & proper-time isochrone contours
     LookbackIsochrones,
     /// Raw 4D Simplex (tetrahedron) barycentric inspector
     Simplex4DInspector,
@@ -139,6 +140,7 @@ pub fn render_frame(
     let aspect = w as f32 / h as f32;
     let half_h = (0.5 * camera.fov_y_rad).tan();
     let half_w = aspect * half_h;
+    let lut = gamma_lut();
 
     framebuffer
         .par_chunks_mut(w)
@@ -168,7 +170,7 @@ pub fn render_frame(
                     shade_sky(ray_dir)
                 };
 
-                *pixel = pack_rgb(color);
+                *pixel = pack_rgb_with_lut(color, lut);
             }
         });
 }
@@ -184,124 +186,31 @@ fn shade_hit(
 
     match cfg.mode {
         RenderMode::RelativisticShaded => {
-            // 1. Evaluate intrinsic rest-frame procedural texture (animated by local proper_time tau!)
-            let mut albedo = match mat.pattern {
-                SurfacePattern::Checkerboard => {
-                    let gu = (hit.uv.0 * mat.grid_scale).floor() as i32;
-                    let gv = (hit.uv.1 * mat.grid_scale).floor() as i32;
-                    let is_even = (gu + gv).rem_euclid(2) == 0;
-                    let mut col = if is_even {
-                        mat.base_color
-                    } else {
-                        mat.checker_color
-                    };
-
-                    // 3D surface triangle wireframe on checkerboard meshes
-                    let min_tri_bary = hit.tri_bary.x.min(hit.tri_bary.y).min(hit.tri_bary.z);
-                    if min_tri_bary < mat.wireframe_width {
-                        let edge_t = (min_tri_bary / mat.wireframe_width).clamp(0.0, 1.0);
-                        let wire_col = Vec3::splat(0.07);
-                        col = wire_col * (1.0 - edge_t) + col * edge_t;
-                    }
-                    col
-                }
-                SurfacePattern::ClockFace => sample_clock_face_texture(hit.uv, hit.proper_time, mat),
-                SurfacePattern::LightClock => {
-                    sample_light_clock_texture(hit.uv, hit.proper_time, mat)
-                }
-            };
-
-            // Subtle border frame on clock cubes
-            if mat.pattern != SurfacePattern::Checkerboard {
-                let u_tile = (hit.uv.0 * mat.grid_scale).rem_euclid(1.0);
-                let v_tile = (hit.uv.1 * mat.grid_scale).rem_euclid(1.0);
-                let border_dist = u_tile.min(1.0 - u_tile).min(v_tile.min(1.0 - v_tile));
-                if border_dist < 0.025 {
-                    albedo = albedo * 0.35;
-                }
-            }
-
-            // 2. 4D Illumination & Shadow Ray from the light source worldline X_L(t_L) = (t_L, light_pos).
-            let spatial_to_light = scene.light_pos - hit.event.spatial();
-            let dist_to_light = spatial_to_light.length().max(1e-4);
-            let t_emit = match cfg.shadow_mode {
-                ShadowMode::CameraSlice => {
-                    // Instantaneous shadow cast inside the camera's own 3D simultaneity slice:
-                    // <X_emit - X_hit, u_cam>_eta = 0  ==>  t_emit = t_hit + beta_cam . (x_L - x_hit)
-                    hit.event.t + camera.tetrad.beta().dot(spatial_to_light)
-                }
-                ShadowMode::LorentzInvariant | ShadowMode::Off => {
-                    // Physically accurate Lorentz-invariant retarded-time null ray (ds^2 = 0):
-                    // t_emit = t_hit - |x_L - x_hit|
-                    hit.event.t - dist_to_light
-                }
-            };
-            let light_emit_event = Vec4::from_time_space(t_emit, scene.light_pos);
-
-            // 4D direction vector from hit event toward the light emission event (parameterized by spatial distance)
-            let to_light_4d = (light_emit_event - hit.event) * (1.0 / dist_to_light);
-
-            // Evaluate the cosine of the incidence angle in the surface's comoving rest frame
-            // purely via Lorentz-invariant Minkowski inner products:
-            let omega_light_in_obj = (-to_light_4d.minkowski_dot(hit.four_velocity)).max(0.2);
-            let cos_light_rest = (to_light_4d.minkowski_dot(hit.surface_normal_4d)
-                / omega_light_in_obj)
-                .abs()
-                .clamp(0.0, 1.0);
-
-            let omega_view_in_obj = (-ray_dir.minkowski_dot(hit.four_velocity)).max(0.2);
-            let cos_view_rest = (ray_dir.minkowski_dot(hit.surface_normal_4d) / omega_view_in_obj)
-                .abs()
-                .clamp(0.0, 1.0);
-
-            // 3. Trace 4D shadow ray on structural/ground surfaces according to ShadowMode
-            let lighting = if mat.pattern == SurfacePattern::Checkerboard {
-                let in_shadow = match cfg.shadow_mode {
-                    ShadowMode::Off => false,
-                    ShadowMode::LorentzInvariant | ShadowMode::CameraSlice => scene.bvh.is_occluded(
-                        hit.event,
-                        to_light_4d,
-                        2e-3,
-                        dist_to_light - 2e-3,
-                    ),
-                };
-                let shadow_factor = if in_shadow { 0.32 } else { 1.0 };
-                let atten = 1.0 / (1.0 + 0.006 * dist_to_light * dist_to_light);
-                mat.emission
-                    + 0.30 * cos_view_rest
-                    + 0.80 * shadow_factor * cos_light_rest * atten
-            } else {
-                // High-contrast self-illuminated clock / light-clock display with 3D view shading
-                0.72 + 0.38 * cos_view_rest + 0.22 * cos_light_rest
-            };
-
-            // Distance fog in lookback parameter lambda
-            let fog = (-0.008 * hit.lambda).exp();
-            let sky = shade_sky(ray_dir);
-            (albedo * lighting) * fog + sky * (1.0 - fog)
+            let albedo = sample_surface_albedo(hit, mat);
+            let lighting = compute_illumination(scene, camera, cfg, ray_dir, hit, mat);
+            apply_distance_fog(albedo * lighting, ray_dir, hit.lambda)
         }
 
         RenderMode::LookbackIsochrones => {
-            // Lookback time delta_t = t_obs - t_hit
-            let lookback_t = (camera.position.t - hit.event.t).abs();
-            let phase = (lookback_t * 0.12).rem_euclid(1.0);
+            // Observer's own rest-frame lookback time/distance `hit.lambda`
+            let phase = (hit.lambda * 0.12).rem_euclid(1.0);
             let base = hsv_to_rgb(phase * 300.0, 0.8, 0.85);
 
             // Isochrone contour lines every 1.0 light-second of coordinate time t_hit
             let t_contour = (hit.event.t.rem_euclid(1.0) - 0.5).abs();
             let is_t_ring = t_contour > 0.45;
 
-            // Proper-time contour lines every 1.0 second of object proper time tau
+            // Proper-time contour lines every 1.0 second of local proper time tau
             let tau_contour = (hit.proper_time.rem_euclid(1.0) - 0.5).abs();
             let is_tau_ring = tau_contour > 0.46;
 
-            let mut col = base;
             if is_t_ring {
-                col = Vec3::new(1.0, 1.0, 1.0);
+                Vec3::new(1.0, 1.0, 1.0)
             } else if is_tau_ring {
-                col = Vec3::new(0.1, 0.1, 0.1);
+                Vec3::new(0.1, 0.1, 0.1)
+            } else {
+                base
             }
-            col
         }
 
         RenderMode::Simplex4DInspector => {
@@ -320,37 +229,220 @@ fn shade_hit(
     }
 }
 
-/// Procedural Analog + Digital Clock Face texture driven purely by the surface's local `proper_time` (tau).
+/// Evaluate the intrinsic rest-frame procedural texture at `hit.uv` and `hit.proper_time`.
+fn sample_surface_albedo(hit: &HitRecord4D, mat: &Material) -> Vec3 {
+    let mut albedo = match mat.pattern {
+        SurfacePattern::Checkerboard => {
+            let gu = (hit.uv.0 * mat.grid_scale).floor() as i32;
+            let gv = (hit.uv.1 * mat.grid_scale).floor() as i32;
+            let is_even = (gu + gv).rem_euclid(2) == 0;
+            let mut col = if is_even {
+                mat.base_color
+            } else {
+                mat.checker_color
+            };
+
+            // 3D surface triangle wireframe on checkerboard meshes
+            let min_tri_bary = hit.tri_bary.x.min(hit.tri_bary.y).min(hit.tri_bary.z);
+            if min_tri_bary < mat.wireframe_width {
+                let edge_t = (min_tri_bary / mat.wireframe_width).clamp(0.0, 1.0);
+                let wire_col = Vec3::splat(0.07);
+                col = wire_col * (1.0 - edge_t) + col * edge_t;
+            }
+            col
+        }
+        SurfacePattern::ClockFace => sample_clock_face_texture(hit, mat),
+        SurfacePattern::LightClock => sample_light_clock_texture(hit.uv, hit.proper_time, mat),
+    };
+
+    // Subtle border frame on clock cubes
+    if mat.pattern != SurfacePattern::Checkerboard {
+        let u_tile = (hit.uv.0 * mat.grid_scale).rem_euclid(1.0);
+        let v_tile = (hit.uv.1 * mat.grid_scale).rem_euclid(1.0);
+        let border_dist = u_tile.min(1.0 - u_tile).min(v_tile.min(1.0 - v_tile));
+        if border_dist < 0.025 {
+            albedo = albedo * 0.35;
+        }
+    }
+
+    albedo
+}
+
+/// Determine the spacetime event on the stationary light source's worldline `X_L(t_L) = (t_L, light_pos)`
+/// that illuminates `hit_event` under `shadow_mode`, together with the spatial distance `|x_L - x_hit|`.
+#[inline]
+fn light_emission_event(
+    hit_event: Vec4,
+    light_pos: Vec3,
+    camera: &Camera4D,
+    shadow_mode: ShadowMode,
+) -> (Vec4, f32) {
+    let spatial_to_light = light_pos - hit_event.spatial();
+    let dist_to_light = spatial_to_light.length().max(1e-4);
+    let t_emit = match shadow_mode {
+        ShadowMode::CameraSlice => {
+            // Instantaneous shadow cast inside the camera's own 3D simultaneity slice:
+            // <X_emit - X_hit, u_cam>_eta = 0  ==>  t_emit = t_hit + beta_cam . (x_L - x_hit)
+            hit_event.t + camera.tetrad.beta().dot(spatial_to_light)
+        }
+        ShadowMode::LorentzInvariant | ShadowMode::Off => {
+            // Physically accurate Lorentz-invariant retarded-time null ray (ds^2 = 0):
+            // t_emit = t_hit - |x_L - x_hit|
+            hit_event.t - dist_to_light
+        }
+    };
+    (Vec4::from_time_space(t_emit, light_pos), dist_to_light)
+}
+
+/// Compute rest-frame Lambertian + view shading and cast 4D shadow rays when facing the light.
+fn compute_illumination(
+    scene: &Scene4D,
+    camera: &Camera4D,
+    cfg: &RenderConfig,
+    ray_dir: Vec4,
+    hit: &HitRecord4D,
+    mat: &Material,
+) -> f32 {
+    let (light_emit_event, dist_to_light) =
+        light_emission_event(hit.event, scene.light_pos, camera, cfg.shadow_mode);
+
+    // 4D direction vector from hit event toward the light emission event (parameterized by spatial distance)
+    let to_light_4d = (light_emit_event - hit.event) * (1.0 / dist_to_light);
+
+    // Evaluate one-sided cosines in the surface's comoving rest frame via the spatial projector
+    // `v_perp = v + <v, u>_eta * u` (works identically for null rays and spacelike camera-slice rays):
+    let cos_light_rest =
+        rest_frame_cos(to_light_4d, hit.surface_normal_4d, hit.four_velocity).max(0.0);
+    // `-ray_dir` points from the hit surface back toward the observer:
+    let cos_view_rest =
+        (-rest_frame_cos(ray_dir, hit.surface_normal_4d, hit.four_velocity)).max(0.0);
+
+    if mat.pattern == SurfacePattern::Checkerboard {
+        // Only cast a shadow ray if the surface is front-facing with respect to the light in its rest frame
+        let in_shadow = if cos_light_rest > 0.0 {
+            match cfg.shadow_mode {
+                ShadowMode::Off => false,
+                ShadowMode::LorentzInvariant | ShadowMode::CameraSlice => scene.bvh.is_occluded(
+                    hit.event,
+                    to_light_4d,
+                    2e-3,
+                    dist_to_light - 2e-3,
+                ),
+            }
+        } else {
+            false
+        };
+        let shadow_factor = if in_shadow { 0.32 } else { 1.0 };
+        let atten = 1.0 / (1.0 + 0.006 * dist_to_light * dist_to_light);
+        mat.emission + 0.30 * cos_view_rest + 0.80 * shadow_factor * cos_light_rest * atten
+    } else {
+        // High-contrast self-illuminated clock / light-clock display with rest-frame 3D shading
+        0.72 + 0.38 * cos_view_rest + 0.22 * cos_light_rest
+    }
+}
+
+#[inline]
+fn apply_distance_fog(surface_color: Vec3, ray_dir: Vec4, lambda: f32) -> Vec3 {
+    let fog = (-0.008 * lambda).exp();
+    let sky_grad = shade_sky_gradient(ray_dir);
+    surface_color * fog + sky_grad * (1.0 - fog)
+}
+
+/// Reconstruct the **central proper time** `tau_tile_center` of the oscillator at the center
+/// `(u_tile = 0.5, v_tile = 0.5)` of the clock tile containing `uv`.
+///
+/// Since `proper_time` at `(u, v)` is `tau_local(u, v) = tau_tile_center + Delta_u * d_tau/du + Delta_v * d_tau/dv`,
+/// subtracting the linear Born-rigid offset recovers `tau_tile_center`, which is strictly uniform
+/// across the entire clock tile on any comoving rest-frame simultaneity slice `Sigma(tau_c)`.
+#[inline]
+pub fn clock_tile_central_proper_time(
+    u_tile: f32,
+    v_tile: f32,
+    grid_scale: f32,
+    local_proper_time: f32,
+    tau_uv_grad: (f32, f32),
+) -> f32 {
+    let inv_grid = 1.0 / grid_scale.max(1e-4);
+    let delta_u = (u_tile - 0.5) * inv_grid;
+    let delta_v = (v_tile - 0.5) * inv_grid;
+    local_proper_time - (delta_u * tau_uv_grad.0 + delta_v * tau_uv_grad.1)
+}
+
+/// Procedural Analog + Digital Clock Face texture with:
+/// 1. **Centrally-driven main dial** at `(0.50, 0.57)`: driven by a single central oscillator at the
+///    clock tile center whose phase signal radiates outward from the dial pivot at speed `c = 1` in
+///    the rest frame (`tau_main(r_phys) = central_proper_time - r_phys`). Because `r_phys` is purely
+///    radial around the pivot, every hand is a single unbroken curve in the rest frame (curving into
+///    a smooth causal spiral rather than tearing into pieces when a Born-rigid proper-time gradient
+///    `Phi` is present across the face).
+/// 2. **Central digital LED readout** (`+24.7S`) at the bottom center of the tile, driven by
+///    `central_proper_time` so digits never tear across their height/width.
+/// 3. **Four corner mini-clocks** at `(0.135, 0.865)`, `(0.865, 0.865)`, `(0.135, 0.135)`, `(0.865, 0.135)`,
+///    each driven by its own local corner oscillator (`tau_corner = central_proper_time + Delta_p_corner . Phi - r_mini_phys`),
+///    making any Rindler / Born-rigid proper-time drift across the face directly visible by comparing
+///    the four corners!
+///
+/// Dial calibration:
 /// - 10 decimal notches around the dial (`0..9`), so every full rotation of a faster hand advances
 ///   the next slower hand by **1 exact notch**, and all 3 hands match the digital `+24.7S` readout:
 ///   * Fast hand (Cyan):   1 full rotation =   1.0s of proper time (1 notch = 0.1s, tenths digit)
 ///   * Main hand (Yellow): 1 full rotation =  10.0s of proper time (1 notch = 1.0s = 1 fast-hand rev, ones digit)
 ///   * Slow hand (Red):    1 full rotation = 100.0s of proper time (1 notch = 10.0s = 1 main-hand rev, tens digit)
-fn sample_clock_face_texture(uv: (f32, f32), proper_time: f32, mat: &Material) -> Vec3 {
-    let u = (uv.0 * mat.grid_scale).rem_euclid(1.0);
-    let v = (uv.1 * mat.grid_scale).rem_euclid(1.0);
+fn sample_clock_face_texture(hit: &HitRecord4D, mat: &Material) -> Vec3 {
+    let grid_scale = mat.grid_scale.max(1e-4);
+    let inv_grid = 1.0 / grid_scale;
+    let u = (hit.uv.0 * grid_scale).rem_euclid(1.0);
+    let v = (hit.uv.1 * grid_scale).rem_euclid(1.0);
 
-    // 1. Digital proper-time display panel at bottom of clock tile: v in [0.03, 0.25], u in [0.07, 0.93]
-    if (0.03..=0.25).contains(&v) && (0.07..=0.93).contains(&u) {
-        if !(0.045..=0.235).contains(&v) || !(0.085..=0.915).contains(&u) {
+    // Central proper time of the oscillator at the center (0.5, 0.5) of this clock tile:
+    let central_proper_time =
+        clock_tile_central_proper_time(u, v, grid_scale, hit.proper_time, hit.tau_uv_grad);
+
+    // 1. Four corner mini-clocks showing the local proper time at each corner of the tile:
+    const CORNER_CENTERS: [(f32, f32); 4] = [
+        (0.135, 0.865),
+        (0.865, 0.865),
+        (0.135, 0.135),
+        (0.865, 0.135),
+    ];
+    for &(mc_x, mc_y) in &CORNER_CENTERS {
+        let mdx = u - mc_x;
+        let mdy = v - mc_y;
+        let mr = (mdx * mdx + mdy * mdy).sqrt();
+        if mr <= 0.095 {
+            // Proper time of the corner oscillator at (mc_x, mc_y), plus radial signal delay -mr_phys / c:
+            let corner_osc_tau = central_proper_time
+                + ((mc_x - 0.5) * inv_grid) * hit.tau_uv_grad.0
+                + ((mc_y - 0.5) * inv_grid) * hit.tau_uv_grad.1;
+            let mdx_phys = (mdx * inv_grid) * hit.uv_world_scale.0;
+            let mdy_phys = (mdy * inv_grid) * hit.uv_world_scale.1;
+            let mr_phys = (mdx_phys * mdx_phys + mdy_phys * mdy_phys).sqrt();
+            return sample_corner_mini_clock(mdx, mdy, mr, corner_osc_tau - mr_phys, mat);
+        }
+    }
+
+    // 2. Digital proper-time display panel at bottom-center of clock tile: u in [0.25, 0.75], v in [0.035, 0.205]
+    if (0.035..=0.205).contains(&v) && (0.25..=0.75).contains(&u) {
+        if !(0.050..=0.190).contains(&v) || !(0.265..=0.735).contains(&u) {
             return mat.base_color * 0.9; // Panel bezel
         }
-        if (0.06..=0.22).contains(&v) && (0.11..=0.89).contains(&u) {
-            if sample_digital_tau(u, v, proper_time) {
-                return Vec3::new(1.0, 0.96, 0.30); // Bright high-contrast LED readout
-            }
+        if (0.06..=0.18).contains(&v)
+            && (0.28..=0.72).contains(&u)
+            && sample_digital_tau(u, v, central_proper_time)
+        {
+            return Vec3::new(1.0, 0.96, 0.30); // Bright high-contrast LED readout
         }
         return Vec3::new(0.03, 0.04, 0.07); // Deep black digital panel background
     }
 
-    // 2. Analog clock dial centered at (0.50, 0.62) with outer bezel radius 0.355
+    // 3. Main analog clock dial centered at (0.50, 0.57) with outer bezel radius 0.330
     let cx = 0.50;
-    let cy = 0.62;
+    let cy = 0.57;
     let dx = u - cx;
     let dy = v - cy;
     let r = (dx * dx + dy * dy).sqrt();
 
-    if r > 0.358 {
+    if r > 0.330 {
         // Exterior casing corner checkerboard
         let gu = (u * 4.0).floor() as i32;
         let gv = (v * 4.0).floor() as i32;
@@ -361,32 +453,41 @@ fn sample_clock_face_texture(uv: (f32, f32), proper_time: f32, mat: &Material) -
         };
     }
 
-    if r > 0.318 {
+    if r > 0.292 {
         // Colored metallic bezel ring
         return mat.base_color * 1.15;
     }
 
-    // Inside the circular clock face (r <= 0.318):
+    // Physical rest-frame radial distance r_phys (in light-seconds) from the dial pivot (cx, cy).
+    // A radio/phase signal emitted by the central oscillator at the pivot propagates radially outward
+    // at speed c = 1 in the clock's comoving rest frame, so a pixel at radius r_phys displays the
+    // retarded phase `dial_tau = central_proper_time - r_phys`.
+    let dx_phys = (dx * inv_grid) * hit.uv_world_scale.0;
+    let dy_phys = (dy * inv_grid) * hit.uv_world_scale.1;
+    let r_phys = (dx_phys * dx_phys + dy_phys * dy_phys).sqrt();
+    let dial_tau = central_proper_time - r_phys;
+
+    // Inside the circular clock face (r <= 0.292):
     // Clockwise angle from top (+Y, notch 0):
     let angle = dx.atan2(dy).rem_euclid(std::f32::consts::TAU);
 
     // Main hand: 1 full revolution = 10.0s of proper time (1 notch = 1.0s)
     let main_hand_angle =
-        ((proper_time / 10.0) * std::f32::consts::TAU).rem_euclid(std::f32::consts::TAU);
+        ((dial_tau / 10.0) * std::f32::consts::TAU).rem_euclid(std::f32::consts::TAU);
 
     let mut dial_col = Vec3::new(0.04, 0.06, 0.10);
-    if angle <= main_hand_angle && r < 0.255 {
+    if angle <= main_hand_angle && r < 0.236 {
         dial_col += mat.base_color * 0.22;
     }
 
     // 10 Notches around the rim (each notch = 1 full rotation of the 1.0s fast hand)
-    if (0.238..=0.310).contains(&r) {
+    if (0.220..=0.286).contains(&r) {
         let sector = angle / (std::f32::consts::TAU / 10.0);
         let dist_to_tick = (sector - sector.round()).abs();
         let tick_idx = sector.round() as i32 % 10;
         let is_cardinal = tick_idx == 0 || tick_idx == 5;
         let half_w = if is_cardinal { 0.105 } else { 0.055 };
-        let inner_r = if is_cardinal { 0.236 } else { 0.262 };
+        let inner_r = if is_cardinal { 0.218 } else { 0.242 };
         if dist_to_tick < half_w && r >= inner_r {
             return if tick_idx == 0 {
                 Vec3::new(1.0, 0.88, 0.15) // Gold top (0) marker
@@ -399,33 +500,84 @@ fn sample_clock_face_texture(uv: (f32, f32), proper_time: f32, mat: &Material) -
     }
 
     // Fast sub-second hand: 1 full rotation = 1.0s of proper time (advances main hand by 1 notch per turn!)
-    let fast_angle =
-        ((proper_time / 1.0) * std::f32::consts::TAU).rem_euclid(std::f32::consts::TAU);
-    if point_on_hand(dx, dy, fast_angle, 0.275, 0.013) {
+    let fast_angle = ((dial_tau / 1.0) * std::f32::consts::TAU).rem_euclid(std::f32::consts::TAU);
+    if point_on_hand(dx, dy, fast_angle, 0.254, 0.012) {
         return Vec3::new(0.25, 0.98, 1.0);
     }
 
     // Main second hand: 1 full rotation = 10.0s of proper time (1 notch = 1.0s, advances slow hand by 1 notch per turn!)
-    if point_on_hand(dx, dy, main_hand_angle, 0.248, 0.024) {
+    if point_on_hand(dx, dy, main_hand_angle, 0.228, 0.022) {
         return Vec3::new(1.0, 0.95, 0.30);
     }
-    if point_on_hand(dx, dy, main_hand_angle, 0.256, 0.032) {
+    if point_on_hand(dx, dy, main_hand_angle, 0.236, 0.030) {
         return Vec3::new(0.02, 0.02, 0.04);
     }
 
     // Slow hand: 1 full rotation = 100.0s of proper time (1 notch = 10.0s)
-    let slow_angle =
-        ((proper_time / 100.0) * std::f32::consts::TAU).rem_euclid(std::f32::consts::TAU);
-    if point_on_hand(dx, dy, slow_angle, 0.175, 0.028) {
+    let slow_angle = ((dial_tau / 100.0) * std::f32::consts::TAU).rem_euclid(std::f32::consts::TAU);
+    if point_on_hand(dx, dy, slow_angle, 0.162, 0.026) {
         return Vec3::new(1.0, 0.35, 0.25);
     }
 
     // Center pivot cap
-    if r < 0.036 {
+    if r < 0.034 {
         return Vec3::new(1.0, 1.0, 1.0);
     }
 
     dial_col
+}
+
+/// Render one of the 4 corner reference mini-clocks (`mr <= 0.095`) driven by its local corner
+/// proper time `mini_tau`. Comparing the 4 corner dials reveals any Born-rigid / Rindler proper-time
+/// gradient (`Delta_tau = Delta_p . Phi`) across the clock face while keeping every dial intact.
+#[inline]
+fn sample_corner_mini_clock(mdx: f32, mdy: f32, mr: f32, mini_tau: f32, mat: &Material) -> Vec3 {
+    if mr > 0.080 {
+        return mat.base_color * 1.15; // Metallic mini-bezel
+    }
+
+    let angle = mdx.atan2(mdy).rem_euclid(std::f32::consts::TAU);
+    let fast_angle = ((mini_tau / 1.0) * std::f32::consts::TAU).rem_euclid(std::f32::consts::TAU);
+    let main_angle = ((mini_tau / 10.0) * std::f32::consts::TAU).rem_euclid(std::f32::consts::TAU);
+
+    let mut col = Vec3::new(0.04, 0.06, 0.10);
+    // Subtle swept sector up to the 1.0s fast hand so sub-second phase offsets across corners jump out
+    if angle <= fast_angle && mr < 0.066 {
+        col += mat.base_color * 0.25;
+    }
+
+    // 10 rim ticks around the mini-dial
+    if (0.062..=0.078).contains(&mr) {
+        let sector = angle / (std::f32::consts::TAU / 10.0);
+        let dist_to_tick = (sector - sector.round()).abs();
+        let tick_idx = sector.round() as i32 % 10;
+        let is_cardinal = tick_idx == 0 || tick_idx == 5;
+        let half_w = if is_cardinal { 0.13 } else { 0.07 };
+        if dist_to_tick < half_w {
+            return if tick_idx == 0 {
+                Vec3::new(1.0, 0.88, 0.15)
+            } else {
+                Vec3::new(0.80, 0.85, 0.92)
+            };
+        }
+    }
+
+    // Fast hand (1.0s per revolution, cyan)
+    if point_on_hand_mini(mdx, mdy, fast_angle, 0.068, 0.0065) {
+        return Vec3::new(0.25, 0.98, 1.0);
+    }
+
+    // Main second hand (10.0s per revolution, yellow)
+    if point_on_hand_mini(mdx, mdy, main_angle, 0.052, 0.0085) {
+        return Vec3::new(1.0, 0.95, 0.30);
+    }
+
+    // Mini pivot cap
+    if mr < 0.012 {
+        return Vec3::new(1.0, 1.0, 1.0);
+    }
+
+    col
 }
 
 #[inline]
@@ -436,10 +588,18 @@ fn point_on_hand(dx: f32, dy: f32, angle_cw: f32, length: f32, half_width: f32) 
     proj_along >= -0.025 && proj_along <= length && proj_perp <= half_width
 }
 
-/// Sample a 6-character 5x7 digital proper-time readout (`+12.4S`) inside `u in [0.11, 0.89], v in [0.06, 0.22]`.
+#[inline]
+fn point_on_hand_mini(dx: f32, dy: f32, angle_cw: f32, length: f32, half_width: f32) -> bool {
+    let (hx, hy) = angle_cw.sin_cos();
+    let proj_along = dx * hx + dy * hy;
+    let proj_perp = (dx * hy - dy * hx).abs();
+    proj_along >= -0.008 && proj_along <= length && proj_perp <= half_width
+}
+
+/// Sample a 6-character 5x7 digital proper-time readout (`+12.4S`) inside `u in [0.28, 0.72], v in [0.06, 0.18]`.
 fn sample_digital_tau(u: f32, v: f32, proper_time: f32) -> bool {
-    let rel_u = (u - 0.11) / (0.89 - 0.11); // [0, 1]
-    let rel_v = (0.22 - v) / (0.22 - 0.06); // [0, 1] top-to-bottom
+    let rel_u = (u - 0.28) / (0.72 - 0.28); // [0, 1]
+    let rel_v = (0.18 - v) / (0.18 - 0.06); // [0, 1] top-to-bottom
 
     let total_cols = 35usize; // 6 chars * 6 cols - 1
     let col = (rel_u * total_cols as f32).floor() as usize;
@@ -474,9 +634,26 @@ fn sample_digital_tau(u: f32, v: f32, proper_time: f32) -> bool {
     (glyph[row] >> (4 - char_col)) & 1 != 0
 }
 
+/// Fractional bounce position in `[0.0, 1.0]` (`0.0` = bottom mirror, `1.0` = top mirror)
+/// for an Einstein light clock with rest-frame mirror separation `cavity_length` (`L`).
+/// Because the photon moves at `c = 1` in the rest frame, one-way travel takes `L` seconds
+/// of proper time and the round-trip period is `T = 2L/c = 2.0 * cavity_length`.
+#[inline]
+pub fn light_clock_bounce_fraction(proper_time: f32, cavity_length: f32) -> f32 {
+    let period = (2.0 * cavity_length).max(1e-4);
+    let cycle = (proper_time / period).rem_euclid(1.0);
+    if cycle < 0.5 {
+        cycle * 2.0
+    } else {
+        (1.0 - cycle) * 2.0
+    }
+}
+
 /// Einstein Bouncing-Photon Light Clock texture:
-/// A photon wavepacket bounces vertically between bottom mirror (v=0.12) and top mirror (v=0.88)
-/// at 1 bounce per 1.0s of proper time `tau`.
+/// A photon wavepacket bounces vertically between bottom mirror (`v = 0.10`) and top mirror (`v = 0.90`)
+/// (spanning `0.80` of the box height). With `he.y = 0.625` (box height `H = 1.25m`), the physical
+/// rest-frame mirror separation is `L = 0.80 * 1.25 = 1.00` light-second (`mat.cavity_length = 1.0`),
+/// so the photon moves at exact speed `1.00c` in its rest frame and bounces once per `1.0s` of `tau`.
 fn sample_light_clock_texture(uv: (f32, f32), proper_time: f32, mat: &Material) -> Vec3 {
     let u = (uv.0 * mat.grid_scale).rem_euclid(1.0);
     let v = (uv.1 * mat.grid_scale).rem_euclid(1.0);
@@ -486,22 +663,17 @@ fn sample_light_clock_texture(uv: (f32, f32), proper_time: f32, mat: &Material) 
         return mat.base_color * 0.65;
     }
 
-    // Top and bottom reflective mirror plates
-    if (0.06..=0.12).contains(&v) || (0.88..=0.94).contains(&v) {
+    // Top and bottom reflective mirror plates (inner reflecting surfaces at v = 0.10 and v = 0.90)
+    if (0.04..=0.10).contains(&v) || (0.90..=0.96).contains(&v) {
         return Vec3::new(0.75, 0.90, 0.98);
     }
-    if !(0.12..=0.88).contains(&v) {
+    if !(0.10..=0.90).contains(&v) {
         return Vec3::new(0.08, 0.12, 0.16);
     }
 
-    // Photon position in [0.12, 0.88]: 1.0s up, 1.0s down (period = 2.0s of proper time)
-    let cycle = (proper_time * 0.5).rem_euclid(1.0);
-    let bounce = if cycle < 0.5 {
-        cycle * 2.0
-    } else {
-        (1.0 - cycle) * 2.0
-    };
-    let photon_v = 0.14 + 0.72 * bounce;
+    // Photon position in [0.10, 0.90] with period T = 2L/c = 2.0 * mat.cavity_length
+    let bounce = light_clock_bounce_fraction(proper_time, mat.cavity_length);
+    let photon_v = 0.10 + 0.80 * bounce;
 
     let dv = (v - photon_v).abs();
     let du = (u - 0.5).abs();
@@ -510,7 +682,7 @@ fn sample_light_clock_texture(uv: (f32, f32), proper_time: f32, mat: &Material) 
     let mut col = Vec3::new(0.05, 0.09, 0.13);
 
     // Calibration ruler ticks along the cavity
-    let ruler_tick = ((v - 0.14) / 0.72 * 8.0).rem_euclid(1.0);
+    let ruler_tick = ((v - 0.10) / 0.80 * 8.0).rem_euclid(1.0);
     if (u < 0.22 || u > 0.78) && ruler_tick < 0.08 {
         col += Vec3::new(0.20, 0.35, 0.35);
     }
@@ -533,14 +705,21 @@ fn sample_light_clock_texture(uv: (f32, f32), proper_time: f32, mat: &Material) 
     col
 }
 
-fn shade_sky(ray_dir: Vec4) -> Vec3 {
-    // Normalize spatial part of ray direction in lab frame so the background star/grid
-    // inherently reflects relativistic aberration when the camera boosts!
+/// Smooth horizon-to-zenith sky gradient (used for distance fog without trig calls).
+#[inline]
+fn shade_sky_gradient(ray_dir: Vec4) -> Vec3 {
     let s = ray_dir.spatial().normalized();
     let horizon = (s.y * 0.5 + 0.5).clamp(0.0, 1.0);
     let zenith_col = Vec3::new(0.04, 0.06, 0.13);
     let horizon_col = Vec3::new(0.12, 0.16, 0.25);
-    let mut sky = horizon_col * (1.0 - horizon) + zenith_col * horizon;
+    horizon_col * (1.0 - horizon) + zenith_col * horizon
+}
+
+fn shade_sky(ray_dir: Vec4) -> Vec3 {
+    // Normalize spatial part of ray direction in lab frame so the background star/grid
+    // inherently reflects relativistic aberration when the camera boosts!
+    let s = ray_dir.spatial().normalized();
+    let mut sky = shade_sky_gradient(ray_dir);
 
     // Celestial coordinate grid on the sky sphere (makes relativistic aberration of the sky visible!)
     let theta = s.y.clamp(-1.0, 1.0).acos(); // [0, pi]
@@ -574,16 +753,36 @@ fn hsv_to_rgb(h_deg: f32, s: f32, v: f32) -> Vec3 {
     Vec3::new(r + m, g + m, b + m)
 }
 
+const GAMMA_LUT_SIZE: usize = 4096;
+
+fn gamma_lut() -> &'static [u8; GAMMA_LUT_SIZE] {
+    static LUT: OnceLock<[u8; GAMMA_LUT_SIZE]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut table = [0u8; GAMMA_LUT_SIZE];
+        for (i, slot) in table.iter_mut().enumerate() {
+            let x = (i as f32) / ((GAMMA_LUT_SIZE - 1) as f32);
+            *slot = (x.powf(1.0 / 2.2) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+        }
+        table
+    })
+}
+
 #[inline]
-pub fn pack_rgb(c: Vec3) -> u32 {
+fn pack_rgb_with_lut(c: Vec3, lut: &[u8; GAMMA_LUT_SIZE]) -> u32 {
     let mapped = Vec3::new(
         c.x / (1.0 + c.x * 0.35),
         c.y / (1.0 + c.y * 0.35),
         c.z / (1.0 + c.z * 0.35),
     )
     .clamp(0.0, 1.0);
-    let r = (mapped.x.powf(1.0 / 2.2) * 255.0) as u32;
-    let g = (mapped.y.powf(1.0 / 2.2) * 255.0) as u32;
-    let b = (mapped.z.powf(1.0 / 2.2) * 255.0) as u32;
+    let scale = (GAMMA_LUT_SIZE - 1) as f32;
+    let r = lut[(mapped.x * scale) as usize] as u32;
+    let g = lut[(mapped.y * scale) as usize] as u32;
+    let b = lut[(mapped.z * scale) as usize] as u32;
     (r << 16) | (g << 8) | b
+}
+
+#[inline]
+pub fn pack_rgb(c: Vec3) -> u32 {
+    pack_rgb_with_lut(c, gamma_lut())
 }

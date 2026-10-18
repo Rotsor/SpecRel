@@ -57,7 +57,7 @@ impl DemoScene {
     pub fn description(self) -> &'static str {
         match self {
             Self::TwinParadox => {
-                "LEFT=HOME (V=0), RIGHT=TRAVELER (0.88C TRIP). REUNITE AT T=+14S WITH 8S CLOCK GAP!"
+                "LEFT=HOME (V=0), RIGHT=TRAVELER (0.94C PEAK). REUNITE AT T=+14S WITH 8S CLOCK GAP!"
             }
             Self::BarnAndPole => {
                 "PAUSE [P] NEAR T=0, PRESS [G] FOR CAMERA SLICE & [V] TO MATCH POLE VELOCITY!"
@@ -89,19 +89,44 @@ impl DemoScene {
     pub fn comoving_beta(self, t: f32) -> Vec3 {
         match self {
             Self::TwinParadox => {
-                if (-14.0..=14.0).contains(&t) {
-                    let omega = std::f32::consts::TAU / 28.0;
-                    let vx = (4.2 * omega * (omega * (t + 14.0)).sin()).clamp(-0.95, 0.95);
-                    Vec3::new(vx, 0.0, 0.0)
-                } else {
-                    Vec3::new(0.85, 0.0, 0.0)
-                }
+                let (_, vx) = twin_traveler_x_and_vx(t as f64);
+                Vec3::new(vx as f32, 0.0, 0.0)
             }
             Self::BarnAndPole => Vec3::new(0.85, 0.0, 0.0),
             Self::TerrellPenroseStreet => Vec3::new(0.85, 0.0, 0.0),
             Self::EinsteinTrainSync => Vec3::new(0.80, 0.0, 0.0),
             Self::RelativisticCarousel => Vec3::new(0.80, 0.0, 0.0),
         }
+    }
+}
+
+/// Shared analytic position `x(t_rel)` and velocity `vx(t_rel)` for the Traveling Twin in Scene 1.
+/// - Rests at `x = 1.4` for `t_rel <= -14.0` and `t_rel >= +14.0` (`vx = 0.0`).
+/// - Executes a smooth raised-cosine excursion for `t_rel in [-14.0, +14.0]` peaking at `0.9425c`.
+#[inline]
+pub fn twin_traveler_x_and_vx(t_rel: f64) -> (f64, f64) {
+    let x_start = 1.4_f64;
+    let t_dep = -14.0_f64;
+    let t_ret = 14.0_f64;
+    if t_rel <= t_dep || t_rel >= t_ret {
+        (x_start, 0.0)
+    } else {
+        let period = t_ret - t_dep; // 28.0s
+        let omega = std::f64::consts::TAU / period;
+        let amp = 4.2_f64; // v_max = amp * omega = 0.9425c (gamma_max = 2.99)
+        let phase = omega * (t_rel - t_dep);
+        let (s, c) = phase.sin_cos();
+        (x_start + amp * (1.0 - c), amp * omega * s)
+    }
+}
+
+/// Invoke `build_copy(t_offset)` across periodic loop offsets `k in k_range` (`t_offset = k * t_loop`).
+fn for_periodic_copies<F>(t_loop: f32, k_range: std::ops::RangeInclusive<i32>, mut build_copy: F)
+where
+    F: FnMut(f32),
+{
+    for loop_k in k_range {
+        build_copy((loop_k as f32) * t_loop);
     }
 }
 
@@ -174,7 +199,7 @@ impl Scene4D {
                 0.025,
             )
             .with_pattern(SurfacePattern::ClockFace),
-            // 5: Einstein Bouncing-Photon Light Clock (emerald/cyan photon cavity)
+            // 5: Einstein Bouncing-Photon Light Clock (emerald/cyan photon cavity, L = 1.0 light-second)
             Material::new(
                 Vec3::new(0.20, 0.95, 0.65),
                 Vec3::new(0.08, 0.22, 0.18),
@@ -182,7 +207,8 @@ impl Scene4D {
                 1.0,
                 0.025,
             )
-            .with_pattern(SurfacePattern::LightClock),
+            .with_pattern(SurfacePattern::LightClock)
+            .with_cavity_length(1.0),
             // 6: Structural / Barn / Sphere Checkerboard (ivory & teal)
             Material::new(
                 Vec3::new(0.85, 0.82, 0.72),
@@ -209,14 +235,14 @@ impl Scene4D {
         all_simplices.extend(build_worldtube_simplices(&ground, &ground_wl, 0));
 
         let twin_cube = Mesh3D::cube(Vec3::new(1.15, 1.15, 1.15));
-        let light_clock_pillar = Mesh3D::cube(Vec3::new(0.55, 1.15, 0.55));
+        // he.y = 0.625 => total height H = 1.25m; cavity v in [0.10, 0.90] spans L = 0.80 * 1.25 = 1.00 light-second!
+        let light_clock_pillar = Mesh3D::cube(Vec3::new(0.55, 0.625, 0.55));
         let marker_cube = Mesh3D::cube(Vec3::new(0.6, 0.6, 0.6));
 
         // Generate contiguous loop-iteration copies (loop_k in -2..=1) so that when camera time
         // wraps from t_max (+34s) back to t_min (-18s), delayed photons from the end of loop_k = -1
         // continue reaching the camera seamlessly before the new loop's departure begins!
-        for loop_k in -2..=1 {
-            let t_offset = (loop_k as f32) * t_loop;
+        for_periodic_copies(t_loop, -2..=1, |t_offset| {
             let seg_t0 = t_min + t_offset;
             let seg_t1 = t_max + t_offset;
             let t_sync = t_sync_base + t_offset;
@@ -232,9 +258,9 @@ impl Scene4D {
             sync_proper_time_at(&mut home_wl, t_sync);
             all_simplices.extend(build_worldtube_simplices(&twin_cube, &home_wl, 1));
 
-            // Stationary Einstein Light-Clock next to Stay-at-Home Twin
+            // Stationary Einstein Light-Clock next to Stay-at-Home Twin (resting on ground y = -2.2)
             let mut home_lc_wl = sample_inertial_worldline(
-                Vec3::new(-3.2, -1.05, 6.0),
+                Vec3::new(-3.2, -1.575, 6.0),
                 Vec3::default(),
                 seg_t0,
                 seg_t1,
@@ -243,27 +269,13 @@ impl Scene4D {
             sync_proper_time_at(&mut home_lc_wl, t_sync);
             all_simplices.extend(build_worldtube_simplices(&light_clock_pillar, &home_lc_wl, 5));
 
-            // 2. Traveling Twin starting at x = +1.4, y = -1.05, z = 6.0:
-            //    - Rests next to Home Twin for t_rel <= -14.0
-            //    - Executes smooth relativistic excursion along +X for t_rel in [-14.0, +14.0]
-            //    - Parks next to Home Twin again for t_rel in [+14.0, +34.0] so clocks can be compared!
-            let traveler_x = |t: f32| -> f32 {
-                let t_rel = t - t_offset;
-                let x_start = 1.4;
-                let t_dep = -14.0;
-                let t_ret = 14.0;
-                if t_rel <= t_dep || t_rel >= t_ret {
-                    x_start
-                } else {
-                    let period = t_ret - t_dep; // 28.0s
-                    let omega = std::f32::consts::TAU / period;
-                    let amp = 4.2; // v_max = amp * omega = 0.942c (gamma_max = 2.99)
-                    x_start + amp * (1.0 - (omega * (t_rel - t_dep)).cos())
-                }
-            };
-
+            // 2. Traveling Twin starting at x = +1.4, y = -1.05, z = 6.0
+            let t_off_d = t_offset as f64;
             let mut trav_wl = sample_accelerated_worldline(
-                |t| Vec3::new(traveler_x(t), -1.05, 6.0),
+                |t| {
+                    let (x, _) = twin_traveler_x_and_vx(t - t_off_d);
+                    [x, -1.05, 6.0]
+                },
                 seg_t0,
                 seg_t1,
                 120,
@@ -271,9 +283,12 @@ impl Scene4D {
             sync_proper_time_at(&mut trav_wl, t_sync);
             all_simplices.extend(build_worldtube_simplices(&twin_cube, &trav_wl, 2));
 
-            // Comoving Einstein Light-Clock riding on top of the Traveling Twin!
+            // Comoving Einstein Light-Clock riding on top of the Traveling Twin (top at y = +0.10)
             let mut trav_lc_wl = sample_accelerated_worldline(
-                |t| Vec3::new(traveler_x(t), 1.25, 6.0),
+                |t| {
+                    let (x, _) = twin_traveler_x_and_vx(t - t_off_d);
+                    [x, 0.725, 6.0]
+                },
                 seg_t0,
                 seg_t1,
                 120,
@@ -291,7 +306,7 @@ impl Scene4D {
             );
             sync_proper_time_at(&mut marker_wl, t_sync);
             all_simplices.extend(build_worldtube_simplices(&marker_cube, &marker_wl, 3));
-        }
+        });
 
         Self {
             demo,
@@ -355,15 +370,9 @@ impl Scene4D {
 
         // 4. The 8.0m Relativistic Pole (he.x = 4.0 => total rest length L0 = 8.0m > 5.0m Barn!).
         // At beta_x = 0.85c (gamma = 1.898), its lab-frame contracted length is 8.0 / 1.898 = 4.21m < 5.0m!
-        // We instantiate worldtube copies for loop iterations `loop_k in -2..=1` (centered at t = k * t_loop)
-        // so that when camera time wraps from t_max (+12s) back to t_min (-12s), the delayed photons
-        // from the previous iteration (`loop_k = -1`) continue arriving while the pole exits the barn
-        // and flies off into the distance!
         let pole_mesh = Mesh3D::cube(Vec3::new(4.0, 0.55, 0.45));
         let beta = Vec3::new(0.85, 0.0, 0.0);
-        for loop_k in -2..=1 {
-            let t_offset = (loop_k as f32) * t_loop;
-            // Position at lab time t = 0 so that at t = t_offset the pole is centered at (0.0, -0.85, 6.0):
+        for_periodic_copies(t_loop, -2..=1, |t_offset| {
             let pos_at_t0 = Vec3::new(0.0, -0.85, 6.0) - beta * t_offset;
             let mut pole_wl = sample_inertial_worldline(
                 pos_at_t0,
@@ -374,7 +383,7 @@ impl Scene4D {
             );
             sync_proper_time_at(&mut pole_wl, t_offset);
             all_simplices.extend(build_worldtube_simplices(&pole_mesh, &pole_wl, 2));
-        }
+        });
 
         Self {
             demo,
@@ -401,18 +410,29 @@ impl Scene4D {
 
         // 2. Stationary colonnade of reference Clock Cubes & Light Clocks on Left (-X) and Right (+X)
         let pillar_cube = Mesh3D::cube(Vec3::new(0.95, 0.95, 0.95));
+        let lc_pillar = Mesh3D::cube(Vec3::new(0.65, 0.625, 0.65));
         for iz in -3..=3 {
             let z = iz as f32 * 5.0;
             for &x in &[-4.2, 4.2] {
-                let wl = sample_inertial_worldline(
-                    Vec3::new(x, -1.25, z),
-                    Vec3::default(),
-                    -140.0,
-                    140.0,
-                    1,
-                );
-                let mat_id = if iz == 0 { 5 } else { 1 };
-                all_simplices.extend(build_worldtube_simplices(&pillar_cube, &wl, mat_id));
+                if iz == 0 {
+                    let wl = sample_inertial_worldline(
+                        Vec3::new(x, -1.575, z),
+                        Vec3::default(),
+                        -140.0,
+                        140.0,
+                        1,
+                    );
+                    all_simplices.extend(build_worldtube_simplices(&lc_pillar, &wl, 5));
+                } else {
+                    let wl = sample_inertial_worldline(
+                        Vec3::new(x, -1.25, z),
+                        Vec3::default(),
+                        -140.0,
+                        140.0,
+                        1,
+                    );
+                    all_simplices.extend(build_worldtube_simplices(&pillar_cube, &wl, 1));
+                }
             }
         }
 
@@ -420,12 +440,10 @@ impl Scene4D {
         // (beta_x = 0.85c) and the Penrose Sphere (beta_z = -0.86c), shifted by `t_offset = k * t_loop`:
         let flyer_cube = Mesh3D::cube(Vec3::new(1.05, 1.05, 1.05));
         let beta_flyer = Vec3::new(0.85, 0.0, 0.0);
-        let sphere_mesh = Mesh3D::uv_sphere(1.05, 8, 12);
+        let sphere_mesh = Mesh3D::uv_sphere(1.05, 10, 16);
         let beta_sphere = Vec3::new(0.0, 0.0, -0.86);
 
-        for loop_k in -2..=1 {
-            let t_offset = (loop_k as f32) * t_loop;
-
+        for_periodic_copies(t_loop, -2..=1, |t_offset| {
             let flyer_pos_t0 = Vec3::new(0.0, -0.75, 4.5) - beta_flyer * t_offset;
             let mut flyer_wl = sample_inertial_worldline(
                 flyer_pos_t0,
@@ -447,16 +465,16 @@ impl Scene4D {
             );
             sync_proper_time_at(&mut sphere_wl, t_offset);
             all_simplices.extend(build_worldtube_simplices(&sphere_mesh, &sphere_wl, 6));
-        }
+        });
 
         // 5. Relativistically accelerating / oscillating Clock Cube along X
         // Period is exactly T_loop = 28.0s (omega_0 = 2*pi/28 = 0.2244 rad/s, v_max = 3.6 * omega_0 = 0.808c)
-        let omega_0 = std::f32::consts::TAU / t_loop;
+        let omega_0 = std::f64::consts::TAU / (t_loop as f64);
         let accel_cube = Mesh3D::cube(Vec3::new(0.95, 0.95, 0.95));
         let accel_wl = sample_accelerated_worldline(
             |t| {
-                let a = 3.6;
-                Vec3::new(a * (omega_0 * t).sin(), 1.1, 8.5)
+                let a = 3.6_f64;
+                [a * (omega_0 * t).sin(), 1.1, 8.5]
             },
             -110.0,
             70.0,
@@ -465,14 +483,13 @@ impl Scene4D {
         all_simplices.extend(build_worldtube_simplices(&accel_cube, &accel_wl, 3));
 
         // 6. Relativistically orbiting Clock Cube in the XZ plane
-        // Angular frequency is 2 * omega_0 (2 full orbits per loop, v = 1.75 * 2 * omega_0 = 0.785c)
-        let orbit_cube = Mesh3D::cube(Vec3::new(0.80, 0.80, 0.80));
+        // Angular frequency is omega_0 (1 full orbit per loop, r = 3.2m => v = 0.718c, well inside the light cylinder)
+        let orbit_cube = Mesh3D::cube(Vec3::new(0.75, 0.75, 0.75));
         let orbit_wl = sample_accelerated_worldline(
             |t| {
-                let r = 1.75;
-                let omega = 2.0 * omega_0;
-                let (s, c) = (omega * t).sin_cos();
-                Vec3::new(1.5 + r * c, 0.5, 11.5 + r * s)
+                let r = 3.2_f64;
+                let (s, c) = (omega_0 * t).sin_cos();
+                [1.5 + r * c, 0.5, 11.5 + r * s]
             },
             -110.0,
             70.0,
@@ -520,10 +537,10 @@ impl Scene4D {
             all_simplices.extend(build_worldtube_simplices(&clock_cube, &wl, 1));
         }
 
-        // Central Einstein Light-Clock on the platform at x = 0
-        let lc_box = Mesh3D::cube(Vec3::new(0.55, 0.95, 0.55));
+        // Central Einstein Light-Clock on the platform at x = 0 (he.y = 0.625 => L = 1.0 light-second)
+        let lc_box = Mesh3D::cube(Vec3::new(0.55, 0.625, 0.55));
         let lc_wl = sample_inertial_worldline(
-            Vec3::new(0.0, -1.15, 5.1),
+            Vec3::new(0.0, -1.575, 5.1),
             Vec3::default(),
             -140.0,
             140.0,
@@ -531,15 +548,10 @@ impl Scene4D {
         );
         all_simplices.extend(build_worldtube_simplices(&lc_box, &lc_wl, 5));
 
-        // 2. Relativistic Train of 7 Synchronized Clock Wagons moving at beta_x = 0.80c (gamma = 5/3 = 1.667):
-        // We instantiate worldtube copies of the entire 7-wagon train for loop iterations `loop_k in -2..=1`
-        // (centered at lab time t_offset = k * t_loop) so that when the scene loops at t_max (+14s -> -14s),
-        // the previous loop's train (`loop_k = -1`) finishes receding down the right side of the track
-        // while the new loop's train (`loop_k = 0`) enters from the left!
+        // 2. Relativistic Train of 7 Synchronized Clock Wagons moving at beta_x = 0.80c (gamma = 5/3 = 1.667)
         let beta = Vec3::new(0.80, 0.0, 0.0);
         let gamma = 1.0f32 / (1.0f32 - beta.x * beta.x).sqrt(); // 5/3 = 1.6667
-        for loop_k in -2..=1 {
-            let t_offset = (loop_k as f32) * t_loop;
+        for_periodic_copies(t_loop, -2..=1, |t_offset| {
             for i in -3..=3 {
                 let x_rest = i as f32 * 2.6;
                 // Position at lab time t = t_offset is x_rest / gamma, so at t = 0:
@@ -557,7 +569,7 @@ impl Scene4D {
                 sync_proper_time_at(&mut wl, t_sync_wagon);
                 all_simplices.extend(build_worldtube_simplices(&clock_cube, &wl, 2));
             }
-        }
+        });
 
         Self {
             demo,
@@ -584,7 +596,6 @@ impl Scene4D {
         all_simplices.extend(build_worldtube_simplices(&ground, &ground_wl, 0));
 
         // Central Stationary Master Clock at (0, -0.7, 8.0) + Einstein Light Clock on top
-        // Extended back to -110.0 so delayed photons at t_min (-24.0) never run out of worldtube!
         let master_cube = Mesh3D::cube(Vec3::new(1.05, 1.05, 1.05));
         let mut master_wl = sample_inertial_worldline(
             Vec3::new(0.0, -0.7, 8.0),
@@ -596,9 +607,9 @@ impl Scene4D {
         sync_proper_time_at(&mut master_wl, t_sync);
         all_simplices.extend(build_worldtube_simplices(&master_cube, &master_wl, 1));
 
-        let lc_cube = Mesh3D::cube(Vec3::new(0.55, 0.95, 0.55));
+        let lc_cube = Mesh3D::cube(Vec3::new(0.55, 0.625, 0.55));
         let mut lc_wl = sample_inertial_worldline(
-            Vec3::new(0.0, 1.35, 8.0),
+            Vec3::new(0.0, 0.975, 8.0),
             Vec3::default(),
             -110.0,
             70.0,
@@ -608,18 +619,22 @@ impl Scene4D {
         all_simplices.extend(build_worldtube_simplices(&lc_cube, &lc_wl, 5));
 
         // 6 Relativistically Orbiting Clock Cubes around the Master Clock at v = 0.80c (gamma = 1.667).
-        // Orbital angular frequency is chosen so 2 full revolutions occur per 48.0s loop (omega = 4*pi / 48.0),
-        // making the carousel positions & velocities strictly periodic across the [t_min, t_max] loop wrap!
-        let orbiter_cube = Mesh3D::cube(Vec3::new(0.75, 0.75, 0.75));
-        let omega = 2.0 * std::f32::consts::TAU / t_loop; // 2 revolutions per loop = 0.2618 rad/s
+        // Orbital angular frequency is chosen so 2 full revolutions occur per 48.0s loop (omega = 4*pi / 48.0).
+        let orbiter_cube = Mesh3D::cube(Vec3::new(0.62, 0.62, 0.62));
+        let omega = 2.0 * std::f64::consts::TAU / (t_loop as f64); // 2 revolutions per loop = 0.2618 rad/s
         let radius = 0.80 / omega; // v = R * omega = 0.80c (R = 3.056m)
+        let t_sync_d = t_sync as f64;
         for k in 0..6 {
-            let phase0 = (k as f32) * std::f32::consts::TAU / 6.0;
+            let phase0 = (k as f64) * std::f64::consts::TAU / 6.0;
             let mut wl = sample_accelerated_worldline(
                 |t| {
-                    let angle = omega * (t - t_sync) + phase0;
+                    let angle = omega * (t - t_sync_d) + phase0;
                     let (s, c) = angle.sin_cos();
-                    Vec3::new(radius * c, -0.6 + 0.4 * (2.0 * angle).sin(), 8.0 + radius * s)
+                    [
+                        radius * c,
+                        -0.6 + 0.25 * (2.0 * angle).sin(),
+                        8.0 + radius * s,
+                    ]
                 },
                 -110.0,
                 70.0,
@@ -646,7 +661,8 @@ mod tests {
     use super::*;
     use crate::minkowski::Tetrad;
     use crate::renderer::{
-        render_frame, Camera4D, RenderConfig, RenderMode, ShadowMode, SliceMode,
+        light_clock_bounce_fraction, render_frame, Camera4D, RenderConfig, RenderMode, ShadowMode,
+        SliceMode,
     };
 
     #[test]
@@ -834,5 +850,109 @@ mod tests {
             hit_at_tmax.proper_time,
             hit_at_tmin.proper_time
         );
+    }
+
+    #[test]
+    fn test_light_clock_subluminal_exact_speed_c() {
+        // Verify that the Einstein light clock has rest-frame mirror separation L = 1.0 light-second,
+        // rest-frame round-trip period T_0 = 2L/c = 2.0s (photon speed = 1.0c), and lab-frame period
+        // gamma * 2L/c when moving transversely at speed beta = 0.80c (gamma = 5/3).
+        let scene = Scene4D::build(DemoScene::TwinParadox);
+        let lc_mat = &scene.materials[5];
+        assert_eq!(lc_mat.pattern, SurfacePattern::LightClock);
+        assert!((lc_mat.cavity_length - 1.0).abs() < 1e-6);
+
+        // At tau = 0.0 -> bottom mirror (0.0); tau = L = 1.0 -> top mirror (1.0); tau = 2L = 2.0 -> bottom (0.0):
+        assert!((light_clock_bounce_fraction(0.0, lc_mat.cavity_length) - 0.0).abs() < 1e-6);
+        assert!((light_clock_bounce_fraction(0.5, lc_mat.cavity_length) - 0.5).abs() < 1e-6);
+        assert!((light_clock_bounce_fraction(1.0, lc_mat.cavity_length) - 1.0).abs() < 1e-6);
+        assert!((light_clock_bounce_fraction(2.0, lc_mat.cavity_length) - 0.0).abs() < 1e-6);
+
+        // For a light clock moving transversely at beta = 0.80 (gamma = 5/3), lab time elapsed per
+        // round-trip bounce is T_lab = gamma * 2L = 10/3 s, during which photon travels
+        // y_dist = L = 1.0 transversely and x_dist = beta * (T_lab / 2) = 4/3 longitudinally,
+        // giving total lab speed sqrt(1^2 + (4/3)^2) / (5/3) = 1.000c!
+        let beta = 0.80_f32;
+        let gamma = 1.0 / (1.0 - beta * beta).sqrt();
+        let t_lab_half_period = gamma * lc_mat.cavity_length;
+        let tau_at_half_period = t_lab_half_period / gamma;
+        assert!(
+            (light_clock_bounce_fraction(tau_at_half_period, lc_mat.cavity_length) - 1.0).abs()
+                < 1e-5
+        );
+        let lab_path_len = (lc_mat.cavity_length.powi(2) + (beta * t_lab_half_period).powi(2)).sqrt();
+        let lab_photon_speed = lab_path_len / t_lab_half_period;
+        assert!((lab_photon_speed - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_penrose_sphere_circular_silhouette() {
+        // Penrose (1959): A sphere moving at relativistic speed beta casts a strictly circular
+        // silhouette on the observer's sky (constant angular radius around its aberrated sky center),
+        // even though it is Lorentz-contracted by 1/gamma in 3D coordinate space!
+        let radius = 1.2_f32;
+        let sphere = Mesh3D::uv_sphere(radius, 24, 36);
+        // Moving transversely at beta_x = 0.80c (gamma = 5/3, 3D x-length contracted by 0.60x):
+        let beta = Vec3::new(0.80, 0.0, 0.0);
+        let pos_t0 = Vec3::new(0.0, 0.0, 8.0);
+        let wl = sample_inertial_worldline(pos_t0, beta, -40.0, 40.0, 4);
+        let bvh = Bvh4D::build(build_worldtube_simplices(&sphere, &wl, 0));
+
+        let obs = Vec4::new(0.0, 0.0, 0.0, 0.0);
+        let tetrad = Tetrad::rest();
+
+        // Find the retarded time t_ret < 0 where the sphere center's worldline X_c(t) = pos_t0 + beta * t
+        // intersects the observer's past light cone |X_c(t)| = -t:
+        let a = 1.0 - beta.length_sq();
+        let b = -2.0 * pos_t0.dot(beta);
+        let c = -pos_t0.length_sq();
+        let t_ret = (-b - (b * b - 4.0 * a * c).sqrt()) / (2.0 * a);
+        let retarded_dir = (pos_t0 + beta * t_ret).normalized();
+
+        let u_perp = Vec3::new(0.0, 1.0, 0.0).cross(retarded_dir).normalized();
+
+        let find_edge = |center_dir: Vec3, radial_dir: Vec3| -> f32 {
+            let mut lo = 0.0_f32;
+            let mut hi = 0.45_f32;
+            for _ in 0..20 {
+                let mid = 0.5 * (lo + hi);
+                let dir = center_dir * mid.cos() + radial_dir * mid.sin();
+                let ray = tetrad.past_light_ray_direction(dir);
+                if bvh.trace(obs, ray, 0.1, 30.0).is_some() {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            0.5 * (lo + hi)
+        };
+
+        // Locate the true center of the aberrated circle along u_perp (the motion direction)
+        let r_plus = find_edge(retarded_dir, u_perp);
+        let r_minus = find_edge(retarded_dir, -u_perp);
+        let shift = 0.5 * (r_plus - r_minus);
+        let circle_center = (retarded_dir * shift.cos() + u_perp * shift.sin()).normalized();
+        let u_circle = Vec3::new(0.0, 1.0, 0.0).cross(circle_center).normalized();
+        let v_circle = circle_center.cross(u_circle).normalized();
+
+        // Measure the silhouette angular radius across 8 azimuths around circle_center:
+        let mut angular_radii = Vec::new();
+        for k in 0..8 {
+            let phi = (k as f32) * std::f32::consts::TAU / 8.0;
+            let radial_dir = u_circle * phi.cos() + v_circle * phi.sin();
+            angular_radii.push(find_edge(circle_center, radial_dir));
+        }
+
+        let mean_r: f32 = angular_radii.iter().sum::<f32>() / (angular_radii.len() as f32);
+        for (k, &r) in angular_radii.iter().enumerate() {
+            assert!(
+                (r - mean_r).abs() / mean_r < 0.015,
+                "Azimuth {} angular radius {} deviates from circular mean {} (radii = {:?})",
+                k,
+                r,
+                mean_r,
+                angular_radii
+            );
+        }
     }
 }
