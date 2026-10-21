@@ -5,7 +5,8 @@ use crate::mesh4d::{
 };
 use crate::minkowski::{Vec3, Vec4};
 
-/// Selectable Special Relativity thought-experiment / paradox scenes.
+/// Selectable scenes: five precomputed Special Relativity thought experiments (keys 1-5) and
+/// the causal Dynamic Mode scenes (key 6+), whose geometry grows up to the camera's future light cone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DemoScene {
     TwinParadox,
@@ -13,16 +14,23 @@ pub enum DemoScene {
     TerrellPenroseStreet,
     EinsteinTrainSync,
     RelativisticCarousel,
+    RelativisticBilliards,
 }
 
 impl DemoScene {
-    pub const ALL: [DemoScene; 5] = [
+    pub const ALL: [DemoScene; 6] = [
         DemoScene::TwinParadox,
         DemoScene::BarnAndPole,
         DemoScene::TerrellPenroseStreet,
         DemoScene::EinsteinTrainSync,
         DemoScene::RelativisticCarousel,
+        DemoScene::RelativisticBilliards,
     ];
+
+    /// Dynamic Mode scenes are simulated causally (`crate::dynamic`) instead of precomputed.
+    pub fn is_dynamic(self) -> bool {
+        matches!(self, Self::RelativisticBilliards)
+    }
 
     pub fn next(self) -> Self {
         match self {
@@ -30,13 +38,15 @@ impl DemoScene {
             Self::BarnAndPole => Self::TerrellPenroseStreet,
             Self::TerrellPenroseStreet => Self::EinsteinTrainSync,
             Self::EinsteinTrainSync => Self::RelativisticCarousel,
-            Self::RelativisticCarousel => Self::TwinParadox,
+            Self::RelativisticCarousel => Self::RelativisticBilliards,
+            Self::RelativisticBilliards => Self::TwinParadox,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            Self::TwinParadox => Self::RelativisticCarousel,
+            Self::TwinParadox => Self::RelativisticBilliards,
+            Self::RelativisticBilliards => Self::RelativisticCarousel,
             Self::BarnAndPole => Self::TwinParadox,
             Self::TerrellPenroseStreet => Self::BarnAndPole,
             Self::EinsteinTrainSync => Self::TerrellPenroseStreet,
@@ -51,6 +61,7 @@ impl DemoScene {
             Self::TerrellPenroseStreet => "3: TERRELL-PENROSE ROTATION & PENROSE SPHERE STREET",
             Self::EinsteinTrainSync => "4: EINSTEIN TRAIN & RELATIVITY OF SIMULTANEITY",
             Self::RelativisticCarousel => "5: RELATIVISTIC CAROUSEL & THOMAS PRECESSION",
+            Self::RelativisticBilliards => "6: RELATIVISTIC BILLIARDS (CAUSAL DYNAMIC MODE)",
         }
     }
 
@@ -71,6 +82,9 @@ impl DemoScene {
             Self::RelativisticCarousel => {
                 "CENTER=MASTER CLOCK (V=0). RING=6 CLOCKS ORBITING AT 0.80C (GAMMA=1.67) + LIGHT CLOCK!"
             }
+            Self::RelativisticBilliards => {
+                "PUCKS EXIST ONLY UP TO YOUR FUTURE LIGHT CONE. SEE IT WITH [G] FRONTIER/PROPHECY + [M] AGE."
+            }
         }
     }
 
@@ -81,6 +95,7 @@ impl DemoScene {
             Self::TerrellPenroseStreet => Vec4::new(0.0, 0.0, 0.0, -7.5),
             Self::EinsteinTrainSync => Vec4::new(-3.0, 0.0, 0.0, -4.5),
             Self::RelativisticCarousel => Vec4::new(-18.0, 0.0, 0.8, -2.5),
+            Self::RelativisticBilliards => Vec4::new(0.0, 0.0, 0.4, -6.0),
         }
     }
 
@@ -96,6 +111,7 @@ impl DemoScene {
             Self::TerrellPenroseStreet => Vec3::new(0.85, 0.0, 0.0),
             Self::EinsteinTrainSync => Vec3::new(0.80, 0.0, 0.0),
             Self::RelativisticCarousel => Vec3::new(0.80, 0.0, 0.0),
+            Self::RelativisticBilliards => crate::dynamic::billiards::COMOVING_BETA,
         }
     }
 }
@@ -150,6 +166,7 @@ impl Scene4D {
             DemoScene::TerrellPenroseStreet => Self::build_terrell_penrose_street(demo, materials),
             DemoScene::EinsteinTrainSync => Self::build_einstein_train(demo, materials),
             DemoScene::RelativisticCarousel => Self::build_carousel(demo, materials),
+            DemoScene::RelativisticBilliards => crate::dynamic::DynWorld::spawn(demo).build_scene(),
         }
     }
 
@@ -216,6 +233,22 @@ impl Scene4D {
                 0.18,
                 2.0,
                 0.025,
+            ),
+            // 7: Moving puck (bright electric cyan & silver checkerboard)
+            Material::new(
+                Vec3::new(0.25, 0.92, 1.00),
+                Vec3::new(0.85, 0.94, 0.98),
+                0.28,
+                2.0,
+                0.030,
+            ),
+            // 8: Resting puck (warm coral & cream checkerboard)
+            Material::new(
+                Vec3::new(0.96, 0.38, 0.22),
+                Vec3::new(0.95, 0.86, 0.72),
+                0.22,
+                2.0,
+                0.030,
             ),
         ]
     }

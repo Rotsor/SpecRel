@@ -297,6 +297,7 @@ pub struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    scene_layout: wgpu::BindGroupLayout,
     frame_layout: wgpu::BindGroupLayout,
     uniform_buf: wgpu::Buffer,
     tables_buf: wgpu::Buffer,
@@ -420,6 +421,7 @@ impl GpuRenderer {
             device,
             queue,
             pipeline,
+            scene_layout,
             frame_layout,
             uniform_buf,
             tables_buf,
@@ -476,6 +478,11 @@ impl GpuRenderer {
             num_nodes: packed.num_nodes,
             light_pos: packed.light_pos,
         }
+    }
+
+    /// Replace `scenes[scene_idx]`'s GPU buffers (a Dynamic Mode scene grew new geometry).
+    pub fn update_scene(&mut self, scene_idx: usize, scene: &Scene4D) {
+        self.scenes[scene_idx] = Self::upload_scene(&self.device, &self.scene_layout, scene);
     }
 
     /// Human-readable adapter description, e.g. `"NVIDIA GeForce RTX 4070 (Vulkan)"`.
@@ -734,6 +741,61 @@ mod tests {
                     i + 1, shadow_mode, bad_frac * 100.0
                 );
             }
+        }
+    }
+
+    /// A live Dynamic Mode snapshot (scene 6 after the camera has thrust and coasted for a few
+    /// seconds, so tubes end in caps at the frontier) renders the same on both backends in
+    /// every view, including the ones that look at the frontier itself.
+    #[test]
+    fn gpu_matches_cpu_dynamic_world() {
+        use crate::dynamic::DynWorld;
+        use crate::renderer::Frontier;
+
+        let mut cam = Camera4D::new(DemoScene::RelativisticBilliards.initial_camera_pos(), 65.0);
+        let mut world = DynWorld::spawn(DemoScene::RelativisticBilliards);
+        for _ in 0..40 {
+            cam.tetrad.boost_local(Vec3::new(0.01, 0.0, 0.01));
+            cam.position += cam.tetrad.e[0] * 0.1;
+            cam.proper_time += 0.1;
+            world.advance(Frontier { origin: cam.position, proper_time: cam.proper_time });
+        }
+        let scene = world.build_scene();
+        let dynamics = FrameDynamics { frontier: Some(world.frontier), flashes: Vec::new() };
+        let mut gpu = match GpuRenderer::new(std::slice::from_ref(&scene)) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping GPU test: {e}");
+                return;
+            }
+        };
+
+        let (w, h) = (192, 120);
+        let mut cpu_fb = vec![0u32; w * h];
+        let mut gpu_fb = vec![0u32; w * h];
+        for (mode, shadow_mode, slice_mode) in [
+            (RenderMode::RelativisticShaded, ShadowMode::LorentzInvariant, SliceMode::PastLightCone),
+            (RenderMode::DecisionAge, ShadowMode::Off, SliceMode::PastLightCone),
+            (RenderMode::DecisionAge, ShadowMode::Off, SliceMode::Frontier),
+            (RenderMode::RelativisticShaded, ShadowMode::LorentzInvariant, SliceMode::Frontier),
+            (RenderMode::RelativisticShaded, ShadowMode::Off, SliceMode::ProphecySlice),
+        ] {
+            let cfg = RenderConfig {
+                width: w,
+                height: h,
+                mode,
+                shadow_mode,
+                slice_mode,
+                prophecy_delta: PROPHECY_DELTA_DEFAULT,
+            };
+            render_frame(&scene, &cam, &cfg, &dynamics, &mut cpu_fb);
+            gpu.render(0, &cam, &cfg, &dynamics, &mut gpu_fb);
+            let (max_diff, bad_frac) = diff_stats(&cpu_fb, &gpu_fb, 4);
+            println!(
+                "dynamic {mode:?}/{shadow_mode:?}/{slice_mode:?}: max diff {max_diff}, {:.3}% px > 4",
+                bad_frac * 100.0
+            );
+            assert!(bad_frac < 0.005, "{slice_mode:?}: {:.3}% of pixels differ", bad_frac * 100.0);
         }
     }
 

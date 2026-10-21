@@ -827,6 +827,46 @@ pub fn build_worldtube_simplices_with_decided(
     simplices
 }
 
+/// Seal a Born-rigid worldtube with the body's rest-frame cross-section at `sample` (e.g. where
+/// a Dynamic Mode history currently ends at the causal frontier): one tetrahedron per surface
+/// triangle, fanned to the body center. The cap is a spacelike 3-volume, so rays crossing the
+/// end of the tube see the body's interior there.
+pub fn build_worldtube_cap(
+    mesh: &Mesh3D,
+    sample: &WorldlineSample,
+    decided_at: f32,
+    material_id: usize,
+) -> Vec<Simplex4D> {
+    let to_world = |p: Vec3| sample.center + sample.tetrad.local_spatial_to_world(p);
+    let tau_at = |p: Vec3| sample.proper_time + p.dot(sample.phi);
+    let tri_bary = [
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+        Vec3::new(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0),
+    ];
+    mesh.triangles
+        .iter()
+        .filter_map(|tri| {
+            let [pa, pb, pc] = tri.indices.map(|i| mesh.vertices[i]);
+            let [uva, uvb, uvc] = tri.uv;
+            let uv_mid = ((uva.0 + uvb.0 + uvc.0) / 3.0, (uva.1 + uvb.1 + uvc.1) / 3.0);
+            Simplex4D::new(
+                [to_world(pa), to_world(pb), to_world(pc), sample.center],
+                [uva, uvb, uvc, uv_mid],
+                tri_bary,
+                [tau_at(pa), tau_at(pb), tau_at(pc), sample.proper_time],
+                [(0.0, 0.0); 4],
+                (1.0, 1.0),
+                sample.tetrad.local_spatial_to_world(tri.normal),
+                sample.tetrad.e[0],
+                material_id,
+            )
+        })
+        .map(|s| s.with_decided_at([decided_at; 4]))
+        .collect()
+}
+
 /// Generate a worldline for an inertial object moving at constant 3-velocity `beta`
 /// passing through spatial point `pos_at_t0` at lab time `t = 0`, spanning lab time `[t_min, t_max]`.
 pub fn sample_inertial_worldline(

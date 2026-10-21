@@ -3,17 +3,27 @@
 //! translate their own key events into [`Action`]s and [`HeldInput`], and keep only what is
 //! genuinely theirs (rendering backend, resolution, HUD visibility, presentation).
 
+use crate::dynamic::DynWorld;
 use crate::minkowski::{Vec3, Vec4};
 use crate::renderer::{
-    Camera4D, FrameDynamics, RenderConfig, RenderMode, ShadowMode, ViewMode,
+    Camera4D, FrameDynamics, Frontier, RenderConfig, RenderMode, ShadowMode, ViewMode,
     PROPHECY_DELTA_DEFAULT,
 };
 use crate::scene::Scene4D;
 
 pub const TIME_SCALES: [f32; 10] = [-4.0, -2.0, -1.0, -0.5, -0.25, 0.25, 0.5, 1.0, 2.0, 4.0];
+/// Index of the slowest *forward* speed: Dynamic Mode cannot run time backwards.
+const FIRST_FORWARD_TIME_SCALE_IDX: usize = 5;
 /// Index of `+1.0x` in [`TIME_SCALES`].
 const DEFAULT_TIME_SCALE_IDX: usize = 7;
 const FOV_Y_DEG: f32 = 65.0;
+/// Wall-clock interval between geometry snapshots of a growing dynamic world (the plan's
+/// "10 Hz full rebuild"; a thing at distance `D` was decided ~`2D` ago, so the lag is invisible
+/// in the Real Camera and God's Eye views).
+const DYNAMIC_REBUILD_INTERVAL: f32 = 0.1;
+/// Rebase a dynamic world's lab time once the camera passes this, to keep `f32` render
+/// coordinates precise while time runs forward indefinitely.
+const DYNAMIC_REBASE_AFTER_T: f32 = 1000.0;
 
 /// A discrete, edge-triggered user command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,12 +83,18 @@ pub struct App {
     pub dynamics: FrameDynamics,
     pub paused: bool,
     pub time_scale_idx: usize,
+    /// The causal simulation behind the current scene, if it is a Dynamic Mode scene.
+    pub world: Option<DynWorld>,
+    /// Bumped whenever a scene's geometry is replaced, so frontends know to re-upload it.
+    pub scene_generation: u64,
+    world_grew: bool,
+    rebuild_timer: f32,
 }
 
 impl App {
     pub fn new(scenes: Vec<Scene4D>, width: usize, height: usize) -> Self {
         let camera = Camera4D::new(scenes[0].demo.initial_camera_pos(), FOV_Y_DEG);
-        Self {
+        let mut app = Self {
             scenes,
             scene_idx: 0,
             camera,
@@ -93,11 +109,30 @@ impl App {
             dynamics: FrameDynamics::default(),
             paused: false,
             time_scale_idx: DEFAULT_TIME_SCALE_IDX,
-        }
+            world: None,
+            scene_generation: 0,
+            world_grew: false,
+            rebuild_timer: 0.0,
+        };
+        app.enter_scene(0);
+        app
     }
 
     pub fn scene(&self) -> &Scene4D {
         &self.scenes[self.scene_idx]
+    }
+
+    /// Dynamic Mode: the camera is the ship, so only timelike motion forward in time is allowed
+    /// (no rewinding, coordinate scrubbing or teleporting).
+    pub fn is_dynamic(&self) -> bool {
+        self.world.is_some()
+    }
+
+    fn camera_frontier(&self) -> Frontier {
+        Frontier {
+            origin: self.camera.position,
+            proper_time: self.camera.proper_time,
+        }
     }
 
     pub fn time_scale(&self) -> f32 {
@@ -119,10 +154,15 @@ impl App {
             Action::CycleShadows => self.cfg.shadow_mode = self.cfg.shadow_mode.next(),
             Action::TogglePause => self.paused = !self.paused,
             Action::ToggleRewind => {
-                self.time_scale_idx = TIME_SCALES.len() - 1 - self.time_scale_idx;
-                self.paused = false;
+                if !self.is_dynamic() {
+                    self.time_scale_idx = TIME_SCALES.len() - 1 - self.time_scale_idx;
+                    self.paused = false;
+                }
             }
-            Action::Slower => self.time_scale_idx = self.time_scale_idx.saturating_sub(1),
+            Action::Slower => {
+                let floor = if self.is_dynamic() { FIRST_FORWARD_TIME_SCALE_IDX } else { 0 };
+                self.time_scale_idx = self.time_scale_idx.saturating_sub(1).max(floor);
+            }
             Action::Faster => {
                 self.time_scale_idx = (self.time_scale_idx + 1).min(TIME_SCALES.len() - 1)
             }
@@ -176,17 +216,21 @@ impl App {
 
         // 3. Direct coordinate-space & time scrubbing. Because scrubbing `t` at fixed
         // `(x, y, z)` is a coordinate translation rather than motion along the observer's
-        // timelike worldline, `camera.proper_time` is left unchanged.
-        let scrub_speed = 6.0 * dt_wall;
-        let scrub_t = axis(input.scrub_forward, input.scrub_back);
-        let mut time_changed = scrub_t != 0.0;
-        self.camera.position.t += scrub_t * scrub_speed;
-        let shift_local = Vec3::new(
-            axis(input.move_right, input.move_left),
-            axis(input.move_up, input.move_down),
-            axis(input.move_forward, input.move_back),
-        ) * scrub_speed;
-        self.camera.position += self.camera.tetrad.local_spatial_to_world(shift_local);
+        // timelike worldline, `camera.proper_time` is left unchanged. Such acausal jumps would
+        // break "camera = ship" in Dynamic Mode, so they are disabled there.
+        let mut time_changed = false;
+        if !self.is_dynamic() {
+            let scrub_speed = 6.0 * dt_wall;
+            let scrub_t = axis(input.scrub_forward, input.scrub_back);
+            time_changed = scrub_t != 0.0;
+            self.camera.position.t += scrub_t * scrub_speed;
+            let shift_local = Vec3::new(
+                axis(input.move_right, input.move_left),
+                axis(input.move_up, input.move_down),
+                axis(input.move_forward, input.move_back),
+            ) * scrub_speed;
+            self.camera.position += self.camera.tetrad.local_spatial_to_world(shift_local);
+        }
 
         // 4. Advance observer along their timelike worldline: dX^mu = u^mu * d_tau
         if !self.paused {
@@ -196,23 +240,70 @@ impl App {
             time_changed = true;
         }
 
-        // Loop lab time seamlessly within [scene.t_min, scene.t_max]
-        let (t_min, t_max) = (self.scene().t_min, self.scene().t_max);
-        let t = self.camera.position.t;
-        if time_changed && (t > t_max || t < t_min) {
-            let wrapped = t_min + (t - t_min).rem_euclid(t_max - t_min);
-            // The scene is periodic, so carry flashes along to the same moment of the loop.
-            self.dynamics.shift_time(wrapped - t);
-            self.camera.position.t = wrapped;
+        if self.is_dynamic() {
+            self.step_world(dt_wall);
+        } else {
+            // Loop lab time seamlessly within [scene.t_min, scene.t_max]
+            let (t_min, t_max) = (self.scene().t_min, self.scene().t_max);
+            let t = self.camera.position.t;
+            if time_changed && (t > t_max || t < t_min) {
+                let wrapped = t_min + (t - t_min).rem_euclid(t_max - t_min);
+                // The scene is periodic, so carry flashes along to the same moment of the loop.
+                self.dynamics.shift_time(wrapped - t);
+                self.camera.position.t = wrapped;
+            }
         }
         self.dynamics.retire_flashes(self.camera.position.t);
     }
 
+    /// Dynamic Mode: move the causal frontier to the camera and finalize what it uncovered,
+    /// snapshotting the geometry at most every [`DYNAMIC_REBUILD_INTERVAL`].
+    fn step_world(&mut self, dt_wall: f32) {
+        if self.camera.position.t > DYNAMIC_REBASE_AFTER_T {
+            let shift = -DYNAMIC_REBASE_AFTER_T;
+            self.camera.position.t += shift;
+            self.dynamics.shift_time(shift);
+            if let Some(world) = self.world.as_mut() {
+                world.rebase(shift as f64);
+            }
+            self.world_grew = true;
+        }
+
+        let frontier = self.camera_frontier();
+        self.dynamics.frontier = Some(frontier);
+        let world = self.world.as_mut().expect("dynamic scene has a world");
+        self.world_grew |= world.advance(frontier);
+
+        self.rebuild_timer += dt_wall;
+        if self.world_grew && self.rebuild_timer >= DYNAMIC_REBUILD_INTERVAL {
+            self.rebuild_dynamic_scene();
+        }
+    }
+
+    fn rebuild_dynamic_scene(&mut self) {
+        if let Some(world) = &self.world {
+            self.scenes[self.scene_idx] = world.build_scene();
+            self.scene_generation += 1;
+            self.world_grew = false;
+            self.rebuild_timer = 0.0;
+        }
+    }
+
     fn enter_scene(&mut self, idx: usize) {
         self.scene_idx = idx;
-        self.camera = Camera4D::new(self.scene().demo.initial_camera_pos(), FOV_Y_DEG);
+        let demo = self.scene().demo;
+        self.camera = Camera4D::new(demo.initial_camera_pos(), FOV_Y_DEG);
         self.paused = false;
         self.dynamics.flashes.clear();
+
+        self.world = demo.is_dynamic().then(|| {
+            DynWorld::new(demo, self.camera_frontier(), self.camera.tetrad.e[0])
+        });
+        self.dynamics.frontier = self.world.as_ref().map(|w| w.frontier);
+        if self.is_dynamic() {
+            self.time_scale_idx = self.time_scale_idx.max(FIRST_FORWARD_TIME_SCALE_IDX);
+            self.rebuild_dynamic_scene();
+        }
     }
 }
 
@@ -280,5 +371,63 @@ mod tests {
 
         app.apply(Action::SelectScene(7)); // out of range: ignored
         assert_eq!(app.scene_idx, 0);
+    }
+
+    fn billiards_app() -> App {
+        let scenes = vec![
+            Scene4D::build(DemoScene::TwinParadox),
+            Scene4D::build(DemoScene::RelativisticBilliards),
+        ];
+        let mut app = App::new(scenes, 64, 40);
+        app.apply(Action::SelectScene(1));
+        app
+    }
+
+    #[test]
+    fn dynamic_scene_tracks_the_camera_frontier_and_rebuilds() {
+        let mut app = billiards_app();
+        assert!(app.is_dynamic());
+        let entered = app.scene_generation;
+        assert!(entered > 0, "entering a dynamic scene snapshots its world");
+
+        app.step(0.05, &HeldInput::default());
+        let f = app.dynamics.frontier.expect("frontier follows the camera");
+        assert_eq!(f.origin, app.camera.position);
+        assert_eq!(app.scene_generation, entered, "no snapshot before the rebuild interval");
+        app.step(0.06, &HeldInput::default());
+        assert_eq!(app.scene_generation, entered + 1);
+
+        // Back to a static scene: no world, no frontier.
+        app.apply(Action::SelectScene(0));
+        assert!(!app.is_dynamic() && app.dynamics.frontier.is_none());
+    }
+
+    #[test]
+    fn dynamic_scene_only_moves_forward_in_time() {
+        let mut app = billiards_app();
+        app.apply(Action::ToggleRewind);
+        for _ in 0..10 {
+            app.apply(Action::Slower);
+        }
+        assert!(app.time_scale() > 0.0);
+
+        let p0 = app.camera.position;
+        app.apply(Action::TogglePause);
+        let scrub = HeldInput { scrub_back: true, move_forward: true, ..Default::default() };
+        app.step(0.1, &scrub);
+        assert_eq!(app.camera.position, p0, "scrubbing and teleporting are disabled");
+    }
+
+    #[test]
+    fn dynamic_scene_rebases_lab_time() {
+        let mut app = billiards_app();
+        app.camera.position.t = DYNAMIC_REBASE_AFTER_T - 0.01;
+        app.apply(Action::EmitFlash);
+        app.step(0.1, &HeldInput::default());
+        let t = app.camera.position.t;
+        assert!(t < 1.0, "camera rebased to {t}");
+        let world = app.world.as_ref().unwrap();
+        assert_eq!(world.frontier.origin, app.camera.position);
+        assert!((app.dynamics.flashes[0].at.t - (t - 0.1)).abs() < 1e-3);
     }
 }

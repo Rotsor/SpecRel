@@ -1,5 +1,6 @@
 pub mod app;
 pub mod bvh4d;
+pub mod dynamic;
 pub mod gpu;
 pub mod hud;
 pub mod mesh4d;
@@ -37,6 +38,7 @@ const KEY_ACTIONS: &[(Key, Action)] = &[
     (Key::Key3, Action::SelectScene(2)),
     (Key::Key4, Action::SelectScene(3)),
     (Key::Key5, Action::SelectScene(4)),
+    (Key::Key6, Action::SelectScene(5)),
     (Key::N, Action::NextScene),
     (Key::B, Action::PrevScene),
     (Key::M, Action::CycleRenderMode),
@@ -94,7 +96,7 @@ fn main() {}
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    println!("Building 5 Special Relativity 4D Spacetime Demo Scenes and 4D BVHs...");
+    println!("Building {} demo scenes and 4D BVHs...", DemoScene::ALL.len());
     let build_start = Instant::now();
     let scenes: Vec<Scene4D> = DemoScene::ALL
         .iter()
@@ -198,7 +200,7 @@ fn main() {
     set_resolution(&mut app, &mut framebuffer, res_scale);
 
     let mut window = Window::new(
-        "SpecRel 4D - Special Relativistic Spacetime Raytracer (Keys 1-5: Switch Paradox Scene)",
+        "SpecRel 4D - Special Relativistic Spacetime Raytracer (Keys 1-6: Switch Scene)",
         WIDTH,
         HEIGHT,
         WindowOptions {
@@ -212,6 +214,7 @@ fn main() {
     window.set_target_fps(60);
 
     let mut show_hud = true;
+    let mut uploaded_generation = app.scene_generation;
     let mut last_frame = Instant::now();
     let mut fps_smooth = 60.0f32;
 
@@ -249,6 +252,12 @@ fn main() {
         }
 
         app.step(dt_wall, &held_input(&window));
+        if app.scene_generation != uploaded_generation {
+            if let Some(g) = gpu.as_mut() {
+                g.update_scene(app.scene_idx, app.scene());
+            }
+            uploaded_generation = app.scene_generation;
+        }
 
         match gpu.as_mut() {
             Some(g) if use_gpu => g.render(

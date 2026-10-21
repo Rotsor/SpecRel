@@ -172,7 +172,7 @@ fn draw_hud_lines(
     let speed = beta.length();
     let gamma = camera.tetrad.gamma();
 
-    let line_scene = format!("SCENE [1-5 / N,B]: {}", demo.title());
+    let line_scene = format!("SCENE [1-6 / N,B]: {}", demo.title());
     let line_desc = demo.description();
 
     let time_status = if paused {

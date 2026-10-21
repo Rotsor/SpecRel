@@ -51,6 +51,10 @@ Switch scenes at any time with keys **`1`–`5`** or **`N` / `B`**:
 5. **`[5]` Relativistic Carousel & Transverse Time Dilation**
    * A central stationary master clock surrounded by 6 clocks orbiting at $0.80c$ ($\gamma = 1.667$), illustrating transverse time dilation and Fermi–Walker / Thomas precession ($\Delta\theta_{\text{Thomas}} = 2\pi(\gamma - 1)$ per orbit).
 
+### Causal Dynamic Mode (in progress)
+
+6. **`[6]` Relativistic Billiards** — the first *causally simulated* scene (see [`docs/DYNAMIC_MODE_PLAN.md`](docs/DYNAMIC_MODE_PLAN.md)). Nothing is precomputed: every puck's history is simulated only up to your **future light cone**, the boundary of what you can no longer influence, so far pucks are known far into the lab-frame future and near ones barely past "now". Everything you normally see is already decided; switch to **Frontier** or **Prophecy** (`G`) to watch the world being written, and **Decision Age** (`M`) to see when each event became fixed. The camera is the ship here, so rewinding and coordinate scrubbing are disabled. (The pucks are still inert — they bounce off the rails but not yet off each other or you.)
+
 ---
 
 ## Running
@@ -103,7 +107,7 @@ python -m http.server 8080 --directory web
 | :--- | :--- |
 | **`F`** | Toggle between **GPU Compute** (defaults to 2X 2560x1600 on desktop, 1X 1280x800 on web) and **CPU Reference** (1X 1280x800) backend |
 | **`Z`** / **`Y`** | Toggle resolution scale: **1X (1280x800)** vs. **2X (2560x1600)** |
-| **`1` – `5`** / **`N`**, **`B`** | Switch between the 5 Special Relativity demo scenes |
+| **`1` – `6`** / **`N`**, **`B`** | Switch between the 5 Special Relativity demo scenes and the Dynamic Mode billiards scene |
 | **`W` `A` `S` `D`** / **`Space`** / **`C`** | Fire proper-acceleration thrusters (Lorentz boost in local frame) |
 | **`V`** | Toggle velocity match with the scene's moving object (Pole / Train / Traveler) |
 | **`X`** | Brake immediately to the Lab rest frame ($\boldsymbol{\beta} = 0$) |
@@ -135,6 +139,7 @@ If you are reading the code to learn how Special Relativity is implemented geome
 5. [`src/gpu.rs`](src/gpu.rs) — `wgpu` GPU compute backend and target-agnostic GPU buffer packing (`PackedSceneGpuData`, `GpuUniforms`), managing static storage buffer uploads, uniform blocks, pipeline dispatch, readback, and CPU-vs-GPU validation tests.
 6. [`src/shaders/render.wgsl`](src/shaders/render.wgsl) — High-performance WGSL compute shader executing full 4D BVH traversal, intersection, procedural clock dials, and lighting on the GPU.
 7. [`src/scene.rs`](src/scene.rs) — The 5 Special Relativity demo scenes with multi-iteration periodic worldtubes (`for_periodic_copies`) and physics verification tests.
+   - [`src/dynamic/`](src/dynamic/mod.rs) — Causal Dynamic Mode: bodies with `f64` histories extended exactly up to the camera's future light cone (`DynWorld`, the frontier rule `is_decided`), and the billiards scene.
 8. [`src/hud.rs`](src/hud.rs) — Software 5x7 bitmap font renderer for HUD, GPU HUD overlay buffer, and in-scene digital clock readouts.
 9. [`src/app.rs`](src/app.rs) — Frontend-independent app state shared by desktop and web: scene selection, observer camera, relativistic flight controls (`Action` / `HeldInput`), time controls and per-frame dynamics.
 10. [`src/main.rs`](src/main.rs) — Native desktop window loop (`minifb`): key bindings and GPU/CPU backend switching.

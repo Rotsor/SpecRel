@@ -1,7 +1,8 @@
 //! WebAssembly (`wasm32-unknown-unknown`) bindings for running SpecRel 4D in the browser.
 //!
 //! Exports a C-ABI interface over WASM linear memory so JavaScript can:
-//! 1. Initialize all 5 Special Relativity 4D scenes and their 4D SAH BVHs in WASM.
+//! 1. Initialize the demo scenes and their 4D SAH BVHs in WASM (re-packing Dynamic Mode scenes
+//!    as they grow; JS re-uploads them via `web_take_dirty_scene`).
 //! 2. Read zero-copy slices of the packed GPU storage buffers (`GpuNode`, `GpuGeom`, `GpuAttr`,
 //!    `GpuMaterial`, `tables`) and the WGSL compute shader (`RENDER_WGSL`) directly from WASM
 //!    memory into browser WebGPU (`navigator.gpu`).
@@ -42,6 +43,7 @@ pub const KEY_V: u32 = 20;
 pub const KEY_SLASH: u32 = 21;
 pub const KEY_PAGE_UP: u32 = 22;
 pub const KEY_PAGE_DOWN: u32 = 23;
+pub const KEY_6: u32 = 24;
 
 // Continuous held-key bitflags (100 + bit index)
 pub const HOLD_LEFT: u32 = 100;
@@ -69,6 +71,7 @@ pub const HOLD_O: u32 = 119;
 fn key_action(code: u32) -> Option<Action> {
     Some(match code {
         KEY_1..=KEY_5 => Action::SelectScene((code - KEY_1) as usize),
+        KEY_6 => Action::SelectScene(5),
         KEY_N => Action::NextScene,
         KEY_B => Action::PrevScene,
         KEY_M => Action::CycleRenderMode,
@@ -125,6 +128,10 @@ struct WebState {
     fps_smooth: f32,
     held_keys: u32,
     uniforms: GpuUniforms,
+    /// `App::scene_generation` last packed into `packed_scenes`.
+    packed_generation: u64,
+    /// Scene whose re-packed buffers JS has not re-uploaded yet.
+    dirty_scene: Option<usize>,
     hud_overlay: Vec<u32>,
     cpu_fb: Vec<u32>,
     cpu_rgba: Vec<u32>,
@@ -157,6 +164,7 @@ pub extern "C" fn web_init(gpu_available: u32) {
 
     let has_gpu = gpu_available != 0;
     let app = App::new(scenes, WIDTH, HEIGHT);
+    let packed_generation = app.scene_generation;
     let uniforms = GpuUniforms::build(
         &app.camera,
         &app.cfg,
@@ -176,6 +184,8 @@ pub extern "C" fn web_init(gpu_available: u32) {
         fps_smooth: 60.0,
         held_keys: 0,
         uniforms,
+        packed_generation,
+        dirty_scene: None,
         hud_overlay: vec![0u32; HUD_BASE_WIDTH * HUD_OVERLAY_HEIGHT],
         cpu_fb: vec![0u32; WIDTH * HEIGHT],
         cpu_rgba: vec![0u32; WIDTH * HEIGHT],
@@ -252,6 +262,11 @@ pub extern "C" fn web_step(dt_secs: f32) {
         s.fps_smooth = s.fps_smooth * 0.9 + (1.0 / dt_wall) * 0.1;
 
         s.app.step(dt_wall, &held_input(s.held_keys));
+        if s.app.scene_generation != s.packed_generation {
+            s.packed_scenes[s.app.scene_idx] = PackedSceneGpuData::from_scene(s.app.scene());
+            s.packed_generation = s.app.scene_generation;
+            s.dirty_scene = Some(s.app.scene_idx);
+        }
 
         let app = &s.app;
         let packed = &s.packed_scenes[app.scene_idx];
@@ -399,6 +414,12 @@ pub extern "C" fn web_scene_materials_ptr(scene_idx: usize) -> *const u8 {
 #[no_mangle]
 pub extern "C" fn web_scene_materials_byte_len(scene_idx: usize) -> usize {
     with_state(|s| bytemuck::cast_slice::<_, u8>(&s.packed_scenes[scene_idx].materials).len())
+}
+
+/// Index of a scene whose packed buffers changed since JS last uploaded them (then cleared), or -1.
+#[no_mangle]
+pub extern "C" fn web_take_dirty_scene() -> i32 {
+    with_state(|s| s.dirty_scene.take().map_or(-1, |i| i as i32))
 }
 
 #[no_mangle]

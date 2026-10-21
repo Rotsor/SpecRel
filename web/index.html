@@ -182,6 +182,7 @@
       <button data-key="3" id="scene-btn-2"><kbd>[3]</kbd>Terrell–Penrose Street</button>
       <button data-key="4" id="scene-btn-3"><kbd>[4]</kbd>Einstein Train Sync</button>
       <button data-key="5" id="scene-btn-4"><kbd>[5]</kbd>Relativistic Carousel</button>
+      <button data-key="24" id="scene-btn-5"><kbd>[6]</kbd>Billiards (Dynamic)</button>
       <span class="hint">Drag canvas to look around · WASD/Space/C to thrust</span>
     </div>
     <div class="btn-row">
@@ -282,6 +283,7 @@
       Digit3: 3, Numpad3: 3,
       Digit4: 4, Numpad4: 4,
       Digit5: 5, Numpad5: 5,
+      Digit6: 24, Numpad6: 24,
       KeyN: 6,
       KeyB: 7,
       KeyM: 8,
@@ -495,9 +497,9 @@
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
           });
 
-          const sceneCount = wasm.web_scene_count();
-          const sceneBindGroups = [];
-          for (let i = 0; i < sceneCount; i++) {
+          // Upload (or re-upload, when a Dynamic Mode scene grows) one scene's storage buffers.
+          const sceneBuffers = [];
+          const uploadScene = (i) => {
             const nodesBuf = createStorageBuffer(
               `scene ${i} nodes`,
               wasmBytes(wasm, wasm.web_scene_nodes_ptr(i), wasm.web_scene_nodes_byte_len(i))
@@ -515,18 +517,23 @@
               wasmBytes(wasm, wasm.web_scene_materials_ptr(i), wasm.web_scene_materials_byte_len(i))
             );
 
-            sceneBindGroups.push(
-              device.createBindGroup({
-                label: `scene ${i} bind group`,
-                layout: sceneLayout,
-                entries: [
-                  { binding: 0, resource: { buffer: nodesBuf } },
-                  { binding: 1, resource: { buffer: geomsBuf } },
-                  { binding: 2, resource: { buffer: attrsBuf } },
-                  { binding: 3, resource: { buffer: matsBuf } },
-                ],
-              })
-            );
+            for (const old of sceneBuffers[i] || []) old.destroy();
+            sceneBuffers[i] = [nodesBuf, geomsBuf, attrsBuf, matsBuf];
+            return device.createBindGroup({
+              label: `scene ${i} bind group`,
+              layout: sceneLayout,
+              entries: [
+                { binding: 0, resource: { buffer: nodesBuf } },
+                { binding: 1, resource: { buffer: geomsBuf } },
+                { binding: 2, resource: { buffer: attrsBuf } },
+                { binding: 3, resource: { buffer: matsBuf } },
+              ],
+            });
+          };
+          const sceneCount = wasm.web_scene_count();
+          const sceneBindGroups = [];
+          for (let i = 0; i < sceneCount; i++) {
+            sceneBindGroups.push(uploadScene(i));
           }
 
           gpuResources = {
@@ -542,6 +549,7 @@
             hudBuf,
             blitParamsBuf,
             sceneBindGroups,
+            uploadScene,
             frameWidth: 0,
             frameHeight: 0,
             outputBuf: null,
@@ -669,6 +677,10 @@
           lastTime = now;
 
           wasm.web_step(dt);
+          const dirtyScene = wasm.web_take_dirty_scene();
+          if (dirtyScene >= 0 && gpuResources) {
+            gpuResources.sceneBindGroups[dirtyScene] = gpuResources.uploadScene(dirtyScene);
+          }
 
           const w = wasm.web_width();
           const h = wasm.web_height();
@@ -679,7 +691,7 @@
 
           if (sceneIdx !== prevSceneIdx) {
             prevSceneIdx = sceneIdx;
-            for (let i = 0; i < 5; i++) {
+            for (let i = 0; i < wasm.web_scene_count(); i++) {
               const b = document.getElementById(`scene-btn-${i}`);
               if (b) b.classList.toggle("active-scene", i === sceneIdx);
             }

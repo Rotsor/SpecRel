@@ -382,22 +382,55 @@ fast-forwarded to it.
 * **Known issue (pre-existing):** HUD line 3 overflows the 1240 px box in its longest
   combinations (isochrones + camera-slice shadows); the Prophecy label adds two characters.
 
-### Phase 3 — Dynamic world skeleton + scene 6 (inert)
-* **First, extract shared app state.** `main.rs` and `web.rs` duplicate all input handling
-  and time stepping. Phase 2 added three more keys to both. Move camera, config, dynamics,
-  time scale and a `handle_action(Action)` / `step(dt)` API into an `app.rs` used by both
-  frontends before adding the per-frame simulation step, so it is written once.
-* Add `src/dynamic/` with `DynWorld`, `Body`, the frontier rule and scheduler, ship-as-body,
-  and the input log.
-* Add the billiards scene with **inert** pucks only (no collisions yet); their tubes grow up
-  to the frontier and end in caps.
-* Wire dynamic scenes into the time code (no looping, origin rebase), plus the 10 Hz
-  rebuild: `GpuRenderer::update_scene` and `web_scene_dirty`.
-* **Reuse from the draft:** `build_worldtube_cap`; `GpuRenderer::update_scene` (+
-  `scene_layout` field); materials 7–8 from `common_materials`; billiards spawn/velocity from
-  `DemoScene::spawn_offset`/`spawn_velocity`.
-* **Tests:** no step is ever finalized inside `I⁺(O)`; `decided_at` non-decreasing; replaying
-  the input log is bit-identical; a full dynamic frame renders identically on CPU and GPU.
+### Phase 3 — Dynamic world skeleton + scene 6 (inert) ✅
+* **Shared app state (`app.rs`, own commit).** `App` holds the scenes, camera, `RenderConfig`,
+  `FrameDynamics`, time controls and (new) the `DynWorld`. Frontends map keys to
+  `Action`/`HeldInput` and keep only backend, resolution, HUD visibility and presentation.
+* **`src/dynamic/`.**
+  * `body.rs`: `BodyState` (`f64` t/pos/vel/τ), `Body` (rest mesh, radius, `Motion`, history
+    + parallel `decided_at`) and the frontier rule `is_decided`. The centre must clear
+    `∂J⁺(O)` by `γ(1+β)r`, which bounds every vertex of the moving body in space *and* time.
+  * `mod.rs`: `DynWorld`.
+    * `new` back-fills each history from 200 s before the camera up to the frontier, stamped
+      with the analytic decision time.
+    * `advance(frontier)` is the scheduler (one pass, since bodies are inert) and prunes
+      history older than 200 s.
+    * `rebase`, and `build_scene`: the static table plus each body's tube, merged into
+      straight segments (split at kinks and every 50 s) and sealed with a cap at its frontier
+      tip.
+  * `billiards.rs`: the scene. A resting rack and four movers bouncing off the rails, in
+    separate lanes because pucks can't collide yet.
+* **Wiring.**
+  * `DemoScene::RelativisticBilliards` (key `6`, web button) and `DemoScene::is_dynamic`.
+  * In dynamic scenes, `App` sets `FrameDynamics::frontier` to the camera event, never loops,
+    and rebases lab time past t = 1000. It disables rewind, negative time scales, `[ ]`
+    scrubbing and IJKL/UO moves (camera = ship).
+  * The geometry is re-snapshotted at most every 0.1 s wall time while the world grows, and
+    `App::scene_generation` signals frontends: natively `GpuRenderer::update_scene`; on the
+    web `web_take_dirty_scene()` → JS `uploadScene(i)`, which destroys the old buffers.
+* **Measured.** A snapshot is ~12.5k simplices and `build_scene` takes ~9 ms natively
+  (`cargo test --release -- --ignored time_build_scene`). The web build holds ~57 FPS with
+  the rebuild running. (The first cut, with a finer sphere and 25 s segments, was 32k
+  simplices / 27 ms.)
+* **Not done (moved):**
+  * The **input log** moves to Phase 9 (rewind/branching), the first thing that replays
+    input. Phase 3's determinism test instead checks the property that matters now: histories
+    are bit-identical however the frontier's motion is split into frames.
+  * The **ship as a body** is just its recorded track (`DynWorld::ship`) until Phase 4 gives
+    it a mesh and collisions.
+* **Tests:**
+  * every finalized step is decided, `decided_at` is non-decreasing and ≤ now, and the next
+    step is still undecided (along an accelerating camera path);
+  * histories are independent of frame chunking;
+  * pruning, and causality surviving a rebase;
+  * pucks stay on the table and bounce;
+  * `step_back` inverts `step`;
+  * the snapshot stays small;
+  * GPU = CPU on a live dynamic world in all frontier views;
+  * `App`: frontier tracking, rebuild cadence, forward-only time, rebase.
+* **Known approximation:** the decided region (the complement of a convex cone) is not
+  convex, so a tube prism between two decided steps can graze `I⁺(O)` by ~size²/distance.
+  This is invisible at puck scale.
 
 ### Phase 4 — Pucks and spores
 Collisions (elastic + inelastic), firing (`Enter`), ammo toggle (`\`), spores, and the ship
