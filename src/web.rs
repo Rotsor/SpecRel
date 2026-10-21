@@ -44,6 +44,8 @@ pub const KEY_SLASH: u32 = 21;
 pub const KEY_PAGE_UP: u32 = 22;
 pub const KEY_PAGE_DOWN: u32 = 23;
 pub const KEY_6: u32 = 24;
+pub const KEY_ENTER: u32 = 25;
+pub const KEY_BACKSLASH: u32 = 26;
 
 // Continuous held-key bitflags (100 + bit index)
 pub const HOLD_LEFT: u32 = 100;
@@ -72,6 +74,8 @@ fn key_action(code: u32) -> Option<Action> {
     Some(match code {
         KEY_1..=KEY_5 => Action::SelectScene((code - KEY_1) as usize),
         KEY_6 => Action::SelectScene(5),
+        KEY_ENTER => Action::Fire,
+        KEY_BACKSLASH => Action::CycleAmmo,
         KEY_N => Action::NextScene,
         KEY_B => Action::PrevScene,
         KEY_M => Action::CycleRenderMode,
@@ -284,12 +288,14 @@ pub extern "C" fn web_step(dt_secs: f32) {
             "CPU"
         };
         let demo = app.scene().demo;
+        let desc = app.scene_description();
 
         if s.gpu_available && s.use_gpu {
             if s.show_hud {
                 draw_hud_overlay(
                     &mut s.hud_overlay,
                     demo,
+                    &desc,
                     &app.camera,
                     &app.cfg,
                     app.paused,
@@ -311,6 +317,7 @@ pub extern "C" fn web_step(dt_secs: f32) {
                     draw_hud_overlay(
                         &mut s.hud_overlay,
                         demo,
+                        &desc,
                         &app.camera,
                         &app.cfg,
                         app.paused,
@@ -325,6 +332,7 @@ pub extern "C" fn web_step(dt_secs: f32) {
                     draw_hud(
                         &mut s.cpu_fb,
                         demo,
+                        &desc,
                         &app.camera,
                         &app.cfg,
                         app.paused,

@@ -758,7 +758,7 @@ mod tests {
             cam.tetrad.boost_local(Vec3::new(0.01, 0.0, 0.01));
             cam.position += cam.tetrad.e[0] * 0.1;
             cam.proper_time += 0.1;
-            world.advance(Frontier { origin: cam.position, proper_time: cam.proper_time });
+            world.advance(Frontier { origin: cam.position, proper_time: cam.proper_time }, cam.tetrad.e[0]);
         }
         let scene = world.build_scene();
         let dynamics = FrameDynamics { frontier: Some(world.frontier), flashes: Vec::new() };

@@ -53,6 +53,9 @@ const KEY_ACTIONS: &[(Key, Action)] = &[
     (Key::X, Action::Brake),
     (Key::V, Action::MatchVelocity),
     (Key::Slash, Action::EmitFlash),
+    (Key::Enter, Action::Fire),
+    (Key::NumPadEnter, Action::Fire),
+    (Key::Backslash, Action::CycleAmmo),
 ];
 
 /// Key bindings that auto-repeat while held (`KeyRepeat::Yes`).
@@ -275,6 +278,7 @@ fn main() {
             draw_hud(
                 &mut framebuffer,
                 app.scene().demo,
+                &app.scene_description(),
                 &app.camera,
                 &app.cfg,
                 app.paused,

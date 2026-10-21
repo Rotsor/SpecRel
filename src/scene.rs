@@ -83,7 +83,7 @@ impl DemoScene {
                 "CENTER=MASTER CLOCK (V=0). RING=6 CLOCKS ORBITING AT 0.80C (GAMMA=1.67) + LIGHT CLOCK!"
             }
             Self::RelativisticBilliards => {
-                "PUCKS EXIST ONLY UP TO YOUR FUTURE LIGHT CONE. SEE IT WITH [G] FRONTIER/PROPHECY + [M] AGE."
+                "RAM PUCKS WITH THE SHIP. [G] FRONTIER/PROPHECY, [M] DECISION AGE"
             }
         }
     }
@@ -250,6 +250,31 @@ impl Scene4D {
                 2.0,
                 0.030,
             ),
+            // 9: Merged puck: kinetic energy turned into rest mass (incandescent gold/orange glow)
+            Material::new(
+                Vec3::new(1.00, 0.82, 0.22),
+                Vec3::new(0.98, 0.35, 0.10),
+                0.55,
+                2.0,
+                0.035,
+            ),
+            // 10: Sticky (inelastic) puck (magenta & plum checkerboard)
+            Material::new(
+                Vec3::new(0.95, 0.25, 0.72),
+                Vec3::new(0.42, 0.10, 0.35),
+                0.30,
+                2.0,
+                0.030,
+            ),
+            // 11: Spore: clock face counting its own proper time down to the decay (lime bezel)
+            Material::new(
+                Vec3::new(0.55, 1.00, 0.25),
+                Vec3::new(0.12, 0.40, 0.10),
+                0.30,
+                1.0,
+                0.025,
+            )
+            .with_pattern(SurfacePattern::ClockFace),
         ]
     }
 

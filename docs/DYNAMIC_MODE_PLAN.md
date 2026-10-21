@@ -432,13 +432,60 @@ fast-forwarded to it.
   convex, so a tube prism between two decided steps can graze `I⁺(O)` by ~size²/distance.
   This is invisible at puck scale.
 
-### Phase 4 — Pucks and spores
-Collisions (elastic + inelastic), firing (`Enter`), ammo toggle (`\`), spores, and the ship
-being rammed.
-* **Reuse from the draft:** materials 7–9.
-* **Tests:** 4-momentum is conserved to 1e-9 for elastic and inelastic collisions; spore decay
-  lab time = `γ·T`; the **causality property test** (same input up to `O`, different after →
-  every step outside `I⁺(O)` is bit-identical).
+### Phase 4 — Pucks and spores ✅
+* **`collide.rs`:** exact `f64` relativistic kinematics.
+  * Elastic collisions reflect the momenta along the contact normal in the CM frame.
+  * Mergers carry the total 4-momentum, so the rest mass exceeds the sum.
+  * Two-body decays: fragments of rest mass `M / 2γ` fly back-to-back in the parent frame.
+* **Scheduler (`DynWorld::try_advance`).** All bodies share a global step grid (`BodyState::step`;
+  `t` is always derived from it). A body advances from step `k` only when:
+  1. its next state is decided, and
+  2. everything that could touch it at `k` is known: other bodies at `k`, or behind but
+     unable to reach contact range at light speed; and the ship's recorded track (bodies near
+     the ship wait for it).
+
+  Its next state is then a pure function of finalized data. This replaces the plan's vaguer
+  "neighbour rule". Isolated bodies stay tight against the frontier; clustered ones wait for
+  their slowest neighbour.
+* **Births and deaths never share a step.**
+  * Merged bodies and spore fragments start at `k+1` from parts that ended at `k`, once that
+    state is decided.
+  * The first version created products at `k`, where they collided with their own parents
+    (runaway mass doubling). A test caught it.
+* **Ammo** (`\` cycles; `Enter` fires at 0.6c along the view in the ship frame):
+  * elastic puck;
+  * sticky puck: sticky clusters merge transitively into a glowing puck, radius ∝ m^⅓;
+  * spore: a clock-faced cube that pops after 2.5 s of its own time into two spores (1.2 s
+    fuse), whose fragments are pucks.
+
+  Projectiles leave the ship's center and ignore the ship until clear. Their launch state is
+  fixed by the firing input itself, so it is exempt from the "decided" check.
+* **Ramming.** The ship is a heavy (6×) sphere of radius 0.8 on its recorded track.
+  Collisions hand it exactly the 4-momentum the puck lost (`ship_kicks`), and `App` boosts the
+  camera's 4-velocity accordingly.
+* **Table.** The rails reflect, and the felt absorbs vertical motion, so shots fired from above
+  land and slide instead of flying off. The rack is spaced (gaps ≈ 1.1) and the movers run in
+  separate lanes, so nothing collides in the back-filled past.
+* **Rigid-contact caveat (documented, not hidden).** Contact acts across the touching bodies'
+  radii within one step, so a momentum kick can hop through a dense cluster faster than `c`.
+  The rack spacing keeps hops subluminal up to ~0.6c impacts. The causality test allows one
+  contact range of slack; in its scenario no difference leaked outside `I⁺(O)` even with zero
+  slack.
+* **HUD/keys.**
+  * `App::scene_description` shows `[ENTER] FIRE <AMMO> | [\] AMMO`, and the HUD font
+    gained `\`.
+  * `Enter`/`NumpadEnter`/`\` are wired natively, and on the web as codes 25/26 with buttons.
+* **Tests:**
+  * collision/merge/decay 4-momentum conserved to 1e-9;
+  * the elastic shot sets ≥ 2 rack pucks moving;
+  * the sticky shot merges with conservation and rest mass > sum;
+  * a spore fired at 0.8c pops after `γ·T` (± one step) into two fragments;
+  * ramming hands the ship exactly the puck's lost 4-momentum;
+  * the **causality property test**: two runs with identical input to `O` and extra shots
+    after it agree on all 22k compared states outside `I⁺(O)` and differ inside;
+  * the scheduler is lazy only when waiting on a neighbour;
+  * the Phase 3 invariants still hold with interactions;
+  * `App` firing/ammo and ship kicks.
 
 ### Phase 5 — Relays (scene 7) and HUD spacetime inset
 Flash-driven state machines; flashes emitted by the simulation feed `FrameDynamics`. The HUD

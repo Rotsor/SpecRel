@@ -53,7 +53,8 @@ Switch scenes at any time with keys **`1`–`5`** or **`N` / `B`**:
 
 ### Causal Dynamic Mode (in progress)
 
-6. **`[6]` Relativistic Billiards** — the first *causally simulated* scene (see [`docs/DYNAMIC_MODE_PLAN.md`](docs/DYNAMIC_MODE_PLAN.md)). Nothing is precomputed: every puck's history is simulated only up to your **future light cone**, the boundary of what you can no longer influence, so far pucks are known far into the lab-frame future and near ones barely past "now". Everything you normally see is already decided; switch to **Frontier** or **Prophecy** (`G`) to watch the world being written, and **Decision Age** (`M`) to see when each event became fixed. The camera is the ship here, so rewinding and coordinate scrubbing are disabled. (The pucks are still inert — they bounce off the rails but not yet off each other or you.)
+6. **`[6]` Relativistic Billiards** — the first *causally simulated* scene (see [`docs/DYNAMIC_MODE_PLAN.md`](docs/DYNAMIC_MODE_PLAN.md)). Nothing is precomputed: every puck's history is simulated only up to your **future light cone**, the boundary of what you can no longer influence, so far pucks are known far into the lab-frame future and near ones barely past "now". Everything you normally see is already decided; switch to **Frontier** or **Prophecy** (`G`) to watch the world being written, and **Decision Age** (`M`) to see when each event became fixed. The camera is the ship here, so rewinding and coordinate scrubbing are disabled.
+   * **Play:** fire (`Enter`) elastic pucks, sticky pucks or spores (cycle with `\`) along your view direction at 0.6c in your rest frame, or fly into the pucks — the ship is a heavy puck too, and getting rammed kicks your camera. Collisions conserve 4-momentum exactly; sticky pucks merge into a glowing puck whose **rest mass exceeds the sum of its parts** (kinetic energy became mass); spores carry a clock face and pop into two fragments when their own clock runs out, so fast spores travel γ times further first.
 
 ---
 
@@ -115,6 +116,7 @@ python -m http.server 8080 --directory web
 | **`G`** | Cycle Spacetime View: **Real Camera ($ds^2 = 0$)** $\to$ **God's Eye ($dt' = 0$)** $\to$ **Frontier (future cone)** $\to$ **Prophecy ($dt' = +\Delta$)** |
 | **`PageUp`** / **`PageDown`** | Push the Prophecy slice further into / back from the future ($\Delta$ = 0.5 .. 20 s) |
 | **`/`** | Emit a spherical light flash from the camera |
+| **`Enter`** / **`\`** | Dynamic Mode: fire the current ammo / cycle ammo (elastic puck, sticky puck, spore) |
 | **`H`** | Cycle Shadow Mode: **Lorentz-Invariant (Null)** $\to$ **Camera-Slice Faked** $\to$ **Off** |
 | **`M`** | Cycle Render Mode: **Shaded** $\to$ **Lookback Isochrones** $\to$ **4D Tetrahedral Mesh** $\to$ **Causal Decision Age** |
 | **`P`** | Pause / Resume observer worldline evolution |

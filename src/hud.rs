@@ -84,6 +84,7 @@ fn fill_rect_solid(
 pub fn draw_hud(
     fb: &mut [u32],
     demo: DemoScene,
+    desc: &str,
     camera: &Camera4D,
     cfg: &RenderConfig,
     paused: bool,
@@ -101,6 +102,7 @@ pub fn draw_hud(
         s,
         0,
         demo,
+        desc,
         camera,
         cfg,
         paused,
@@ -117,6 +119,7 @@ pub fn draw_hud(
 pub fn draw_hud_overlay(
     overlay: &mut [u32],
     demo: DemoScene,
+    desc: &str,
     camera: &Camera4D,
     cfg: &RenderConfig,
     paused: bool,
@@ -144,6 +147,7 @@ pub fn draw_hud_overlay(
         1,
         0xFF00_0000,
         demo,
+        desc,
         camera,
         cfg,
         paused,
@@ -161,6 +165,7 @@ fn draw_hud_lines(
     s: usize,
     alpha_mask: u32,
     demo: DemoScene,
+    desc: &str,
     camera: &Camera4D,
     cfg: &RenderConfig,
     paused: bool,
@@ -173,7 +178,6 @@ fn draw_hud_lines(
     let gamma = camera.tetrad.gamma();
 
     let line_scene = format!("SCENE [1-6 / N,B]: {}", demo.title());
-    let line_desc = demo.description();
 
     let time_status = if paused {
         "PAUSED".to_string()
@@ -213,7 +217,7 @@ fn draw_hud_lines(
 
     let text_scale = 2 * s;
     draw_text_scaled(fb, fb_w, fb_h, 22 * s, 22 * s, &line_scene, alpha_mask | 0xFF9944, text_scale);
-    draw_text_scaled(fb, fb_w, fb_h, 22 * s, 46 * s, line_desc, alpha_mask | 0xFFD980, text_scale);
+    draw_text_scaled(fb, fb_w, fb_h, 22 * s, 46 * s, desc, alpha_mask | 0xFFD980, text_scale);
     draw_text_scaled(fb, fb_w, fb_h, 22 * s, 74 * s, &line1, alpha_mask | 0xFFE866, text_scale);
     draw_text_scaled(fb, fb_w, fb_h, 22 * s, 98 * s, &line2, alpha_mask | 0x66F2FF, text_scale);
     draw_text_scaled(fb, fb_w, fb_h, 22 * s, 122 * s, &line3, alpha_mask | 0xA8FF80, text_scale);
@@ -298,6 +302,7 @@ pub fn glyph_5x7(ch: char) -> [u8; 7] {
         '+' => [0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000],
         '=' => [0b00000, 0b00000, 0b11111, 0b00000, 0b11111, 0b00000, 0b00000],
         '/' => [0b00001, 0b00010, 0b00100, 0b00100, 0b01000, 0b10000, 0b00000],
+        '\\' => [0b10000, 0b01000, 0b00100, 0b00100, 0b00010, 0b00001, 0b00000],
         '(' => [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010],
         ')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000],
         '[' => [0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110],

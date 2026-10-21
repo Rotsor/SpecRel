@@ -1,32 +1,33 @@
 //! Bodies with a causally finalized history, and the frontier rule that gates their growth.
 
+use super::collide::{self, V3};
 use crate::mesh4d::{Mesh3D, WorldlineSample};
 use crate::minkowski::{Tetrad, Vec3, Vec4};
 
-/// Lab-time step of every body's history.
+/// Lab-time step of the global history grid shared by all bodies.
 pub const STEP_DT: f64 = 0.1;
 
-/// Full dynamic state of a point-like (rigid, non-rotating) body at one history step, in `f64`.
+/// Full dynamic state of a point-like (rigid, non-rotating) body at one grid step, in `f64`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BodyState {
+    /// Global grid step; `t` is always the world's time of this step.
+    pub step: i64,
     /// Lab time
     pub t: f64,
-    pub pos: [f64; 3],
+    pub pos: V3,
     /// Lab 3-velocity (`c = 1`)
-    pub vel: [f64; 3],
-    /// Proper time of the body's center
+    pub vel: V3,
+    /// Proper time of the body's center since it came into being
     pub tau: f64,
 }
 
 impl BodyState {
     pub fn gamma(&self) -> f64 {
-        let [vx, vy, vz] = self.vel;
-        1.0 / (1.0 - (vx * vx + vy * vy + vz * vz)).sqrt()
+        collide::gamma(self.vel)
     }
 
     pub fn speed(&self) -> f64 {
-        let [vx, vy, vz] = self.vel;
-        (vx * vx + vy * vy + vz * vz).sqrt()
+        collide::dot3(self.vel, self.vel).sqrt()
     }
 
     /// The center's spacetime event.
@@ -35,15 +36,16 @@ impl BodyState {
         Vec4::new(self.t as f32, x as f32, y as f32, z as f32)
     }
 
-    /// Coast inertially for lab time `dt`.
-    pub fn drift(&self, dt: f64) -> Self {
+    /// Coast inertially at `vel` to the next grid step at time `t_next`.
+    pub fn drift(&self, vel: V3, t_next: f64) -> Self {
+        let dt = t_next - self.t;
         let [x, y, z] = self.pos;
-        let [vx, vy, vz] = self.vel;
         Self {
-            t: self.t + dt,
-            pos: [x + vx * dt, y + vy * dt, z + vz * dt],
-            vel: self.vel,
-            tau: self.tau + dt / self.gamma(),
+            step: self.step + 1,
+            t: t_next,
+            pos: [x + vel[0] * dt, y + vel[1] * dt, z + vel[2] * dt],
+            vel,
+            tau: self.tau + dt / collide::gamma(vel),
         }
     }
 
@@ -60,43 +62,62 @@ impl BodyState {
     }
 }
 
-/// `true` if the whole body at `state` lies outside the open future light cone `I+(origin)`,
-/// i.e. no future choice of the observer at `origin` can still influence it.
-///
-/// Every vertex `V` of a rigid body of rest radius `r` is `center + p^i e_i` with `|p| <= r`,
-/// so in the lab frame it sits within `gamma * r` in space and `gamma * beta * r` in time of
-/// the center. Requiring the center to clear the light cone by `gamma * (1 + beta) * r`
-/// therefore guarantees that every vertex does. The boundary `dJ+(origin)` counts as decided.
-pub fn is_decided(state: &BodyState, radius: f64, origin: Vec4) -> bool {
-    let margin = state.gamma() * (1.0 + state.speed()) * radius;
-    let dt = state.t - origin.t as f64;
-    let [x, y, z] = state.pos;
-    let (dx, dy, dz) = (x - origin.x as f64, y - origin.y as f64, z - origin.z as f64);
-    dt + margin <= (dx * dx + dy * dy + dz * dz).sqrt()
+pub fn distance(a: V3, b: V3) -> f64 {
+    let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    collide::dot3(d, d).sqrt()
 }
 
-/// How a body evolves from one history step to the next.
-#[derive(Clone, Copy, Debug)]
-pub enum Motion {
-    /// Coasts forever.
-    Inertial,
-    /// Coasts and reflects elastically off the walls of an axis-aligned box (half-extents along
-    /// `x` and `z`, centered on the origin) shrunk by the body's radius.
-    Table { half_x: f64, z_min: f64, z_max: f64 },
+/// How far (in the lab frame, space and time combined) any vertex of a rigid body of rest
+/// radius `radius` can stick out from its center: `gamma * r` in space plus `gamma * beta * r`
+/// in time.
+pub fn event_margin(state: &BodyState, radius: f64) -> f64 {
+    state.gamma() * (1.0 + state.speed()) * radius
+}
+
+/// `true` if the whole body at `state` lies outside the open future light cone `I+(origin)`,
+/// i.e. no future choice of the observer at `origin` can still influence it. Requiring the
+/// center to clear the light cone by [`event_margin`] guarantees that every vertex does. The
+/// boundary `dJ+(origin)` counts as decided.
+pub fn is_decided(state: &BodyState, radius: f64, origin: Vec4) -> bool {
+    let o = [origin.x as f64, origin.y as f64, origin.z as f64];
+    state.t - origin.t as f64 + event_margin(state, radius) <= distance(state.pos, o)
+}
+
+/// What a body is, as far as its interactions are concerned.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Kind {
+    /// Collides elastically (unless the other body is sticky).
+    Puck,
+    /// Merges with whatever it touches.
+    Sticky,
+    /// Splits into two fragments once its own clock reads `lifetime`; fragments of generation
+    /// `generation > 0` are spores again with a shorter fuse, the last generation plain pucks.
+    Spore { lifetime: f64, generation: u32 },
 }
 
 /// A body with a history finalized up to the causal frontier.
 pub struct Body {
+    /// Stable identity, derived from how the body came to be (so two runs of the world agree
+    /// on it even when they create different bodies elsewhere).
+    pub uid: u64,
+    pub kind: Kind,
+    /// Rest mass
+    pub mass: f64,
     /// Rest-frame surface mesh
     pub mesh: Mesh3D,
     pub material_id: usize,
-    /// Rest-frame bounding radius of `mesh`
+    /// Rest-frame bounding radius of `mesh`, also its contact radius
     pub radius: f64,
-    pub motion: Motion,
-    /// Finalized states, one per [`STEP_DT`], oldest first (pruned behind the camera).
+    /// Finalized states, one per grid step, oldest first (pruned behind the camera).
     pub history: Vec<BodyState>,
     /// Camera proper time at which each history step was finalized (parallel to `history`).
     pub decided_at: Vec<f32>,
+    /// The body was created mid-scene (fired, merged, decayed), so its tube gets a start cap.
+    pub born: bool,
+    /// The body ceased to exist after its last history step (merged, decayed or left).
+    pub ended: bool,
+    /// Pass through the ship until first clear of it (a projectile leaving the launcher).
+    pub ignore_ship: bool,
 }
 
 impl Body {
@@ -104,39 +125,17 @@ impl Body {
         self.history.last().expect("bodies always keep at least one state")
     }
 
-    /// The state one step after `state`. Inert bodies depend on nothing but themselves, so this
-    /// never reads the observer or other bodies.
-    pub fn step(&self, state: &BodyState) -> BodyState {
-        let mut next = state.drift(STEP_DT);
-        if let Motion::Table { half_x, z_min, z_max } = self.motion {
-            let r = self.radius;
-            reflect(&mut next.pos[0], &mut next.vel[0], -half_x + r, half_x - r);
-            reflect(&mut next.pos[2], &mut next.vel[2], z_min + r, z_max - r);
-        }
-        next
+    pub fn first_step(&self) -> i64 {
+        self.history[0].step
     }
 
-    /// The state one step *before* `state`, for back-filling history that predates the scene.
-    pub fn step_back(&self, state: &BodyState) -> BodyState {
-        let reversed = BodyState {
-            vel: state.vel.map(|v| -v),
-            ..*state
-        };
-        let mut prev = self.step(&BodyState { t: -reversed.t, tau: -reversed.tau, ..reversed });
-        prev.t = -prev.t;
-        prev.tau = -prev.tau;
-        prev.vel = prev.vel.map(|v| -v);
-        prev
+    /// State at global grid `step`, if finalized (and not yet pruned).
+    pub fn at(&self, step: i64) -> Option<&BodyState> {
+        let i = step - self.first_step();
+        (i >= 0).then(|| self.history.get(i as usize)).flatten()
     }
-}
 
-/// Fold `x` back into `[lo, hi]` by mirror reflection, flipping `v` on each bounce.
-fn reflect(x: &mut f64, v: &mut f64, lo: f64, hi: f64) {
-    if *x > hi {
-        *x = 2.0 * hi - *x;
-        *v = -*v;
-    } else if *x < lo {
-        *x = 2.0 * lo - *x;
-        *v = -*v;
+    pub fn is_sticky(&self) -> bool {
+        self.kind == Kind::Sticky
     }
 }

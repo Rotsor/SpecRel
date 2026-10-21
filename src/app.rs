@@ -3,6 +3,8 @@
 //! translate their own key events into [`Action`]s and [`HeldInput`], and keep only what is
 //! genuinely theirs (rendering backend, resolution, HUD visibility, presentation).
 
+use crate::dynamic::billiards::{Ammo, FIRE_SPEED, SHIP_MASS};
+use crate::dynamic::collide::P4;
 use crate::dynamic::DynWorld;
 use crate::minkowski::{Vec3, Vec4};
 use crate::renderer::{
@@ -48,6 +50,10 @@ pub enum Action {
     EmitFlash,
     ProphecyDeltaUp,
     ProphecyDeltaDown,
+    /// Dynamic Mode: launch the current ammo from the ship along the view direction.
+    Fire,
+    /// Dynamic Mode: cycle what [`Action::Fire`] launches.
+    CycleAmmo,
 }
 
 /// Keys held down during a frame (continuous controls).
@@ -85,6 +91,8 @@ pub struct App {
     pub time_scale_idx: usize,
     /// The causal simulation behind the current scene, if it is a Dynamic Mode scene.
     pub world: Option<DynWorld>,
+    /// What [`Action::Fire`] launches in Dynamic Mode.
+    pub ammo: Ammo,
     /// Bumped whenever a scene's geometry is replaced, so frontends know to re-upload it.
     pub scene_generation: u64,
     world_grew: bool,
@@ -110,6 +118,7 @@ impl App {
             paused: false,
             time_scale_idx: DEFAULT_TIME_SCALE_IDX,
             world: None,
+            ammo: Ammo::Puck,
             scene_generation: 0,
             world_grew: false,
             rebuild_timer: 0.0,
@@ -182,6 +191,8 @@ impl App {
             Action::EmitFlash => self.dynamics.emit_flash(self.camera.position),
             Action::ProphecyDeltaUp => self.cfg.step_prophecy_delta(1.0),
             Action::ProphecyDeltaDown => self.cfg.step_prophecy_delta(-1.0),
+            Action::Fire => self.fire(),
+            Action::CycleAmmo => self.ammo = self.ammo.next(),
         }
     }
 
@@ -272,11 +283,57 @@ impl App {
         let frontier = self.camera_frontier();
         self.dynamics.frontier = Some(frontier);
         let world = self.world.as_mut().expect("dynamic scene has a world");
-        self.world_grew |= world.advance(frontier);
+        self.world_grew |= world.advance(frontier, self.camera.tetrad.e[0]);
+
+        // Collisions with the ship push back on it: apply the momentum to the camera.
+        let kicks: Vec<_> = world.ship_kicks.drain(..).collect();
+        for kick in kicks {
+            self.kick_ship(kick);
+        }
 
         self.rebuild_timer += dt_wall;
         if self.world_grew && self.rebuild_timer >= DYNAMIC_REBUILD_INTERVAL {
             self.rebuild_dynamic_scene();
+        }
+    }
+
+    /// Launch the current ammo at [`FIRE_SPEED`] along the view direction in the ship's rest
+    /// frame: lab 4-velocity `gamma (e_0 + FIRE_SPEED * e_forward)`.
+    fn fire(&mut self) {
+        let frontier = self.camera_frontier();
+        let Some(world) = self.world.as_mut() else {
+            return;
+        };
+        let e = &self.camera.tetrad.e;
+        let u = e[0] + e[3] * FIRE_SPEED as f32;
+        let vel = [u.x / u.t, u.y / u.t, u.z / u.t].map(|c| c as f64);
+        if world.fire(frontier, vel, self.ammo) {
+            self.world_grew = true;
+        }
+    }
+
+    /// Add collision 4-momentum `kick` to the ship (rest mass [`SHIP_MASS`]) and re-point the
+    /// camera's 4-velocity along the result.
+    fn kick_ship(&mut self, kick: P4) {
+        let u = self.camera.tetrad.e[0];
+        let p = [
+            SHIP_MASS * u.t as f64 + kick[0],
+            SHIP_MASS * u.x as f64 + kick[1],
+            SHIP_MASS * u.y as f64 + kick[2],
+            SHIP_MASS * u.z as f64 + kick[3],
+        ];
+        let m = (p[0] * p[0] - p[1] * p[1] - p[2] * p[2] - p[3] * p[3]).sqrt();
+        let [t, x, y, z] = p.map(|c| (c / m) as f32);
+        self.camera.tetrad.boost_to(Vec4::new(t, x, y, z));
+    }
+
+    /// The HUD's second line: the scene description, plus the ammo in Dynamic Mode.
+    pub fn scene_description(&self) -> String {
+        let desc = self.scene().demo.description();
+        if self.is_dynamic() {
+            format!("[ENTER] FIRE {} | [\\] AMMO | {desc}", self.ammo.name())
+        } else {
+            desc.to_string()
         }
     }
 
@@ -416,6 +473,32 @@ mod tests {
         let scrub = HeldInput { scrub_back: true, move_forward: true, ..Default::default() };
         app.step(0.1, &scrub);
         assert_eq!(app.camera.position, p0, "scrubbing and teleporting are disabled");
+    }
+
+    #[test]
+    fn firing_launches_the_selected_ammo_forward() {
+        let mut app = billiards_app();
+        let before = app.world.as_ref().unwrap().bodies.len();
+        app.apply(Action::CycleAmmo);
+        assert_eq!(app.ammo, Ammo::Sticky);
+        app.apply(Action::Fire);
+        let world = app.world.as_ref().unwrap();
+        assert_eq!(world.bodies.len(), before + 1);
+        let shot = world.bodies.last().unwrap();
+        assert!(shot.is_sticky() && shot.born);
+        // Straight ahead (+z) at the launch speed, the camera being at rest.
+        let v = shot.latest().vel;
+        assert!((v[2] - FIRE_SPEED).abs() < 1e-6 && v[0].abs() < 1e-6);
+        assert!(app.scene_description().contains("STICKY PUCK"));
+    }
+
+    #[test]
+    fn ship_kick_changes_the_camera_velocity() {
+        let mut app = billiards_app();
+        // The momentum a 0.6c puck hands over when it bounces straight back: (0, 0, 0, -1.5).
+        app.kick_ship([0.0, 0.0, 0.0, -1.5]);
+        let beta = app.camera.tetrad.beta();
+        assert!(beta.z < -0.2 && beta.x.abs() < 1e-6, "ship pushed back: {beta:?}");
     }
 
     #[test]
