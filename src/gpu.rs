@@ -93,7 +93,7 @@ pub(crate) struct GpuUniforms {
     pub(crate) slice_mode: u32,
     pub(crate) num_nodes: u32,
     pub(crate) frontier_origin: [f32; 4],
-    pub(crate) frontier_active: u32,
+    pub(crate) frontier_view_offset: f32,
     pub(crate) num_flashes: u32,
     pub(crate) frontier_tau: f32,
     pub(crate) prophecy_delta: f32,
@@ -149,7 +149,7 @@ impl GpuUniforms {
             },
             num_nodes,
             frontier_origin: v4(frontier.origin),
-            frontier_active: dynamics.frontier.is_some() as u32,
+            frontier_view_offset: dynamics.frontier_view_offset(),
             num_flashes: flashes.len() as u32,
             frontier_tau: frontier.proper_time,
             prophecy_delta: cfg.prophecy_delta,
@@ -654,7 +654,7 @@ mod tests {
                 ("light_pos", offset_of!(GpuUniforms, light_pos)),
                 ("num_nodes", offset_of!(GpuUniforms, num_nodes)),
                 ("frontier_origin", offset_of!(GpuUniforms, frontier_origin)),
-                ("frontier_active", offset_of!(GpuUniforms, frontier_active)),
+                ("frontier_view_offset", offset_of!(GpuUniforms, frontier_view_offset)),
                 ("num_flashes", offset_of!(GpuUniforms, num_flashes)),
                 ("frontier_tau", offset_of!(GpuUniforms, frontier_tau)),
                 ("flash_at", offset_of!(GpuUniforms, flash_at)),
@@ -700,6 +700,7 @@ mod tests {
             };
             let dynamics = FrameDynamics {
                 frontier: None,
+                frontier_lag: 0.0,
                 flashes: vec![
                     crate::renderer::FlashEvent {
                         at: flash_at(3.0),
@@ -761,7 +762,11 @@ mod tests {
             world.advance(Frontier { origin: cam.position, proper_time: cam.proper_time }, cam.tetrad.e[0]);
         }
         let scene = world.build_scene();
-        let dynamics = FrameDynamics { frontier: Some(world.frontier), flashes: Vec::new() };
+        let dynamics = FrameDynamics {
+            frontier: Some(world.frontier),
+            flashes: Vec::new(),
+            frontier_lag: world.frontier_lag(cam.tetrad.e[0]),
+        };
         let mut gpu = match GpuRenderer::new(std::slice::from_ref(&scene)) {
             Ok(g) => g,
             Err(e) => {
@@ -857,6 +862,7 @@ mod tests {
                 origin: cam.position + Vec4::new(-0.5, 0.2, 0.0, 0.0),
                 proper_time: 24.0,
             }),
+            frontier_lag: 0.0,
             flashes: Vec::new(),
         };
         for slice_mode in [SliceMode::PastLightCone, SliceMode::ProphecySlice] {

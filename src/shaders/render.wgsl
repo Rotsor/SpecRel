@@ -21,8 +21,7 @@ const SHADOW_CAMERA_SLICE: u32 = 2u;
 const SLICE_PAST_LIGHT_CONE: u32 = 0u;
 const SLICE_FRONTIER: u32 = 2u;
 const SLICE_PROPHECY: u32 = 3u;
-// Mirrors `renderer::FRONTIER_RAY_OFFSET` and `mesh4d::DECIDED_AT_STATIC`.
-const FRONTIER_RAY_OFFSET: f32 = 0.14;
+// Mirrors `mesh4d::DECIDED_AT_STATIC`.
 const DECIDED_AT_STATIC: f32 = -1.0e9;
 const PATTERN_CHECKERBOARD: u32 = 0u;
 const PATTERN_CLOCK_FACE: u32 = 1u;
@@ -49,7 +48,7 @@ struct Uniforms {
     // Per-frame dynamics (`renderer::FrameDynamics`). `frontier_origin`/`frontier_tau` fall back
     // to the camera event when no Dynamic Mode frontier is active.
     frontier_origin: vec4<f32>,
-    frontier_active: u32,
+    frontier_view_offset: f32,
     num_flashes: u32,
     frontier_tau: f32,
     prophecy_delta: f32,
@@ -934,7 +933,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let n = normalized3(local_dir);
         ray_dir = -u.e0 + u.e1 * n.x + u.e2 * n.y + u.e3 * n.z;
     } else if u.slice_mode == SLICE_FRONTIER {
-        ray_origin = u.cam_pos - u.e0 * FRONTIER_RAY_OFFSET;
+        ray_origin = u.cam_pos - u.e0 * u.frontier_view_offset;
         let n = normalized3(local_dir);
         ray_dir = u.e0 + u.e1 * n.x + u.e2 * n.y + u.e3 * n.z;
     } else {

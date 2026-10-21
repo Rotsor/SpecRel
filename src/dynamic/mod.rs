@@ -394,6 +394,21 @@ impl DynWorld {
         self.ship.drain(..stale.min(self.ship.len() - 1));
     }
 
+    /// How far (in the camera's proper time, for a camera moving with 4-velocity `u`) the live
+    /// bodies' finalized tips trail the frontier: the largest decision age of a tip, plus one
+    /// step so the last prism is in view. The Frontier view looks back by this much so that
+    /// its future-cone rays meet the bodies where their histories end. Capped at 5 s.
+    pub fn frontier_lag(&self, u: Vec4) -> f32 {
+        let o = self.frontier.origin;
+        self.bodies
+            .iter()
+            .filter(|b| !b.ended)
+            .map(|b| analytic_decision_age(b.latest().event(), o, u))
+            .fold(0.0f32, f32::max)
+            .min(5.0)
+            + STEP_DT as f32
+    }
+
     /// Shift every event by `dt` in lab time (origin rebase, keeping `f32` coordinates precise).
     pub fn rebase(&mut self, dt: f64) {
         self.t_origin += dt;
@@ -663,6 +678,46 @@ mod tests {
         assert!(flips > 0, "movers should bounce off the rails");
         assert_eq!(world.bodies.len(), 13);
         assert!(world.bodies[..10].iter().all(|b| b.latest().vel == [0.0; 3]), "rack stays put");
+    }
+
+    /// Frontier-view rays aimed at each live puck hit it when they start `frontier_lag` behind
+    /// the camera, and pass behind its tip with the bare static-scene offset.
+    #[test]
+    fn frontier_view_rays_meet_the_finalized_tips() {
+        let mut world = DynWorld::spawn(DemoScene::RelativisticBilliards);
+        run_parked(&mut world, 3.0);
+        let scene = world.build_scene();
+        let o = world.frontier.origin;
+        let tetrad = Tetrad::rest();
+        let hits = |offset: f32| {
+            world
+                .bodies
+                .iter()
+                .filter(|b| !b.ended)
+                .filter(|b| {
+                    // Aim where the view's light cone crosses the body's worldline.
+                    let origin = o - tetrad.e[0] * offset;
+                    let crossing = b.history.iter().min_by(|x, y| {
+                        let off = |s: &&BodyState| {
+                            let e = s.event() - origin;
+                            (e.t - e.spatial().length()).abs()
+                        };
+                        off(x).total_cmp(&off(y))
+                    });
+                    let dir = crossing.unwrap().event().spatial() - origin.spatial();
+                    let ray = tetrad.future_light_ray_direction(dir);
+                    scene
+                        .bvh
+                        .trace(origin, ray, 1e-3, 180.0)
+                        .is_some_and(|h| h.material_id == b.material_id)
+                })
+                .count()
+        };
+        let live = world.bodies.iter().filter(|b| !b.ended).count();
+        let lag = world.frontier_lag(tetrad.e[0]);
+        assert!(lag > 0.3 && lag <= 5.0 + STEP_DT as f32, "lag {lag}");
+        assert_eq!(hits(crate::renderer::FRONTIER_RAY_OFFSET + lag), live);
+        assert_eq!(hits(crate::renderer::FRONTIER_RAY_OFFSET), 0, "static offset misses them");
     }
 
     #[test]

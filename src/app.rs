@@ -284,6 +284,7 @@ impl App {
         self.dynamics.frontier = Some(frontier);
         let world = self.world.as_mut().expect("dynamic scene has a world");
         self.world_grew |= world.advance(frontier, self.camera.tetrad.e[0]);
+        self.dynamics.frontier_lag = world.frontier_lag(self.camera.tetrad.e[0]);
 
         // Collisions with the ship push back on it: apply the momentum to the camera.
         let kicks: Vec<_> = world.ship_kicks.drain(..).collect();
@@ -357,6 +358,8 @@ impl App {
             DynWorld::new(demo, self.camera_frontier(), self.camera.tetrad.e[0])
         });
         self.dynamics.frontier = self.world.as_ref().map(|w| w.frontier);
+        let u = self.camera.tetrad.e[0];
+        self.dynamics.frontier_lag = self.world.as_ref().map_or(0.0, |w| w.frontier_lag(u));
         if self.is_dynamic() {
             self.time_scale_idx = self.time_scale_idx.max(FIRST_FORWARD_TIME_SCALE_IDX);
             self.rebuild_dynamic_scene();

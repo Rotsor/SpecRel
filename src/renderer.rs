@@ -76,7 +76,8 @@ pub enum ViewMode {
     /// (Press `X` to brake to `v = 0` if you want the unboosted World Lab slice!)
     CameraSimultaneity,
     /// Causal frontier: rays run down the *future* null cone `k^mu = +e_0 + n^a e_a` from
-    /// `O' = O - FRONTIER_RAY_OFFSET * e_0`, landing just outside `I+(O)`: the world as it is
+    /// `O' = O - FrameDynamics::frontier_view_offset() * e_0`, landing just outside `I+(O)` (and,
+    /// in Dynamic Mode, just behind every body's finalized tip): the world as it is
     /// being decided, and where the camera's current choices are about to propagate.
     Frontier,
     /// Prophecy slice: the God's-eye slice pushed into the camera's future by
@@ -203,6 +204,10 @@ pub struct FrameDynamics {
     pub frontier: Option<Frontier>,
     /// Active light pulses; only the first [`MAX_FLASHES`] are rendered.
     pub flashes: Vec<FlashEvent>,
+    /// How far (in camera proper time) the simulated world's finalized tips trail the frontier.
+    /// Bodies are only finalized once *all* of them is decided, so the Frontier view looks back
+    /// this much further to see them. Zero for static scenes.
+    pub frontier_lag: f32,
 }
 
 /// Flashes are dropped once their shell is this far (light-seconds) past the emission event:
@@ -210,6 +215,11 @@ pub struct FrameDynamics {
 pub const FLASH_MAX_RADIUS: f32 = 200.0;
 
 impl FrameDynamics {
+    /// Proper-time offset of the Frontier view's ray origin behind the camera event.
+    pub fn frontier_view_offset(&self) -> f32 {
+        FRONTIER_RAY_OFFSET + self.frontier_lag
+    }
+
     /// The flashes the renderers actually evaluate (both backends cap at [`MAX_FLASHES`]).
     pub fn active_flashes(&self) -> &[FlashEvent] {
         &self.flashes[..self.flashes.len().min(MAX_FLASHES)]
@@ -280,7 +290,9 @@ pub fn render_frame(
 
     let ray_origin = match cfg.slice_mode {
         SliceMode::PastLightCone | SliceMode::CameraSimultaneity => camera.position,
-        SliceMode::Frontier => camera.position - camera.tetrad.e[0] * FRONTIER_RAY_OFFSET,
+        SliceMode::Frontier => {
+            camera.position - camera.tetrad.e[0] * dynamics.frontier_view_offset()
+        }
         SliceMode::ProphecySlice => camera.position + camera.tetrad.e[0] * cfg.prophecy_delta,
     };
 
