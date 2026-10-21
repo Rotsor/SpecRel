@@ -2,7 +2,8 @@
 //!
 //! All scene data is static, so every scene's BVH nodes, 80-byte hot intersection records,
 //! cold per-simplex attributes and materials are uploaded once as storage buffers. The only
-//! per-frame input is a small uniform block (camera event + tetrad + render settings).
+//! per-frame input is a small uniform block (camera event + tetrad + render settings + the
+//! frame's `FrameDynamics`: causal frontier and light-pulse flashes).
 //!
 //! The kernel (`shaders/render.wgsl`) writes packed `0x00RRGGBB` pixels into a storage buffer
 //! which is read back into the caller's framebuffer, so the window/HUD code is identical for
@@ -10,7 +11,10 @@
 
 use crate::mesh4d::SurfacePattern;
 use crate::minkowski::Vec4;
-use crate::renderer::{gamma_lut, Camera4D, RenderConfig, RenderMode, ShadowMode, SliceMode};
+use crate::renderer::{
+    gamma_lut, Camera4D, FrameDynamics, RenderConfig, RenderMode, ShadowMode, SliceMode,
+    MAX_FLASHES,
+};
 use crate::scene::Scene4D;
 use bytemuck::{Pod, Zeroable};
 #[cfg(not(target_arch = "wasm32"))]
@@ -65,6 +69,7 @@ pub(crate) struct GpuAttr {
     pub(crate) normal: [f32; 4],
     pub(crate) four_vel: [f32; 4],
     pub(crate) misc: [f32; 4],
+    pub(crate) decided_at: [f32; 4],
 }
 
 #[repr(C)]
@@ -87,12 +92,20 @@ pub(crate) struct GpuUniforms {
     pub(crate) shadow_mode: u32,
     pub(crate) slice_mode: u32,
     pub(crate) num_nodes: u32,
+    pub(crate) frontier_origin: [f32; 4],
+    pub(crate) frontier_active: u32,
+    pub(crate) num_flashes: u32,
+    pub(crate) frontier_tau: f32,
+    pub(crate) _pad0: u32,
+    pub(crate) flash_at: [[f32; 4]; MAX_FLASHES],
+    pub(crate) flash_col_width: [[f32; 4]; MAX_FLASHES],
 }
 
 impl GpuUniforms {
     pub(crate) fn build(
         camera: &Camera4D,
         cfg: &RenderConfig,
+        dynamics: &FrameDynamics,
         num_nodes: u32,
         light_pos: [f32; 4],
     ) -> Self {
@@ -100,6 +113,19 @@ impl GpuUniforms {
         let aspect = w as f32 / h as f32;
         let half_h = (0.5 * camera.fov_y_rad).tan();
         let half_w = aspect * half_h;
+
+        let flashes = dynamics.active_flashes();
+        let mut flash_at = [[0.0; 4]; MAX_FLASHES];
+        let mut flash_col_width = [[0.0; 4]; MAX_FLASHES];
+        for (i, f) in flashes.iter().enumerate() {
+            let c = f.color * f.intensity;
+            flash_at[i] = v4(f.at);
+            flash_col_width[i] = [c.x, c.y, c.z, f.width];
+        }
+        let (frontier_active, frontier_origin, frontier_tau) = match dynamics.frontier {
+            Some(fr) => (1, v4(fr.origin), fr.proper_time),
+            None => (0, [0.0; 4], 0.0),
+        };
 
         Self {
             cam_pos: v4(camera.position),
@@ -122,6 +148,13 @@ impl GpuUniforms {
                 SliceMode::CameraSimultaneity => 1,
             },
             num_nodes,
+            frontier_origin,
+            frontier_active,
+            num_flashes: flashes.len() as u32,
+            frontier_tau,
+            _pad0: 0,
+            flash_at,
+            flash_col_width,
         }
     }
 }
@@ -204,6 +237,7 @@ impl PackedSceneGpuData {
                         f32::from_bits(s.material_id as u32),
                         0.0,
                     ],
+                    decided_at: s.decided_at,
                 }
             })
             .collect();
@@ -502,6 +536,7 @@ impl GpuRenderer {
         scene_idx: usize,
         camera: &Camera4D,
         cfg: &RenderConfig,
+        dynamics: &FrameDynamics,
         framebuffer: &mut [u32],
     ) {
         let (w, h) = (cfg.width, cfg.height);
@@ -510,7 +545,8 @@ impl GpuRenderer {
         let scene = &self.scenes[scene_idx];
         let frame = self.frame.as_ref().expect("frame buffers initialised");
 
-        let uniforms = GpuUniforms::build(camera, cfg, scene.num_nodes, scene.light_pos);
+        let uniforms =
+            GpuUniforms::build(camera, cfg, dynamics, scene.num_nodes, scene.light_pos);
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
@@ -564,6 +600,141 @@ mod tests {
     use crate::scene::DemoScene;
     use crate::minkowski::Vec3;
 
+    /// The Rust `#[repr(C)]` mirrors must match the WGSL struct layouts byte for byte, or the
+    /// shader silently reads garbage. Naga computes the WGSL side from the shader source.
+    #[test]
+    fn wgsl_struct_layouts_match_rust() {
+        use std::mem::{offset_of, size_of};
+        use wgpu::naga;
+
+        let module = naga::front::wgsl::parse_str(RENDER_WGSL).expect("render.wgsl parses");
+        let wgsl_struct = |name: &str| -> (u32, Vec<(String, u32)>) {
+            let ty = module
+                .types
+                .iter()
+                .map(|(_, ty)| ty)
+                .find(|ty| ty.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("WGSL struct {name} not found"));
+            match &ty.inner {
+                naga::TypeInner::Struct { members, span } => (
+                    *span,
+                    members
+                        .iter()
+                        .map(|m| (m.name.clone().unwrap_or_default(), m.offset))
+                        .collect(),
+                ),
+                _ => panic!("{name} is not a struct"),
+            }
+        };
+        let check = |name: &str, rust_size: usize, rust_offsets: &[(&str, usize)]| {
+            let (span, members) = wgsl_struct(name);
+            assert_eq!(span as usize, rust_size, "{name} size");
+            for &(field, offset) in rust_offsets {
+                let wgsl_offset = members
+                    .iter()
+                    .find(|(n, _)| n == field)
+                    .unwrap_or_else(|| panic!("{name}.{field} missing in WGSL"))
+                    .1;
+                assert_eq!(wgsl_offset as usize, offset, "{name}.{field} offset");
+            }
+        };
+
+        check(
+            "Uniforms",
+            size_of::<GpuUniforms>(),
+            &[
+                ("light_pos", offset_of!(GpuUniforms, light_pos)),
+                ("num_nodes", offset_of!(GpuUniforms, num_nodes)),
+                ("frontier_origin", offset_of!(GpuUniforms, frontier_origin)),
+                ("frontier_active", offset_of!(GpuUniforms, frontier_active)),
+                ("num_flashes", offset_of!(GpuUniforms, num_flashes)),
+                ("frontier_tau", offset_of!(GpuUniforms, frontier_tau)),
+                ("flash_at", offset_of!(GpuUniforms, flash_at)),
+                ("flash_col_width", offset_of!(GpuUniforms, flash_col_width)),
+            ],
+        );
+        check(
+            "Attr",
+            size_of::<GpuAttr>(),
+            &[
+                ("misc", offset_of!(GpuAttr, misc)),
+                ("decided_at", offset_of!(GpuAttr, decided_at)),
+            ],
+        );
+        check("Node", size_of::<GpuNode>(), &[]);
+        check("Geom", size_of::<GpuGeom>(), &[]);
+        check("Material", size_of::<GpuMaterial>(), &[]);
+    }
+
+    /// Flash lighting through the per-frame uniform block must match the CPU reference. The
+    /// flashes are emitted at the camera's position `2R` before the camera event, so on the
+    /// Real Camera view their shells light everything at distance `R` in the camera frame.
+    #[test]
+    fn gpu_matches_cpu_with_flashes() {
+        let scenes: Vec<Scene4D> = DemoScene::ALL.iter().map(|&d| Scene4D::build(d)).collect();
+        let mut gpu = match GpuRenderer::new(&scenes) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping GPU test: {e}");
+                return;
+            }
+        };
+
+        let (w, h) = (192, 120);
+        let mut plain_fb = vec![0u32; w * h];
+        let mut cpu_fb = vec![0u32; w * h];
+        let mut gpu_fb = vec![0u32; w * h];
+
+        for (i, scene) in scenes.iter().enumerate() {
+            let cam = Camera4D::new(scene.demo.initial_camera_pos(), 65.0);
+            let flash_at = |r: f32| {
+                Vec4::from_time_space(cam.position.t - 2.0 * r, cam.position.spatial())
+            };
+            let dynamics = FrameDynamics {
+                frontier: None,
+                flashes: vec![
+                    crate::renderer::FlashEvent {
+                        at: flash_at(3.0),
+                        width: 1.2,
+                        intensity: 2.0,
+                        color: Vec3::new(1.0, 0.3, 0.2),
+                    },
+                    crate::renderer::FlashEvent {
+                        at: flash_at(6.0),
+                        width: 1.5,
+                        intensity: 3.0,
+                        color: Vec3::new(0.2, 0.6, 1.0),
+                    },
+                ],
+            };
+            for shadow_mode in [ShadowMode::LorentzInvariant, ShadowMode::Off] {
+                let cfg = RenderConfig {
+                    width: w,
+                    height: h,
+                    mode: RenderMode::RelativisticShaded,
+                    shadow_mode,
+                    slice_mode: SliceMode::PastLightCone,
+                };
+                render_frame(scene, &cam, &cfg, &FrameDynamics::default(), &mut plain_fb);
+                render_frame(scene, &cam, &cfg, &dynamics, &mut cpu_fb);
+                gpu.render(i, &cam, &cfg, &dynamics, &mut gpu_fb);
+
+                let (_, lit_frac) = diff_stats(&plain_fb, &cpu_fb, 4);
+                let (max_diff, bad_frac) = diff_stats(&cpu_fb, &gpu_fb, 4);
+                println!(
+                    "scene {} flashes/{:?}: {:.1}% px lit, max CPU/GPU diff {}, {:.3}% px > 4",
+                    i + 1, shadow_mode, lit_frac * 100.0, max_diff, bad_frac * 100.0
+                );
+                assert!(lit_frac > 0.01, "scene {}: flashes lit too few pixels", i + 1);
+                assert!(
+                    bad_frac < 0.005,
+                    "scene {} flashes/{:?}: {:.3}% of pixels differ",
+                    i + 1, shadow_mode, bad_frac * 100.0
+                );
+            }
+        }
+    }
+
     /// Per-channel absolute difference statistics between two packed RGB images.
     fn diff_stats(a: &[u32], b: &[u32], tol: u32) -> (u32, f64) {
         let mut max_diff = 0;
@@ -608,6 +779,7 @@ mod tests {
         ];
         let mut cpu_fb = vec![0u32; w * h];
         let mut gpu_fb = vec![0u32; w * h];
+        let no_dynamics = FrameDynamics::default();
 
         for (i, scene) in scenes.iter().enumerate() {
             let mut cam = Camera4D::new(scene.demo.initial_camera_pos(), 65.0);
@@ -616,8 +788,8 @@ mod tests {
             cam.tetrad.rotate_local(0.15, -0.05, 0.0);
             for &(mode, shadow_mode, slice_mode) in &configs {
                 let cfg = RenderConfig { width: w, height: h, mode, shadow_mode, slice_mode };
-                render_frame(scene, &cam, &cfg, &mut cpu_fb);
-                gpu.render(i, &cam, &cfg, &mut gpu_fb);
+                render_frame(scene, &cam, &cfg, &no_dynamics, &mut cpu_fb);
+                gpu.render(i, &cam, &cfg, &no_dynamics, &mut gpu_fb);
                 let (max_diff, bad_frac) = diff_stats(&cpu_fb, &gpu_fb, 4);
                 println!(
                     "scene {} {:?}/{:?}/{:?}: max channel diff {}, {:.3}% px > 4",

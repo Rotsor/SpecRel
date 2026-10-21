@@ -1,5 +1,9 @@
 use crate::minkowski::{Tetrad, Vec3, Vec4};
 
+/// `decided_at` sentinel for precomputed static geometry, which was never inside the ship's
+/// future light cone (Decision-Age shading then falls back to an analytic decision time).
+pub const DECIDED_AT_STATIC: f32 = -1.0e9;
+
 /// Procedural surface pattern rendered in the object's intrinsic rest-frame UV and proper time `tau`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfacePattern {
@@ -260,6 +264,9 @@ pub struct Simplex4D {
     pub surface_normal_4d: Vec4,
     /// Instantaneous 4-velocity of the surface element
     pub four_velocity: Vec4,
+    /// Camera proper time at which each vertex event left the ship's open future light cone
+    /// `I+(O)` in Dynamic Mode ([`DECIDED_AT_STATIC`] for precomputed static geometry)
+    pub decided_at: [f32; 4],
     /// Material index in the scene
     pub material_id: usize,
     /// 4D bounding box
@@ -294,6 +301,8 @@ pub struct HitRecord4D {
     pub surface_normal_4d: Vec4,
     /// 4-velocity of the hit surface element at emission
     pub four_velocity: Vec4,
+    /// Interpolated camera proper time at which this event became causally decided
+    pub decided_at: f32,
     /// Material index
     pub material_id: usize,
 }
@@ -355,9 +364,17 @@ impl Simplex4D {
             uv_world_scale,
             surface_normal_4d,
             four_velocity,
+            decided_at: [DECIDED_AT_STATIC; 4],
             material_id,
             aabb,
         })
+    }
+
+    /// Stamp per-vertex causal decision times (see [`Simplex4D::decided_at`]).
+    #[inline]
+    pub fn with_decided_at(mut self, decided_at: [f32; 4]) -> Self {
+        self.decided_at = decided_at;
+        self
     }
 
     /// Interpolate vertex attributes at a hit location with 4D barycentric coordinates `tet_bary`.
@@ -386,6 +403,11 @@ impl Simplex4D {
             + self.tau_uv_grad[2].1 * v
             + self.tau_uv_grad[3].1 * w;
 
+        let decided_at = self.decided_at[0] * w0
+            + self.decided_at[1] * u
+            + self.decided_at[2] * v
+            + self.decided_at[3] * w;
+
         HitRecord4D {
             lambda,
             event,
@@ -397,6 +419,7 @@ impl Simplex4D {
             uv_world_scale: self.uv_world_scale,
             surface_normal_4d: self.surface_normal_4d,
             four_velocity: self.four_velocity,
+            decided_at,
             material_id: self.material_id,
         }
     }
@@ -619,8 +642,23 @@ pub fn build_worldtube_simplices(
     samples: &[WorldlineSample],
     material_id: usize,
 ) -> Vec<Simplex4D> {
+    build_worldtube_simplices_with_decided(mesh, samples, None, material_id)
+}
+
+/// [`build_worldtube_simplices`], additionally stamping every vertex of step `k` with the
+/// causal decision time `decided_at[k]` (one entry per sample). `None` marks static geometry
+/// ([`DECIDED_AT_STATIC`]).
+pub fn build_worldtube_simplices_with_decided(
+    mesh: &Mesh3D,
+    samples: &[WorldlineSample],
+    decided_at: Option<&[f32]>,
+    material_id: usize,
+) -> Vec<Simplex4D> {
     if samples.len() < 2 {
         return Vec::new();
+    }
+    if let Some(d) = decided_at {
+        assert_eq!(d.len(), samples.len(), "one decided_at entry per worldline sample");
     }
 
     let n_verts = mesh.vertices.len();
@@ -657,6 +695,10 @@ pub fn build_worldtube_simplices(
         let v_next = &embedded_verts[step + 1];
         let s_curr = &samples[step];
         let s_next = &samples[step + 1];
+        let (dec0, dec1) = match decided_at {
+            Some(d) => (d[step], d[step + 1]),
+            None => (DECIDED_AT_STATIC, DECIDED_AT_STATIC),
+        };
 
         // Average 4-velocity across the step
         let u_avg_raw = s_curr.tetrad.e[0] + s_next.tetrad.e[0];
@@ -744,6 +786,7 @@ pub fn build_worldtube_simplices(
                     [ba, bb, bc, bc],
                     [tau_a0, tau_b0, tau_c0, tau_c1],
                     [tau_uv_0, tau_uv_0, tau_uv_0, tau_uv_1],
+                    [dec0, dec0, dec0, dec1],
                 ),
                 (
                     [a0, b0, b1, c1],
@@ -751,6 +794,7 @@ pub fn build_worldtube_simplices(
                     [ba, bb, bb, bc],
                     [tau_a0, tau_b0, tau_b1, tau_c1],
                     [tau_uv_0, tau_uv_0, tau_uv_1, tau_uv_1],
+                    [dec0, dec0, dec1, dec1],
                 ),
                 (
                     [a0, a1, b1, c1],
@@ -758,10 +802,11 @@ pub fn build_worldtube_simplices(
                     [ba, ba, bb, bc],
                     [tau_a0, tau_a1, tau_b1, tau_c1],
                     [tau_uv_0, tau_uv_1, tau_uv_1, tau_uv_1],
+                    [dec0, dec1, dec1, dec1],
                 ),
             ];
 
-            for (verts, uv, tb, taus, tau_grads) in tets {
+            for (verts, uv, tb, taus, tau_grads, decs) in tets {
                 if let Some(simplex) = Simplex4D::new(
                     verts,
                     uv,
@@ -773,7 +818,7 @@ pub fn build_worldtube_simplices(
                     u_avg,
                     material_id,
                 ) {
-                    simplices.push(simplex);
+                    simplices.push(simplex.with_decided_at(decs));
                 }
             }
         }
@@ -964,6 +1009,40 @@ pub fn sync_proper_time_at(samples: &mut [WorldlineSample], t_sync: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each prism tet takes its vertices' decision times from the worldline step they sit on,
+    /// static tubes get the sentinel, and hits interpolate barycentrically.
+    #[test]
+    fn worldtube_decided_at_follows_steps() {
+        let mesh = Mesh3D::cube(Vec3::new(0.5, 0.5, 0.5));
+        let samples =
+            sample_inertial_worldline(Vec3::default(), Vec3::new(0.3, 0.0, 0.0), 0.0, 4.0, 2);
+        assert_eq!(samples.len(), 3);
+
+        let static_tube = build_worldtube_simplices(&mesh, &samples, 0);
+        assert!(static_tube
+            .iter()
+            .all(|s| s.decided_at == [DECIDED_AT_STATIC; 4]));
+
+        let decided = [10.0, 20.0, 30.0];
+        let tube = build_worldtube_simplices_with_decided(&mesh, &samples, Some(&decided), 0);
+        assert_eq!(tube.len(), static_tube.len());
+        let mut steps_seen = [false; 2];
+        for s in &tube {
+            // Every tet spans exactly one step: its decision times are that step's two values.
+            let lo = s.decided_at.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = s.decided_at.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let step = if lo == 10.0 { 0 } else { 1 };
+            assert_eq!((lo, hi), (decided[step], decided[step + 1]));
+            steps_seen[step] = true;
+
+            let bary = [0.1, 0.2, 0.3, 0.4];
+            let hit = s.interpolate_hit(1.0, s.v0, bary);
+            let expected: f32 = (0..4).map(|i| s.decided_at[i] * bary[i]).sum();
+            assert!((hit.decided_at - expected).abs() < 1e-4);
+        }
+        assert_eq!(steps_seen, [true, true]);
+    }
 
     #[test]
     fn test_ray_simplex4d_intersection() {

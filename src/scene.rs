@@ -661,8 +661,8 @@ mod tests {
     use super::*;
     use crate::minkowski::Tetrad;
     use crate::renderer::{
-        light_clock_bounce_fraction, render_frame, Camera4D, RenderConfig, RenderMode, ShadowMode,
-        SliceMode,
+        light_clock_bounce_fraction, render_frame, Camera4D, FrameDynamics, RenderConfig, RenderMode,
+        ShadowMode, SliceMode,
     };
 
     #[test]
@@ -680,7 +680,7 @@ mod tests {
             let scene = Scene4D::build(demo);
             assert!(!scene.bvh.simplices.is_empty());
             let cam = Camera4D::new(demo.initial_camera_pos(), 65.0);
-            render_frame(&scene, &cam, &cfg, &mut fb);
+            render_frame(&scene, &cam, &cfg, &FrameDynamics::default(), &mut fb);
             assert!(fb.iter().all(|&px| px != 0));
         }
     }

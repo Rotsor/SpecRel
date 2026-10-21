@@ -11,7 +11,9 @@
 use crate::gpu::{build_tables_data, GpuUniforms, PackedSceneGpuData, RENDER_WGSL};
 use crate::hud::{draw_hud, draw_hud_overlay, HUD_BASE_WIDTH, HUD_OVERLAY_HEIGHT};
 use crate::minkowski::{Vec3, Vec4};
-use crate::renderer::{render_frame, Camera4D, RenderConfig, RenderMode, ShadowMode, ViewMode};
+use crate::renderer::{
+    render_frame, Camera4D, FrameDynamics, RenderConfig, RenderMode, ShadowMode, ViewMode,
+};
 use crate::scene::{DemoScene, Scene4D};
 use std::cell::UnsafeCell;
 
@@ -73,6 +75,8 @@ struct WebState {
     scene_idx: usize,
     camera: Camera4D,
     cfg: RenderConfig,
+    /// Per-frame causal frontier and flashes (empty for static scenes).
+    dynamics: FrameDynamics,
     paused_worldline: bool,
     time_scale_idx: usize,
     show_hud: bool,
@@ -128,9 +132,11 @@ pub extern "C" fn web_init(gpu_available: u32) {
         shadow_mode: ShadowMode::LorentzInvariant,
         slice_mode: ViewMode::PastLightCone,
     };
+    let dynamics = FrameDynamics::default();
     let uniforms = GpuUniforms::build(
         &camera,
         &cfg,
+        &dynamics,
         packed_scenes[scene_idx].num_nodes,
         packed_scenes[scene_idx].light_pos,
     );
@@ -142,6 +148,7 @@ pub extern "C" fn web_init(gpu_available: u32) {
         scene_idx,
         camera,
         cfg,
+        dynamics,
         paused_worldline: false,
         time_scale_idx: 7, // +1.0x forward
         show_hud: true,
@@ -392,7 +399,13 @@ pub extern "C" fn web_step(dt_secs: f32) {
         }
 
         let packed = &s.packed_scenes[s.scene_idx];
-        s.uniforms = GpuUniforms::build(&s.camera, &s.cfg, packed.num_nodes, packed.light_pos);
+        s.uniforms = GpuUniforms::build(
+            &s.camera,
+            &s.cfg,
+            &s.dynamics,
+            packed.num_nodes,
+            packed.light_pos,
+        );
 
         let backend = if s.gpu_available && s.use_gpu {
             "GPU"
@@ -418,7 +431,7 @@ pub extern "C" fn web_step(dt_secs: f32) {
             if s.cpu_fb.len() != total_px {
                 s.cpu_fb.resize(total_px, 0);
             }
-            render_frame(scene, &s.camera, &s.cfg, &mut s.cpu_fb);
+            render_frame(scene, &s.camera, &s.cfg, &s.dynamics, &mut s.cpu_fb);
 
             if s.gpu_available {
                 // WebGPU is presenting the canvas; composite the HUD in the blit shader.

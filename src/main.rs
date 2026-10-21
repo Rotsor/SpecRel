@@ -17,7 +17,9 @@ use minkowski::{Vec3, Vec4};
 #[cfg(not(target_arch = "wasm32"))]
 use minifb::{Key, KeyRepeat, Window, WindowOptions};
 #[cfg(not(target_arch = "wasm32"))]
-use renderer::{render_frame, Camera4D, RenderConfig, RenderMode, ShadowMode, ViewMode};
+use renderer::{
+    render_frame, Camera4D, FrameDynamics, RenderConfig, RenderMode, ShadowMode, ViewMode,
+};
 #[cfg(not(target_arch = "wasm32"))]
 use scene::{DemoScene, Scene4D};
 #[cfg(not(target_arch = "wasm32"))]
@@ -42,11 +44,12 @@ fn render_with_backend(
     scene_idx: usize,
     camera: &Camera4D,
     cfg: &RenderConfig,
+    dynamics: &FrameDynamics,
     framebuffer: &mut [u32],
 ) {
     match gpu {
-        Some(g) if use_gpu => g.render(scene_idx, camera, cfg, framebuffer),
-        _ => render_frame(&scenes[scene_idx], camera, cfg, framebuffer),
+        Some(g) if use_gpu => g.render(scene_idx, camera, cfg, dynamics, framebuffer),
+        _ => render_frame(&scenes[scene_idx], camera, cfg, dynamics, framebuffer),
     }
 }
 
@@ -111,7 +114,7 @@ fn main() {
         for (i, scene) in scenes.iter().enumerate() {
             let cam = Camera4D::new(scene.demo.initial_camera_pos(), 65.0);
             let t0 = Instant::now();
-            render_frame(scene, &cam, &cfg, &mut framebuffer);
+            render_frame(scene, &cam, &cfg, &FrameDynamics::default(), &mut framebuffer);
             let dt = t0.elapsed();
             let non_zero = framebuffer.iter().filter(|&&px| px != 0).count();
             println!(
@@ -127,11 +130,11 @@ fn main() {
             );
 
             if let Some(g) = gpu.as_mut() {
-                g.render(i, &cam, &cfg, &mut gpu_fb); // warm-up (pipeline/driver caches)
+                g.render(i, &cam, &cfg, &FrameDynamics::default(), &mut gpu_fb); // warm-up (pipeline/driver caches)
                 const RUNS: u32 = 10;
                 let t0 = Instant::now();
                 for _ in 0..RUNS {
-                    g.render(i, &cam, &cfg, &mut gpu_fb);
+                    g.render(i, &cam, &cfg, &FrameDynamics::default(), &mut gpu_fb);
                 }
                 let dt_gpu = t0.elapsed() / RUNS;
                 let mut max_diff = 0u32;
@@ -180,6 +183,8 @@ fn main() {
     window.set_target_fps(60);
 
     let mut paused_worldline = false;
+    // Static scenes have no causal frontier or flashes; Dynamic Mode will drive these per frame.
+    let dynamics = FrameDynamics::default();
     let mut time_scale_idx: usize = 7; // Default +1.0x forward
     let mut show_hud = true;
     let mut last_frame = Instant::now();
@@ -394,6 +399,7 @@ fn main() {
             scene_idx,
             &camera,
             &cfg,
+            &dynamics,
             &mut framebuffer,
         );
 

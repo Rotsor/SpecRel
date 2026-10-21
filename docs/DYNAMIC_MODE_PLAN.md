@@ -336,38 +336,43 @@ Each phase is one PR. "Draft" refers to branch `draft/dynamic-mode-wip` (`aca4c2
 The browser port was sitting uncommitted under the dynamic work. It is now its own commit:
 shared GPU packing (`PackedSceneGpuData`, `GpuUniforms::build`, `build_tables_data`), HUD
 moved into `hud.rs` with a GPU overlay variant, `src/web.rs`, `web/index.html`, and `wasm32`
-gating of native-only dependencies. Built `.wasm` files are gitignored. *To do: merge to
-`main`.*
+gating of native-only dependencies. Built `.wasm` files are gitignored. `main` has been
+fast-forwarded to it.
 
-### Phase 1 — Plumbing, no visible change
-* `FrameDynamics { frontier: Option<(Vec4 /*O*/, f32 /*τ*/)>, flashes: Vec<FlashEvent> }`,
-  passed per frame to `render_frame`, `GpuRenderer::render` and `web.rs`, and packed into
-  `GpuUniforms` (a frontier-origin `vec4`, counts, `MAX_FLASHES` flash slots).
-* A per-vertex `decided_at: [f32; 4]` on `Simplex4D` / `HitRecord4D` / `GpuAttr` / WGSL
-  `Attr`, plus `build_worldtube_simplices_with_decided`.
-* **Reuse from the draft:** `mesh4d.rs` `DECIDED_AT_STATIC`, the `decided_at` fields,
-  `with_decided_at`, `build_worldtube_simplices_with_decided` (and restore the deleted
-  proper-time-gradient comment); `gpu.rs` `GpuAttr.decided_at`, and the uniform layout from
-  `build_with_dynamic` — but with flashes and frontier coming from `FrameDynamics`, not the
-  scene. `FlashEvent` moves out of `scene.rs` into `renderer.rs`.
-* **Drop:** `Scene4D.{flashes, frontier_origin, frontier_tau}` and the matching fields on
-  `PackedSceneGpuData`/`SceneBuffers`.
-* **Tests:** existing image diffs unchanged; assert `size_of::<GpuUniforms>()` matches the
-  WGSL struct; `decided_at` interpolation unit test.
+### Phase 1 — Plumbing + flash lighting, no visible change ✅
+* `renderer::FrameDynamics { frontier: Option<Frontier { origin, proper_time }>, flashes }`
+  (+ `FlashEvent`, `MAX_FLASHES = 16`) is passed per frame to `render_frame`,
+  `GpuRenderer::render` and `GpuUniforms::build`. `main.rs` and `web.rs` hold an empty one;
+  dynamic scenes will fill it.
+* `GpuUniforms` / WGSL `Uniforms` carry `frontier_origin`, `frontier_active`, `frontier_tau`,
+  `num_flashes` and 16 flash slots. The frontier fields are not read by the shader yet.
+* Per-vertex `decided_at: [f32; 4]` on `Simplex4D`, interpolated into `HitRecord4D`, packed
+  into `GpuAttr` / WGSL `Attr` / `HitRecord`; `DECIDED_AT_STATIC`, `with_decided_at`,
+  `build_worldtube_simplices_with_decided`.
+* **Flash lighting moved here from phase 2** (CPU `compute_flash_illumination` + WGSL
+  mirror), because a GPU-vs-CPU render *with* flashes is the only end-to-end check that the
+  new uniform layout is right. With no flashes the term is skipped entirely, so static scenes
+  render exactly as before.
+* **Tests:** `wgsl_struct_layouts_match_rust` (naga parses `render.wgsl` and compares the size
+  and member offsets of `Uniforms`, `Attr`, `Node`, `Geom`, `Material` with the Rust
+  mirrors); `gpu_matches_cpu_with_flashes` (two flash shells on every static scene, both
+  shadow modes, also asserts the flashes visibly light ≥ 1% of pixels);
+  `worldtube_decided_at_follows_steps`.
 
 ### Phase 2 — New views on static scenes
-Frontier view, Prophecy slice (+ Δ keys), Decision-Age mode with the analytic fallback, and
-flash lighting fired by `/` from the ship. All are useful before any simulation exists.
+Frontier view, Prophecy slice (+ Δ keys), Decision-Age mode with the analytic fallback, and a
+`/` key that emits a flash from the ship into `FrameDynamics` (lighting already exists from
+phase 1). All are useful before any simulation exists.
 * **Reuse from the draft:** `minkowski.rs` `future_light_ray_direction`; `renderer.rs`
   `ViewMode::{Frontier, ProphecySlice}`, `RenderMode::DecisionAge`, `FRONTIER_RAY_OFFSET`,
-  `shade_decision_age`, `apply_causal_bubble`, `compute_flash_illumination`,
-  `Camera4D.prophecy_delta`; `render.wgsl` equivalents (`SLICE_FRONTIER`, `SLICE_PROPHECY`,
-  `MODE_DECISION_AGE`, flash loop, bubble).
+  `shade_decision_age`, `apply_causal_bubble`, `Camera4D.prophecy_delta`; `render.wgsl`
+  equivalents (`SLICE_FRONTIER`, `SLICE_PROPHECY`, `MODE_DECISION_AGE`, bubble). The bubble
+  and decision age read the frontier from `FrameDynamics` / `u.frontier_*`.
 * **Fix:** in Frontier view every hit sits ~δ outside the frontier and gets a faint ring tint;
   the ring should only draw when `δ` is smaller than the ring width, or move the ring test to
   `|signed_inside + δ|`.
 * **Tests:** GPU-vs-CPU diffs for each new view/mode on a static scene; analytic
-  decision-age = `T + R`; flash shell hit/miss unit test.
+  decision-age = `T + R`.
 
 ### Phase 3 — Dynamic world skeleton + scene 6 (inert)
 * Add `src/dynamic/` with `DynWorld`, `Body`, the frontier rule and scheduler, ship-as-body,

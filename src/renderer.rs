@@ -133,10 +133,52 @@ pub struct RenderConfig {
     pub slice_mode: SliceMode,
 }
 
+/// Maximum number of light-pulse flashes uploaded to the GPU uniform block per frame.
+pub const MAX_FLASHES: usize = 16;
+
+/// A spherical pulse of light emitted at spacetime event `at`. It illuminates any surface event
+/// `E` on its future light cone within shell thickness `width`:
+/// `|(E.t - at.t) - |E.x - at.x|| < 0.5 * width`.
+#[derive(Clone, Copy, Debug)]
+pub struct FlashEvent {
+    pub at: Vec4,
+    pub width: f32,
+    pub intensity: f32,
+    pub color: Vec3,
+}
+
+/// The causal frontier `dJ+(O)` of the player's ship in Dynamic Mode: everything outside the
+/// open future light cone of `origin` is decided.
+#[derive(Clone, Copy, Debug)]
+pub struct Frontier {
+    /// The frontier's apex event `O`.
+    pub origin: Vec4,
+    /// Ship proper time at `O`.
+    pub proper_time: f32,
+}
+
+/// Per-frame render inputs that change independently of a scene's (static) geometry, so they
+/// are passed alongside the camera rather than baked into scene buffers.
+#[derive(Clone, Debug, Default)]
+pub struct FrameDynamics {
+    /// `Some` while a Dynamic Mode scene is running.
+    pub frontier: Option<Frontier>,
+    /// Active light pulses; only the first [`MAX_FLASHES`] are rendered.
+    pub flashes: Vec<FlashEvent>,
+}
+
+impl FrameDynamics {
+    /// The flashes the renderers actually evaluate (both backends cap at [`MAX_FLASHES`]).
+    pub fn active_flashes(&self) -> &[FlashEvent] {
+        &self.flashes[..self.flashes.len().min(MAX_FLASHES)]
+    }
+}
+
 pub fn render_frame(
     scene: &Scene4D,
     camera: &Camera4D,
     cfg: &RenderConfig,
+    dynamics: &FrameDynamics,
     framebuffer: &mut [u32],
 ) {
     let w = cfg.width;
@@ -173,7 +215,7 @@ pub fn render_frame(
                 let color = if let Some(hit) =
                     scene.bvh.trace(camera.position, ray_dir, 1e-3, 180.0)
                 {
-                    shade_hit(scene, camera, cfg, ray_dir, &hit)
+                    shade_hit(scene, camera, cfg, dynamics, ray_dir, &hit)
                 } else {
                     shade_sky(ray_dir)
                 };
@@ -187,6 +229,7 @@ fn shade_hit(
     scene: &Scene4D,
     camera: &Camera4D,
     cfg: &RenderConfig,
+    dynamics: &FrameDynamics,
     ray_dir: Vec4,
     hit: &HitRecord4D,
 ) -> Vec3 {
@@ -196,7 +239,13 @@ fn shade_hit(
         RenderMode::RelativisticShaded => {
             let albedo = sample_surface_albedo(hit, mat);
             let lighting = compute_illumination(scene, camera, cfg, ray_dir, hit, mat);
-            apply_distance_fog(albedo * lighting, ray_dir, hit.lambda)
+            let mut lit = albedo * lighting;
+            let flashes = dynamics.active_flashes();
+            if !flashes.is_empty() {
+                let flash_rgb = compute_flash_illumination(scene, cfg, flashes, hit);
+                lit += (albedo * 0.65 + Vec3::splat(0.35)) * flash_rgb;
+            }
+            apply_distance_fog(lit, ray_dir, hit.lambda)
         }
 
         RenderMode::LookbackIsochrones => {
@@ -347,6 +396,41 @@ fn compute_illumination(
         // High-contrast self-illuminated clock / light-clock display with rest-frame 3D shading
         0.72 + 0.38 * cos_view_rest + 0.22 * cos_light_rest
     }
+}
+
+/// Retarded illumination from light-pulse flashes: the hit event `E` is lit by flash `F` when
+/// `F` lies on `E`'s past light cone within the pulse's shell width. Shadow rays follow the
+/// null segment back to `F` (Lorentz-invariant in every shadow mode except `Off`).
+fn compute_flash_illumination(
+    scene: &Scene4D,
+    cfg: &RenderConfig,
+    flashes: &[FlashEvent],
+    hit: &HitRecord4D,
+) -> Vec3 {
+    let mut total = Vec3::default();
+    for f in flashes {
+        let dt = hit.event.t - f.at.t;
+        if dt <= 0.0 {
+            continue;
+        }
+        let dist = (f.at.spatial() - hit.event.spatial()).length().max(1e-4);
+        let shell_err = (dt - dist).abs();
+        let half_w = (0.5 * f.width).max(1e-3);
+        if shell_err >= half_w {
+            continue;
+        }
+        let k = 1.0 - shell_err / half_w;
+        let pulse = k * k;
+        let to_flash_4d = (f.at - hit.event) * (1.0 / dist);
+        let cos_f = rest_frame_cos(to_flash_4d, hit.surface_normal_4d, hit.four_velocity).max(0.0);
+        let in_shadow = cos_f > 0.0
+            && cfg.shadow_mode != ShadowMode::Off
+            && scene.bvh.is_occluded(hit.event, to_flash_4d, 2e-3, dist - 2e-3);
+        let shadow_factor = if in_shadow { 0.25 } else { 1.0 };
+        let atten = 1.0 / (1.0 + 0.015 * dist * dist);
+        total += f.color * (f.intensity * pulse * atten * (0.25 + 0.75 * shadow_factor * cos_f));
+    }
+    total
 }
 
 #[inline]

@@ -40,6 +40,14 @@ struct Uniforms {
     shadow_mode: u32,
     slice_mode: u32,
     num_nodes: u32,
+    // Per-frame dynamics (`renderer::FrameDynamics`).
+    frontier_origin: vec4<f32>,
+    frontier_active: u32,
+    num_flashes: u32,
+    frontier_tau: f32,
+    _pad0: u32,
+    flash_at: array<vec4<f32>, 16>,         // emission event (t, x, y, z)
+    flash_col_width: array<vec4<f32>, 16>,  // (color * intensity, shell width)
 };
 
 struct Node {
@@ -74,6 +82,7 @@ struct Attr {
     normal: vec4<f32>,
     four_vel: vec4<f32>,
     misc: vec4<f32>, // (uv_world_scale.0, uv_world_scale.1, bitcast(material_id), 0)
+    decided_at: vec4<f32>,
 };
 
 struct Material {
@@ -347,6 +356,7 @@ struct HitRecord {
     uv_world_scale: vec2<f32>,
     normal: vec4<f32>,
     four_vel: vec4<f32>,
+    decided_at: f32,
     material_id: u32,
 };
 
@@ -364,6 +374,7 @@ fn make_hit_record(t: TraceHit) -> HitRecord {
     h.uv_world_scale = a.misc.xy;
     h.normal = a.normal;
     h.four_vel = a.four_vel;
+    h.decided_at = dot(a.decided_at, b);
     h.material_id = bitcast<u32>(a.misc.z);
     return h;
 }
@@ -751,6 +762,37 @@ fn compute_illumination(ray_dir: vec4<f32>, hit: HitRecord, mat: Material) -> f3
     return 0.72 + 0.38 * cos_view_rest + 0.22 * cos_light_rest;
 }
 
+// Mirrors `renderer::compute_flash_illumination`.
+fn compute_flash_illumination(hit: HitRecord) -> vec3<f32> {
+    var total = vec3<f32>(0.0);
+    for (var i = 0u; i < u.num_flashes; i++) {
+        let f_at = u.flash_at[i];
+        let f_cw = u.flash_col_width[i];
+        let dt = hit.event.x - f_at.x;
+        if dt <= 0.0 {
+            continue;
+        }
+        let dist = max(length(f_at.yzw - hit.event.yzw), 1e-4);
+        let shell_err = abs(dt - dist);
+        let half_w = max(0.5 * f_cw.w, 1e-3);
+        if shell_err >= half_w {
+            continue;
+        }
+        let k = 1.0 - shell_err / half_w;
+        let pulse = k * k;
+        let to_flash_4d = (f_at - hit.event) * (1.0 / dist);
+        let cos_f = max(rest_frame_cos(to_flash_4d, hit.normal, hit.four_vel), 0.0);
+        var in_shadow = false;
+        if cos_f > 0.0 && u.shadow_mode != SHADOW_OFF {
+            in_shadow = is_occluded(hit.event, to_flash_4d, 2e-3, dist - 2e-3);
+        }
+        let shadow_factor = select(1.0, 0.25, in_shadow);
+        let atten = 1.0 / (1.0 + 0.015 * dist * dist);
+        total += f_cw.xyz * (pulse * atten * (0.25 + 0.75 * shadow_factor * cos_f));
+    }
+    return total;
+}
+
 fn apply_distance_fog(surface: vec3<f32>, ray_dir: vec4<f32>, lambda: f32) -> vec3<f32> {
     let fog = exp(-0.008 * lambda);
     return surface * fog + shade_sky_gradient(ray_dir) * (1.0 - fog);
@@ -762,7 +804,11 @@ fn shade_hit(ray_dir: vec4<f32>, hit: HitRecord) -> vec3<f32> {
     if u.mode == MODE_SHADED {
         let albedo = sample_surface_albedo(hit, mat);
         let lighting = compute_illumination(ray_dir, hit, mat);
-        return apply_distance_fog(albedo * lighting, ray_dir, hit.lambda);
+        var lit = albedo * lighting;
+        if u.num_flashes > 0u {
+            lit += (albedo * 0.65 + vec3<f32>(0.35)) * compute_flash_illumination(hit);
+        }
+        return apply_distance_fog(lit, ray_dir, hit.lambda);
     }
 
     if u.mode == MODE_ISOCHRONES {
