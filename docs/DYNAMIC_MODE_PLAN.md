@@ -447,30 +447,46 @@ fast-forwarded to it.
   Its next state is then a pure function of finalized data. This replaces the plan's vaguer
   "neighbour rule". Isolated bodies stay tight against the frontier; clustered ones wait for
   their slowest neighbour.
-* **Births and deaths never share a step.**
-  * Merged bodies and spore fragments start at `k+1` from parts that ended at `k`, once that
-    state is decided.
-  * The first version created products at `k`, where they collided with their own parents
-    (runaway mass doubling). A test caught it.
+* **Contacts are causal: impulses wait until they have crossed the body.** A contact that
+  begins at step `k` computes its impulse exactly from both bodies' states at the touching
+  point `P`, in a canonical order so the two impulses cancel. The body puts it in `pending` and
+  feels it only at the first step where `P` is in the causal past of *every* point of the body
+  (`Impulse::has_reached`: `|P − centre| + r ≤ Δt`). Until then it coasts on and overlaps what
+  it hit, as a compressible body would.
+  * Each contact acts once, when it begins (`Body::touching`).
+  * Why: the first Phase 4 cut changed a body's velocity the very next step, so a push hopped
+    a whole diameter per step and crossed a Newton's cradle ~7× faster than light (0.60 s for
+    a 4.25 s light-crossing). It now takes 4.70 s (`cradle_pushes_no_faster_than_light`).
+  * The causality property test now passes with **zero** slack.
+* **Sticky = perfectly inelastic, without merging.** Merging two touching spheres into one at
+  their centre would be action at a distance again. Each body instead gets its share of the
+  total 4-momentum in proportion to its rest mass (`collide::stick`): both end up co-moving,
+  their rest masses grow by `M / (m_a + m_b)`, and each switches to the glowing material from
+  that step (`Body::material_changes`). Sharing by energy instead would *lower* a resting
+  target's rest mass, which is why rest mass is used.
+* **Births and deaths never share a step.** Spore fragments start at `k+1` from a parent that
+  ended at `k`. The first version created products at `k`, where they collided with their own
+  parents (runaway mass doubling); a test caught it.
 * **Ammo** (`\` cycles; `Enter` fires at 0.6c along the view in the ship frame):
   * elastic puck;
-  * sticky puck: sticky clusters merge transitively into a glowing puck, radius ∝ m^⅓;
+  * sticky puck;
   * spore: a clock-faced cube that pops after 2.5 s of its own time into two spores (1.2 s
     fuse), whose fragments are pucks.
 
   Projectiles leave the ship's center and ignore the ship until clear. Their launch state is
   fixed by the firing input itself, so it is exempt from the "decided" check.
-* **Ramming.** The ship is a heavy (6×) sphere of radius 0.8 on its recorded track.
-  Collisions hand it exactly the 4-momentum the puck lost (`ship_kicks`), and `App` boosts the
-  camera's 4-velocity accordingly.
+* **Ramming.** The ship is a heavy (6×) sphere of radius 0.8 on its recorded track. Collisions
+  hand it exactly the 4-momentum the puck lost (`ship_kicks`). `App` keeps each kick in flight
+  until its news has crossed the hull to the camera at the centre, then boosts the camera's
+  4-velocity.
 * **Table.** The rails reflect, and the felt absorbs vertical motion, so shots fired from above
-  land and slide instead of flying off. The rack is spaced (gaps ≈ 1.1) and the movers run in
-  separate lanes, so nothing collides in the back-filled past.
-* **Rigid-contact caveat (documented, not hidden).** Contact acts across the touching bodies'
-  radii within one step, so a momentum kick can hop through a dense cluster faster than `c`.
-  The rack spacing keeps hops subluminal up to ~0.6c impacts. The causality test allows one
-  contact range of slack; in its scenario no difference leaked outside `I⁺(O)` even with zero
-  slack.
+  land and slide instead of flying off. Rails are static and uninfluenceable, so their
+  instant reflection carries no information. The rack is spaced (gaps ≈ 1.1) and the movers
+  run in separate lanes, so nothing collides in the back-filled past.
+* **Frontier view fix.** Bodies are only finalized once all of them is decided, so tips trail
+  the frontier by at least `γ(1+β)r`, and clustered bodies by more. The fixed 0.14 s offset put
+  every frontier ray behind every puck. `FrameDynamics::frontier_lag` (the largest decision
+  age of a live tip, plus a step, capped at 5 s) now pushes the view origin back accordingly.
 * **HUD/keys.**
   * `App::scene_description` shows `[ENTER] FIRE <AMMO> | [\] AMMO`, and the HUD font
     gained `\`.
@@ -478,11 +494,14 @@ fast-forwarded to it.
 * **Tests:**
   * collision/merge/decay 4-momentum conserved to 1e-9;
   * the elastic shot sets ≥ 2 rack pucks moving;
-  * the sticky shot merges with conservation and rest mass > sum;
+  * the sticky shot leaves shot and target co-moving, heavier and glowing; `stick`
+    conserves 4-momentum and matches the merged rest mass;
+  * Newton's cradle: the push crosses no faster than light;
+  * Frontier-view rays hit every live puck with the lag, and none without;
   * a spore fired at 0.8c pops after `γ·T` (± one step) into two fragments;
   * ramming hands the ship exactly the puck's lost 4-momentum;
   * the **causality property test**: two runs with identical input to `O` and extra shots
-    after it agree on all 22k compared states outside `I⁺(O)` and differ inside;
+    after it agree on all 22k compared states outside `I⁺(O)` with no slack, and differ inside;
   * the scheduler is lazy only when waiting on a neighbour;
   * the Phase 3 invariants still hold with interactions;
   * `App` firing/ammo and ship kicks.

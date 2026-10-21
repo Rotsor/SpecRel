@@ -23,7 +23,7 @@ use crate::minkowski::{Vec3, Vec4};
 use crate::renderer::{analytic_decision_age, Frontier};
 use crate::scene::{DemoScene, Scene4D};
 use billiards::{Ammo, SHIP_MASS, SHIP_RADIUS};
-use body::{distance, is_decided, Body, BodyState, Kind, STEP_DT};
+use body::{distance, is_decided, Body, BodyState, Impulse, Kind, STEP_DT};
 use collide::{P4, V3};
 
 /// How far behind the camera (in lab time) histories are kept: beyond the renderers' maximum
@@ -73,8 +73,9 @@ pub struct DynWorld {
     pub ship: Vec<ShipSample>,
     /// The frontier the histories were last extended to.
     pub frontier: Frontier,
-    /// Collision 4-momentum delivered to the ship and not yet applied to the camera.
-    pub ship_kicks: Vec<P4>,
+    /// Collision impulses delivered to the ship. The camera is the ship's center, so `App`
+    /// applies each once its news has crossed the hull ([`Impulse::has_reached`]).
+    pub ship_kicks: Vec<Impulse>,
     /// Lab time of grid step 0.
     t_origin: f64,
     fired: u64,
@@ -182,8 +183,12 @@ impl DynWorld {
         changed
     }
 
-    /// Advance body `i` by one grid step (or end it in a decay or merger). Returns `false` if
-    /// it has to wait: for the frontier, or for a neighbor or the ship to be known.
+    /// Advance body `i` by one grid step (or end it in a decay). Returns `false` if it has to
+    /// wait: for the frontier, or for a neighbor or the ship to be known.
+    ///
+    /// Contacts that begin at step `k` compute their impulse from both bodies' states at the
+    /// touching point, but the body only feels it once news of the contact has crossed it
+    /// ([`Impulse::has_reached`]); so every state depends only on its own causal past.
     fn try_advance(&mut self, i: usize, stamp: &impl Fn(&BodyState) -> f32) -> bool {
         let s = *self.bodies[i].latest();
         let k = s.step;
@@ -197,37 +202,62 @@ impl DynWorld {
         let Some(contacts) = self.contacts(i, k) else {
             return false;
         };
-        let sticky = self.bodies[i].is_sticky();
-        if contacts.bodies.iter().any(|&j| sticky || self.bodies[j].is_sticky()) {
-            return self.merge_cluster(i, k, stamp);
-        }
+        let me = &self.bodies[i];
+        let r = me.radius;
 
-        let (m, r) = (self.bodies[i].mass, self.bodies[i].radius);
-        let mut vel = s.vel;
+        // New contacts at step k.
+        let mut received = Vec::new();
         for &j in &contacts.bodies {
-            let o = self.bodies[j].at(k).expect("contacts exist at step k");
-            if let Some((v, _)) = collide::elastic(m, vel, self.bodies[j].mass, o.vel, sub3(o.pos, s.pos)) {
-                vel = v;
+            let other = &self.bodies[j];
+            if me.touching.contains(&other.uid) {
+                continue;
+            }
+            let o = other.at(k).expect("contacts exist at step k");
+            if let Some(dp) = contact_impulse(me, &s, other, o) {
+                let at = touching_point(s.pos, r, o.pos, other.radius);
+                received.push(Impulse { t: s.t, pos: at, dp });
             }
         }
         let mut kick = None;
-        if let Some(ship) = contacts.ship {
-            if let Some((v, v_ship)) = collide::elastic(m, vel, SHIP_MASS, ship.vel, sub3(ship.pos, s.pos)) {
-                vel = v;
-                kick = Some(collide::sub(
-                    collide::momentum(SHIP_MASS, v_ship),
-                    collide::momentum(SHIP_MASS, ship.vel),
-                ));
+        if let Some(ship) = contacts.ship.filter(|_| !me.touching_ship) {
+            let sep = sub3(ship.pos, s.pos);
+            if let Some((v, _)) = collide::elastic(me.mass, s.vel, SHIP_MASS, ship.vel, sep) {
+                let at = touching_point(s.pos, r, ship.pos, SHIP_RADIUS);
+                let dp = collide::sub(collide::momentum(me.mass, v), collide::momentum(me.mass, s.vel));
+                received.push(Impulse { t: s.t, pos: at, dp });
+                kick = Some(Impulse { t: s.t, pos: at, dp: dp.map(|c| -c) });
             }
         }
 
-        let mut next = s.drift(vel, self.step_time(k + 1));
+        // Coast to step k + 1, then feel every impulse whose news has crossed the body by then.
+        let mut next = s.drift(s.vel, self.step_time(k + 1));
         billiards::constrain(&s, &mut next, r);
+        let (pending, arrived): (Vec<Impulse>, Vec<Impulse>) = me
+            .pending
+            .iter()
+            .chain(&received)
+            .copied()
+            .partition(|imp| !imp.has_reached(&next, r));
+        let mut mass = me.mass;
+        for imp in &arrived {
+            let (m, v) = collide::mass_and_velocity(collide::add(collide::momentum(mass, next.vel), imp.dp));
+            mass = m;
+            next.vel = v;
+        }
         if !is_decided(&next, r, self.frontier.origin) {
             return false;
         }
+
         let stamp = stamp(&next);
+        let touching = contacts.bodies.iter().map(|&j| self.bodies[j].uid).collect();
         let body = &mut self.bodies[i];
+        if mass > body.mass * (1.0 + 1e-9) && body.material_at(next.step) != billiards::MATERIAL_HEATED {
+            body.material_changes.push((next.step, billiards::MATERIAL_HEATED));
+        }
+        body.mass = mass;
+        body.pending = pending;
+        body.touching = touching;
+        body.touching_ship = contacts.ship.is_some();
         body.history.push(next);
         body.decided_at.push(stamp);
         body.ended = billiards::out_of_play(&next);
@@ -301,61 +331,6 @@ impl DynWorld {
         ShipSample { t, pos: lerp(a.pos, b.pos), vel: lerp(a.vel, b.vel) }
     }
 
-    /// All sticky contacts of body `i` at step `k`, transitively, merge into one body carrying
-    /// their total 4-momentum. Waits (returns `false`) until the whole cluster is known and the
-    /// merged body's first state is decided.
-    fn merge_cluster(&mut self, i: usize, k: i64, stamp: &impl Fn(&BodyState) -> f32) -> bool {
-        let mut members = vec![i];
-        let mut next = 0;
-        while next < members.len() {
-            let m = members[next];
-            next += 1;
-            let Some(c) = self.contacts(m, k) else {
-                return false;
-            };
-            for j in c.bodies {
-                let joins = self.bodies[m].is_sticky() || self.bodies[j].is_sticky();
-                if joins && !members.contains(&j) {
-                    members.push(j);
-                }
-            }
-        }
-        members.sort_by_key(|&m| self.bodies[m].uid);
-
-        let parts: Vec<(f64, V3)> =
-            members.iter().map(|&m| (self.bodies[m].mass, self.bodies[m].latest().vel)).collect();
-        let (mass, vel) = collide::merge(&parts);
-        // Center of energy of the parts.
-        let mut pos = [0.0; 3];
-        let mut energy = 0.0;
-        for &m in &members {
-            let s = self.bodies[m].latest();
-            let e = self.bodies[m].mass * s.gamma();
-            energy += e;
-            for c in 0..3 {
-                pos[c] += e * s.pos[c];
-            }
-        }
-        let pos = pos.map(|p| p / energy);
-
-        // The parts' last state is step `k`; the merged body's first is `k + 1`, so no step
-        // ever holds both (nothing can collide with a body and its own parts at once).
-        let at_k = BodyState { step: k, t: self.step_time(k), pos, vel, tau: 0.0 };
-        let first = at_k.drift(vel, self.step_time(k + 1));
-        if !is_decided(&first, billiards::puck_radius(mass), self.frontier.origin) {
-            return false;
-        }
-        let uids: Vec<u64> = members.iter().map(|&m| self.bodies[m].uid).collect();
-        let mut merged = billiards::merged(&uids, mass, first);
-        merged.decided_at = vec![stamp(&first)];
-        for &m in &members {
-            debug_assert_eq!(self.bodies[m].latest().step, k);
-            self.bodies[m].ended = true;
-        }
-        self.bodies.push(merged);
-        true
-    }
-
     /// A spore whose clock ran out at step `k` splits there; the two fragments fly from step
     /// `k + 1`. Waits (returns `false`) until both fragments' first states are decided.
     fn decay(&mut self, i: usize, generation: u32, stamp: &impl Fn(&BodyState) -> f32) -> bool {
@@ -417,9 +392,15 @@ impl DynWorld {
             for s in &mut body.history {
                 s.t = t_origin + s.step as f64 * STEP_DT;
             }
+            for imp in &mut body.pending {
+                imp.t += dt;
+            }
         }
         for s in &mut self.ship {
             s.t += dt;
+        }
+        for kick in &mut self.ship_kicks {
+            kick.t += dt;
         }
         self.frontier.origin.t += dt as f32;
     }
@@ -443,14 +424,26 @@ impl DynWorld {
             let keep = render_sample_indices(&body.history);
             let samples: Vec<_> = keep.iter().map(|&i| body.history[i].sample()).collect();
             let decided: Vec<f32> = keep.iter().map(|&i| body.decided_at[i]).collect();
-            simplices.extend(build_worldtube_simplices_with_decided(
-                &body.mesh,
-                &samples,
-                Some(&decided),
-                body.material_id,
-            ));
+            let material: Vec<usize> =
+                keep.iter().map(|&i| body.material_at(body.history[i].step)).collect();
+            // One tube per run of prisms of equal material (a prism takes its later end's).
+            let mut a = 0;
+            while a + 1 < samples.len() {
+                let m = material[a + 1];
+                let mut b = a + 1;
+                while b + 1 < samples.len() && material[b + 1] == m {
+                    b += 1;
+                }
+                simplices.extend(build_worldtube_simplices_with_decided(
+                    &body.mesh,
+                    &samples[a..=b],
+                    Some(&decided[a..=b]),
+                    m,
+                ));
+                a = b;
+            }
             let mut cap = |i: usize| {
-                simplices.extend(build_worldtube_cap(&body.mesh, &samples[i], decided[i], body.material_id));
+                simplices.extend(build_worldtube_cap(&body.mesh, &samples[i], decided[i], material[i]));
             };
             cap(samples.len() - 1);
             if body.born && samples.len() > 1 {
@@ -471,6 +464,40 @@ impl DynWorld {
 
 fn sub3(a: V3, b: V3) -> V3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+/// Where two touching spheres meet: on the line between their centers, split by their radii.
+fn touching_point(a: V3, r_a: f64, b: V3, r_b: f64) -> V3 {
+    let f = r_a / (r_a + r_b);
+    [0, 1, 2].map(|c| a[c] + (b[c] - a[c]) * f)
+}
+
+/// The 4-momentum body `me` (at state `s`) receives from a contact beginning with `other` (at
+/// `o`), or `None` if they are already separating. Sticky contacts are perfectly inelastic,
+/// others elastic. Evaluated in a canonical order (lower uid first) so both bodies compute the
+/// same collision and their impulses cancel exactly.
+fn contact_impulse(me: &Body, s: &BodyState, other: &Body, o: &BodyState) -> Option<P4> {
+    let sep = sub3(o.pos, s.pos);
+    let closing = collide::dot3(sub3(o.vel, s.vel), sep) < 0.0;
+    if !closing {
+        return None;
+    }
+    let me_first = me.uid < other.uid;
+    let ((ma, va), (mb, vb), sep) = if me_first {
+        ((me.mass, s.vel), (other.mass, o.vel), sep)
+    } else {
+        ((other.mass, o.vel), (me.mass, s.vel), sep.map(|c| -c))
+    };
+    let (dpa, dpb) = if me.is_sticky() || other.is_sticky() {
+        collide::stick(ma, va, mb, vb)
+    } else {
+        let (va2, vb2) = collide::elastic(ma, va, mb, vb, sep)?;
+        (
+            collide::sub(collide::momentum(ma, va2), collide::momentum(ma, va)),
+            collide::sub(collide::momentum(mb, vb2), collide::momentum(mb, vb)),
+        )
+    };
+    Some(if me_first { dpa } else { dpb })
 }
 
 /// The state one grid step before `s` (for back-filling the collision-free past at spawn):
@@ -510,7 +537,7 @@ fn render_sample_indices(history: &[BodyState]) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::billiards::{puck_radius, PUCK_MASS};
+    use super::billiards::PUCK_MASS;
     use super::*;
     use crate::minkowski::Tetrad;
 
@@ -720,6 +747,43 @@ mod tests {
         assert_eq!(hits(crate::renderer::FRONTIER_RAY_OFFSET), 0, "static offset misses them");
     }
 
+    /// Newton's cradle: a line of nearly touching pucks struck at one end. The far puck may not
+    /// start moving before light from the first contact could have crossed all of it — rigid
+    /// contact would hand the push down the line by a diameter per step, far faster than `c`.
+    #[test]
+    fn cradle_pushes_no_faster_than_light() {
+        let mut world = DynWorld::spawn(DemoScene::RelativisticBilliards);
+        let step = (world.frontier.origin.t as f64 / STEP_DT).floor() as i64 - 1;
+        let t = step as f64 * STEP_DT;
+        let r = billiards::PUCK_RADIUS;
+        let gap = 0.01;
+        let puck = |uid: u64, x: f64, vx: f64| {
+            let state = BodyState { step, t, pos: [x, 0.0, -25.0], vel: [vx, 0.0, 0.0], tau: 0.0 };
+            let mut b = billiards::body(uid, Kind::Puck, PUCK_MASS, state, 8);
+            b.decided_at = vec![0.0];
+            b
+        };
+        // Off the table, far from the camera: decided well into the future.
+        world.bodies = (0..6).map(|n| puck(n, n as f64 * (2.0 * r + gap), 0.0)).collect();
+        world.bodies.push(puck(99, -1.0, 0.5));
+        run_parked(&mut world, 30.0);
+
+        let striker = world.bodies.iter().find(|b| b.uid == 99).unwrap();
+        let first = &world.bodies[0];
+        let contact = striker
+            .history
+            .iter()
+            .find(|s| first.at(s.step).is_some_and(|f| distance(s.pos, f.pos) < 2.0 * r))
+            .expect("striker reaches the cradle");
+        let x0 = contact.pos[0] + r; // the touching point
+        let last = &world.bodies[5];
+        let moved = last.history.iter().find(|s| s.vel[0] != 0.0).expect("push arrives");
+        let news_needed = (last.history[0].pos[0] - x0) + r; // reach its far side
+        let took = moved.t - contact.t;
+        println!("push crossed the cradle in {took:.2} s; light needs {news_needed:.2} s");
+        assert!(took >= news_needed - 1e-9, "push took {took:.2} s, light needs {news_needed:.2} s");
+    }
+
     #[test]
     fn back_step_inverts_drift() {
         let world = DynWorld::spawn(DemoScene::RelativisticBilliards);
@@ -749,30 +813,29 @@ mod tests {
     }
 
     #[test]
-    fn sticky_shot_merges_into_a_heavier_puck() {
+    fn sticky_shot_sticks_and_turns_kinetic_energy_into_mass() {
         let mut world = DynWorld::spawn(DemoScene::RelativisticBilliards);
         let vel = aim_at_rack(&world, 0.6);
         assert!(world.fire(world.frontier, vel, Ammo::Sticky));
         run_parked(&mut world, 60.0);
 
-        let m = world.bodies.iter().find(|b| b.material_id == 9).expect("a merger happened");
-        let first = m.history[0];
-        let parents: Vec<_> = world
-            .bodies
+        // The shot and the first puck it hit each felt their inelastic share (the pair may go
+        // on to stick to more of the rack): both glow from then on, both are heavier, and right
+        // after it they move together.
+        let heated: Vec<_> = world.bodies.iter().filter(|b| !b.material_changes.is_empty()).collect();
+        let shot = heated.iter().find(|b| b.is_sticky()).expect("the shot heated up");
+        let target = heated
             .iter()
-            .filter(|b| b.ended && b.uid != m.uid && b.latest().step == first.step - 1)
-            .collect();
-        assert!(parents.len() >= 2);
-        let total = parents.iter().fold([0.0; 4], |acc, b| {
-            collide::add(acc, collide::momentum(b.mass, b.latest().vel))
-        });
-        let merged = collide::momentum(m.mass, first.vel); // coasting from the merge event
-        for c in 0..4 {
-            assert!((total[c] - merged[c]).abs() < 1e-9, "4-momentum not conserved");
+            .filter(|b| !b.is_sticky())
+            .min_by_key(|b| b.material_changes[0].0)
+            .expect("the puck it hit heated up");
+        let vel_after = |b: &Body| b.at(b.material_changes[0].0).unwrap().vel;
+        let (va, vb) = (vel_after(shot), vel_after(target));
+        for c in 0..3 {
+            assert!((va[c] - vb[c]).abs() < 1e-9, "co-moving after sticking: {va:?} vs {vb:?}");
         }
-        let rest_sum: f64 = parents.iter().map(|b| b.mass).sum();
-        assert!(m.mass > rest_sum, "rest mass {} should exceed {rest_sum}", m.mass);
-        assert!((m.radius - puck_radius(m.mass)).abs() < 1e-12);
+        assert!(heated.iter().all(|b| b.mass > PUCK_MASS), "every stuck puck gained rest mass");
+        assert!(heated.iter().all(|b| b.material_changes[0].1 == billiards::MATERIAL_HEATED));
         assert_causal(&world);
     }
 
@@ -822,7 +885,7 @@ mod tests {
         let puck = world.bodies.iter().find(|b| b.uid == 42).unwrap();
         let before = collide::momentum(PUCK_MASS, [0.0, 0.0, -0.6]);
         let after = collide::momentum(PUCK_MASS, puck.latest().vel);
-        let kick = world.ship_kicks[0];
+        let kick = world.ship_kicks[0].dp;
         for c in 0..4 {
             assert!((before[c] - after[c] - kick[c]).abs() < 1e-9);
         }
@@ -833,8 +896,8 @@ mod tests {
     /// The causality property: two runs with the same input up to the camera event `O` but
     /// different input afterwards agree on every history step outside `I+(O)`.
     ///
-    /// Contact acts across the touching bodies' radii within one step, so a difference can leak
-    /// that far outside the cone; the comparison allows exactly that slack.
+    /// No slack: a contact only changes a body once its news has crossed the whole body, so
+    /// every state depends on its own causal past alone (see `cradle_pushes_no_faster_than_light`).
     #[test]
     fn input_after_o_never_changes_anything_outside_its_future_cone() {
         let path = gentle_path(900, 0.05);
@@ -866,7 +929,6 @@ mod tests {
             other.advance(f, u);
         }
 
-        let slack = 2.0 * puck_radius(4.0 * PUCK_MASS) + STEP_DT;
         let (mut compared, mut differing_inside) = (0, 0);
         for a in &same.bodies {
             let Some(b) = other.bodies.iter().find(|b| b.uid == a.uid) else {
@@ -878,7 +940,7 @@ mod tests {
                     differing_inside += (b.ended && s.step > b.latest().step) as usize;
                     continue;
                 };
-                if is_decided(s, a.radius + slack, o) {
+                if is_decided(s, a.radius, o) {
                     assert_eq!(s, t, "body {:x} differs outside I+(O) at step {}", a.uid, s.step);
                     compared += 1;
                 } else if s != t {

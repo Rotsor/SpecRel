@@ -32,7 +32,8 @@ pub const COMOVING_BETA: Vec3 = Vec3::new(0.7, 0.0, 0.0);
 
 const MATERIAL_MOVING: usize = 7;
 const MATERIAL_RESTING: usize = 8;
-const MATERIAL_MERGED: usize = 9;
+/// A body that gained rest mass from a sticky hit glows from then on.
+pub const MATERIAL_HEATED: usize = 9;
 const MATERIAL_STICKY: usize = 10;
 const MATERIAL_SPORE: usize = 11;
 
@@ -99,6 +100,10 @@ pub fn body(uid: u64, kind: Kind, mass: f64, state: BodyState, material_id: usiz
         born: false,
         ended: false,
         ignore_ship: false,
+        pending: Vec::new(),
+        touching: Vec::new(),
+        touching_ship: false,
+        material_changes: Vec::new(),
     }
 }
 
@@ -140,14 +145,6 @@ pub fn projectile(seq: u64, ammo: Ammo, state: BodyState) -> Body {
     };
     b.born = true;
     b.ignore_ship = true;
-    b
-}
-
-/// The body formed when the sticky cluster `uids` merges.
-pub fn merged(uids: &[u64], mass: f64, state: BodyState) -> Body {
-    let uid = uids.iter().fold(0x3E26E, |acc, &u| mix(acc, u));
-    let mut b = body(uid, Kind::Sticky, mass, state, MATERIAL_MERGED);
-    b.born = true;
     b
 }
 

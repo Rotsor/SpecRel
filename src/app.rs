@@ -3,7 +3,8 @@
 //! translate their own key events into [`Action`]s and [`HeldInput`], and keep only what is
 //! genuinely theirs (rendering backend, resolution, HUD visibility, presentation).
 
-use crate::dynamic::billiards::{Ammo, FIRE_SPEED, SHIP_MASS};
+use crate::dynamic::billiards::{Ammo, FIRE_SPEED, SHIP_MASS, SHIP_RADIUS};
+use crate::dynamic::body::{BodyState, Impulse};
 use crate::dynamic::collide::P4;
 use crate::dynamic::DynWorld;
 use crate::minkowski::{Vec3, Vec4};
@@ -93,6 +94,8 @@ pub struct App {
     pub world: Option<DynWorld>,
     /// What [`Action::Fire`] launches in Dynamic Mode.
     pub ammo: Ammo,
+    /// Ship collision impulses whose news has not crossed the hull yet.
+    kicks_in_flight: Vec<Impulse>,
     /// Bumped whenever a scene's geometry is replaced, so frontends know to re-upload it.
     pub scene_generation: u64,
     world_grew: bool,
@@ -119,6 +122,7 @@ impl App {
             time_scale_idx: DEFAULT_TIME_SCALE_IDX,
             world: None,
             ammo: Ammo::Puck,
+            kicks_in_flight: Vec::new(),
             scene_generation: 0,
             world_grew: false,
             rebuild_timer: 0.0,
@@ -274,6 +278,9 @@ impl App {
             let shift = -DYNAMIC_REBASE_AFTER_T;
             self.camera.position.t += shift;
             self.dynamics.shift_time(shift);
+            for kick in &mut self.kicks_in_flight {
+                kick.t += shift as f64;
+            }
             if let Some(world) = self.world.as_mut() {
                 world.rebase(shift as f64);
             }
@@ -286,10 +293,23 @@ impl App {
         self.world_grew |= world.advance(frontier, self.camera.tetrad.e[0]);
         self.dynamics.frontier_lag = world.frontier_lag(self.camera.tetrad.e[0]);
 
-        // Collisions with the ship push back on it: apply the momentum to the camera.
-        let kicks: Vec<_> = world.ship_kicks.drain(..).collect();
-        for kick in kicks {
-            self.kick_ship(kick);
+        // Collisions with the ship push back on it. The camera is the ship's center: it feels a
+        // kick once news of the contact has crossed the hull, like any other body.
+        self.kicks_in_flight.append(&mut world.ship_kicks);
+        let p = self.camera.position;
+        let ship = BodyState {
+            step: 0,
+            t: p.t as f64,
+            pos: [p.x as f64, p.y as f64, p.z as f64],
+            vel: [0.0; 3],
+            tau: 0.0,
+        };
+        let (arrived, flying): (Vec<_>, Vec<_>) = std::mem::take(&mut self.kicks_in_flight)
+            .into_iter()
+            .partition(|k| k.has_reached(&ship, SHIP_RADIUS));
+        self.kicks_in_flight = flying;
+        for kick in arrived {
+            self.kick_ship(kick.dp);
         }
 
         self.rebuild_timer += dt_wall;
@@ -353,6 +373,7 @@ impl App {
         self.camera = Camera4D::new(demo.initial_camera_pos(), FOV_Y_DEG);
         self.paused = false;
         self.dynamics.flashes.clear();
+        self.kicks_in_flight.clear();
 
         self.world = demo.is_dynamic().then(|| {
             DynWorld::new(demo, self.camera_frontier(), self.camera.tetrad.e[0])

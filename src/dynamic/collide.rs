@@ -92,6 +92,18 @@ pub fn merge(parts: &[(f64, V3)]) -> (f64, V3) {
     mass_and_velocity(total)
 }
 
+/// Perfectly inelastic contact between two bodies that stay separate: both end up moving at
+/// the CM velocity `P / E`, and the dissipated kinetic energy heats them in proportion to their
+/// rest masses: body `i` gets the share `m_i / (m_a + m_b)` of the total 4-momentum `P`, so its
+/// rest mass grows by the same factor `M / (m_a + m_b)` as the merged body of [`merge`].
+/// Returns each body's 4-momentum change.
+pub fn stick(m_a: f64, v_a: V3, m_b: f64, v_b: V3) -> (P4, P4) {
+    let (pa, pb) = (momentum(m_a, v_a), momentum(m_b, v_b));
+    let total = add(pa, pb);
+    let share = |m: f64| total.map(|c| c * m / (m_a + m_b));
+    (sub(share(m_a), pa), sub(share(m_b), pb))
+}
+
 /// A body of rest mass `m` moving at `v` splits into two equal fragments flying apart at
 /// `speed` along `dir_rest` (a unit vector in the parent's rest frame). Each fragment's energy
 /// in that frame is `m / 2`, so its rest mass is `m / (2 gamma(speed))`.
@@ -145,6 +157,20 @@ mod tests {
         assert!(m > 2.1, "merged rest mass {m}"); // E = 2.25, p = 0.75 => M = 2.121
         let total = add(momentum(1.0, parts[0].1), momentum(1.0, parts[1].1));
         assert_p4_eq(momentum(m, v), total, 1e-9);
+    }
+
+    #[test]
+    fn sticking_conserves_four_momentum_and_comoves() {
+        let (ma, va, mb, vb) = (1.0, [0.6, 0.0, 0.1], 2.0, [-0.1, 0.0, 0.0]);
+        let (dpa, dpb) = stick(ma, va, mb, vb);
+        assert_p4_eq(add(dpa, dpb), [0.0; 4], 1e-12);
+        let (m1, v1) = mass_and_velocity(add(momentum(ma, va), dpa));
+        let (m2, v2) = mass_and_velocity(add(momentum(mb, vb), dpb));
+        for c in 0..3 {
+            assert!((v1[c] - v2[c]).abs() < 1e-12);
+        }
+        let (merged, _) = merge(&[(ma, va), (mb, vb)]);
+        assert!((m1 + m2 - merged).abs() < 1e-12 && merged > ma + mb);
     }
 
     #[test]

@@ -88,7 +88,8 @@ pub fn is_decided(state: &BodyState, radius: f64, origin: Vec4) -> bool {
 pub enum Kind {
     /// Collides elastically (unless the other body is sticky).
     Puck,
-    /// Merges with whatever it touches.
+    /// Sticks to whatever it touches: both end up co-moving, heavier by the kinetic energy
+    /// the contact dissipated (see [`collide::stick`]).
     Sticky,
     /// Splits into two fragments once its own clock reads `lifetime`; fragments of generation
     /// `generation > 0` are spores again with a shorter fuse, the last generation plain pucks.
@@ -118,6 +119,32 @@ pub struct Body {
     pub ended: bool,
     /// Pass through the ship until first clear of it (a projectile leaving the launcher).
     pub ignore_ship: bool,
+    /// Collision impulses received but not yet felt: see [`Impulse::has_reached`].
+    pub pending: Vec<Impulse>,
+    /// Uids of the bodies touching it at its latest step (a contact acts once, when it begins).
+    pub touching: Vec<u64>,
+    pub touching_ship: bool,
+    /// Material switches as `(first step, material)`, e.g. glowing once a sticky hit adds mass.
+    pub material_changes: Vec<(i64, usize)>,
+}
+
+/// A collision's 4-momentum change for one body, and where and when the contact happened.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Impulse {
+    pub t: f64,
+    pub pos: V3,
+    pub dp: collide::P4,
+}
+
+impl Impulse {
+    /// A rigid body's motion may only change once news of the contact has reached *all* of it:
+    /// the contact event must lie in the causal past of every point of the body (radius `r`)
+    /// at `state`. Until then the body coasts on — and overlaps what it hit, as a real,
+    /// compressible body would. This caps how fast a push travels down a chain of touching
+    /// bodies at `c`.
+    pub fn has_reached(&self, state: &BodyState, r: f64) -> bool {
+        distance(self.pos, state.pos) + r <= state.t - self.t
+    }
 }
 
 impl Body {
@@ -137,5 +164,13 @@ impl Body {
 
     pub fn is_sticky(&self) -> bool {
         self.kind == Kind::Sticky
+    }
+
+    pub fn material_at(&self, step: i64) -> usize {
+        self.material_changes
+            .iter()
+            .rev()
+            .find(|&&(from, _)| from <= step)
+            .map_or(self.material_id, |&(_, m)| m)
     }
 }
