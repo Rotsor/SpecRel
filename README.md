@@ -136,5 +136,6 @@ If you are reading the code to learn how Special Relativity is implemented geome
 6. [`src/shaders/render.wgsl`](src/shaders/render.wgsl) — High-performance WGSL compute shader executing full 4D BVH traversal, intersection, procedural clock dials, and lighting on the GPU.
 7. [`src/scene.rs`](src/scene.rs) — The 5 Special Relativity demo scenes with multi-iteration periodic worldtubes (`for_periodic_copies`) and physics verification tests.
 8. [`src/hud.rs`](src/hud.rs) — Software 5x7 bitmap font renderer for HUD, GPU HUD overlay buffer, and in-scene digital clock readouts.
-9. [`src/main.rs`](src/main.rs) — Native desktop interactive window loop (`minifb`), dynamic GPU/CPU backend switching, and relativistic flight controls.
-10. [`src/web.rs`](src/web.rs) & [`web/index.html`](web/index.html) — Zero-copy WebAssembly (`wasm32-unknown-unknown`) bindings and browser WebGPU + Canvas2D frontend.
+9. [`src/app.rs`](src/app.rs) — Frontend-independent app state shared by desktop and web: scene selection, observer camera, relativistic flight controls (`Action` / `HeldInput`), time controls and per-frame dynamics.
+10. [`src/main.rs`](src/main.rs) — Native desktop window loop (`minifb`): key bindings and GPU/CPU backend switching.
+11. [`src/web.rs`](src/web.rs) & [`web/index.html`](web/index.html) — Zero-copy WebAssembly (`wasm32-unknown-unknown`) bindings and browser WebGPU + Canvas2D frontend.

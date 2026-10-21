@@ -8,22 +8,15 @@
 //! 3. Step the relativistic observer camera, Lorentz boosts, proper time, and HUD each frame,
 //!    supporting both zero-readback WebGPU compute rendering and CPU reference rendering.
 
+use crate::app::{Action, App, HeldInput};
 use crate::gpu::{build_tables_data, GpuUniforms, PackedSceneGpuData, RENDER_WGSL};
 use crate::hud::{draw_hud, draw_hud_overlay, HUD_BASE_WIDTH, HUD_OVERLAY_HEIGHT};
-use crate::minkowski::{Vec3, Vec4};
-use crate::renderer::{
-    render_frame, Camera4D, FrameDynamics, RenderConfig, RenderMode, ShadowMode, ViewMode,
-    PROPHECY_DELTA_DEFAULT,
-};
+use crate::renderer::render_frame;
 use crate::scene::{DemoScene, Scene4D};
 use std::cell::UnsafeCell;
 
 const WIDTH: usize = 1280;
 const HEIGHT: usize = 800;
-
-const TIME_SCALES: [f32; 10] = [
-    -4.0, -2.0, -1.0, -0.5, -0.25, 0.25, 0.5, 1.0, 2.0, 4.0,
-];
 
 // Discrete key action codes sent from JS `keydown`
 pub const KEY_1: u32 = 1;
@@ -72,17 +65,59 @@ pub const HOLD_J: u32 = 117;
 pub const HOLD_U: u32 = 118;
 pub const HOLD_O: u32 = 119;
 
+/// Map a discrete JS key code to an app action (frontend-only keys are handled separately).
+fn key_action(code: u32) -> Option<Action> {
+    Some(match code {
+        KEY_1..=KEY_5 => Action::SelectScene((code - KEY_1) as usize),
+        KEY_N => Action::NextScene,
+        KEY_B => Action::PrevScene,
+        KEY_M => Action::CycleRenderMode,
+        KEY_G => Action::CycleView,
+        KEY_H => Action::CycleShadows,
+        KEY_P => Action::TogglePause,
+        KEY_T => Action::ToggleRewind,
+        KEY_MINUS => Action::Slower,
+        KEY_EQUAL => Action::Faster,
+        KEY_R => Action::Reset,
+        KEY_X => Action::Brake,
+        KEY_V => Action::MatchVelocity,
+        KEY_SLASH => Action::EmitFlash,
+        KEY_PAGE_UP => Action::ProphecyDeltaUp,
+        KEY_PAGE_DOWN => Action::ProphecyDeltaDown,
+        _ => return None,
+    })
+}
+
+fn held_input(mask: u32) -> HeldInput {
+    let held = |code: u32| (mask & (1u32 << (code - 100))) != 0;
+    HeldInput {
+        yaw_left: held(HOLD_LEFT),
+        yaw_right: held(HOLD_RIGHT),
+        pitch_up: held(HOLD_UP),
+        pitch_down: held(HOLD_DOWN),
+        roll_left: held(HOLD_Q),
+        roll_right: held(HOLD_E),
+        thrust_forward: held(HOLD_W),
+        thrust_back: held(HOLD_S),
+        thrust_right: held(HOLD_D),
+        thrust_left: held(HOLD_A),
+        thrust_up: held(HOLD_SPACE),
+        thrust_down: held(HOLD_C),
+        scrub_back: held(HOLD_BRACKET_LEFT),
+        scrub_forward: held(HOLD_BRACKET_RIGHT),
+        move_forward: held(HOLD_I),
+        move_back: held(HOLD_K),
+        move_right: held(HOLD_L),
+        move_left: held(HOLD_J),
+        move_up: held(HOLD_U),
+        move_down: held(HOLD_O),
+    }
+}
+
 struct WebState {
-    scenes: Vec<Scene4D>,
+    app: App,
     packed_scenes: Vec<PackedSceneGpuData>,
     tables: Vec<u32>,
-    scene_idx: usize,
-    camera: Camera4D,
-    cfg: RenderConfig,
-    /// Per-frame causal frontier and flashes (empty for static scenes).
-    dynamics: FrameDynamics,
-    paused_worldline: bool,
-    time_scale_idx: usize,
     show_hud: bool,
     gpu_available: bool,
     use_gpu: bool,
@@ -108,11 +143,6 @@ fn with_state<R>(f: impl FnOnce(&mut WebState) -> R) -> R {
     f(state)
 }
 
-#[inline]
-fn held(mask: u32, code: u32) -> bool {
-    (mask & (1u32 << (code - 100))) != 0
-}
-
 #[no_mangle]
 pub extern "C" fn web_init(gpu_available: u32) {
     let scenes: Vec<Scene4D> = DemoScene::ALL
@@ -126,40 +156,23 @@ pub extern "C" fn web_init(gpu_available: u32) {
     let tables = build_tables_data();
 
     let has_gpu = gpu_available != 0;
-    let res_scale = 1usize;
-    let scene_idx = 0usize;
-    let camera = Camera4D::new(scenes[scene_idx].demo.initial_camera_pos(), 65.0);
-    let cfg = RenderConfig {
-        width: WIDTH * res_scale,
-        height: HEIGHT * res_scale,
-        mode: RenderMode::RelativisticShaded,
-        shadow_mode: ShadowMode::LorentzInvariant,
-        slice_mode: ViewMode::PastLightCone,
-        prophecy_delta: PROPHECY_DELTA_DEFAULT,
-    };
-    let dynamics = FrameDynamics::default();
+    let app = App::new(scenes, WIDTH, HEIGHT);
     let uniforms = GpuUniforms::build(
-        &camera,
-        &cfg,
-        &dynamics,
-        packed_scenes[scene_idx].num_nodes,
-        packed_scenes[scene_idx].light_pos,
+        &app.camera,
+        &app.cfg,
+        &app.dynamics,
+        packed_scenes[app.scene_idx].num_nodes,
+        packed_scenes[app.scene_idx].light_pos,
     );
 
     let state = WebState {
-        scenes,
+        app,
         packed_scenes,
         tables,
-        scene_idx,
-        camera,
-        cfg,
-        dynamics,
-        paused_worldline: false,
-        time_scale_idx: 7, // +1.0x forward
         show_hud: true,
         gpu_available: has_gpu,
         use_gpu: has_gpu,
-        res_scale,
+        res_scale: 1,
         fps_smooth: 60.0,
         held_keys: 0,
         uniforms,
@@ -187,98 +200,42 @@ pub extern "C" fn web_key_event(code: u32, pressed: u32, repeat: u32) {
         }
 
         // Prophecy-delta stepping auto-repeats while held, like the native build.
-        if pressed != 0 && (code == KEY_PAGE_UP || code == KEY_PAGE_DOWN) {
-            s.cfg.step_prophecy_delta(if code == KEY_PAGE_UP { 1.0 } else { -1.0 });
+        let repeats = code == KEY_PAGE_UP || code == KEY_PAGE_DOWN;
+        if pressed == 0 || (repeat != 0 && !repeats) {
             return;
         }
 
-        if pressed == 0 || repeat != 0 {
+        if let Some(action) = key_action(code) {
+            s.app.apply(action);
             return;
         }
 
-        let mut new_scene_idx = None;
+        // Frontend-only toggles: HUD, rendering backend and resolution.
         match code {
-            KEY_1 => new_scene_idx = Some(0),
-            KEY_2 => new_scene_idx = Some(1),
-            KEY_3 => new_scene_idx = Some(2),
-            KEY_4 => new_scene_idx = Some(3),
-            KEY_5 => new_scene_idx = Some(4),
-            KEY_N => new_scene_idx = Some((s.scene_idx + 1) % s.scenes.len()),
-            KEY_B => new_scene_idx = Some((s.scene_idx + s.scenes.len() - 1) % s.scenes.len()),
-            KEY_M => s.cfg.mode = s.cfg.mode.next(),
-            KEY_G => s.cfg.slice_mode = s.cfg.slice_mode.next(),
-            KEY_H => s.cfg.shadow_mode = s.cfg.shadow_mode.next(),
-            KEY_P => s.paused_worldline = !s.paused_worldline,
-            KEY_T => {
-                s.time_scale_idx = TIME_SCALES.len() - 1 - s.time_scale_idx;
-                s.paused_worldline = false;
-            }
-            KEY_MINUS => {
-                s.time_scale_idx = s.time_scale_idx.saturating_sub(1);
-            }
-            KEY_EQUAL => {
-                s.time_scale_idx = (s.time_scale_idx + 1).min(TIME_SCALES.len() - 1);
-            }
             KEY_TAB => s.show_hud = !s.show_hud,
             KEY_F => {
                 if s.gpu_available {
                     s.use_gpu = !s.use_gpu;
                     if !s.use_gpu && s.res_scale > 1 {
                         s.res_scale = 1;
-                        s.cfg.width = WIDTH;
-                        s.cfg.height = HEIGHT;
+                        s.app.cfg.width = WIDTH;
+                        s.app.cfg.height = HEIGHT;
                     }
                 }
             }
             KEY_Z => {
                 s.res_scale = if s.res_scale == 1 { 2 } else { 1 };
-                s.cfg.width = WIDTH * s.res_scale;
-                s.cfg.height = HEIGHT * s.res_scale;
-            }
-            KEY_R => {
-                let pos = s.scenes[s.scene_idx].demo.initial_camera_pos();
-                s.camera = Camera4D::new(pos, 65.0);
-                s.time_scale_idx = 7;
-                s.paused_worldline = false;
-                s.dynamics.flashes.clear();
-            }
-            KEY_SLASH => s.dynamics.emit_flash(s.camera.position),
-            KEY_X => {
-                s.camera.tetrad.boost_to(Vec4::new(1.0, 0.0, 0.0, 0.0));
-            }
-            KEY_V => {
-                if s.camera.tetrad.beta().length() > 0.1 {
-                    s.camera.tetrad.boost_to(Vec4::new(1.0, 0.0, 0.0, 0.0));
-                } else {
-                    let target_beta = s.scenes[s.scene_idx]
-                        .demo
-                        .comoving_beta(s.camera.position.t);
-                    let target_u = Vec4::four_velocity_from_beta(target_beta);
-                    s.camera.tetrad.boost_to(target_u);
-                }
+                s.app.cfg.width = WIDTH * s.res_scale;
+                s.app.cfg.height = HEIGHT * s.res_scale;
             }
             _ => {}
-        }
-
-        if let Some(idx) = new_scene_idx {
-            if idx < s.scenes.len() {
-                s.scene_idx = idx;
-                let pos = s.scenes[s.scene_idx].demo.initial_camera_pos();
-                s.camera = Camera4D::new(pos, 65.0);
-                s.paused_worldline = false;
-                s.dynamics.flashes.clear();
-            }
         }
     });
 }
 
 #[no_mangle]
 pub extern "C" fn web_mouse_look(dyaw: f32, dpitch: f32) {
-    with_state(|s| {
-        if dyaw != 0.0 || dpitch != 0.0 {
-            s.camera.tetrad.rotate_local(dyaw, dpitch, 0.0);
-        }
-    });
+    with_state(|s| s.app.look(dyaw, dpitch, 0.0));
 }
 
 #[no_mangle]
@@ -294,133 +251,14 @@ pub extern "C" fn web_step(dt_secs: f32) {
         let dt_wall = dt_secs.clamp(0.001, 0.1);
         s.fps_smooth = s.fps_smooth * 0.9 + (1.0 / dt_wall) * 0.1;
 
-        let mask = s.held_keys;
+        s.app.step(dt_wall, &held_input(s.held_keys));
 
-        // 1. Local camera orientation in observer's rest frame
-        let rot_speed = 1.6 * dt_wall;
-        let mut yaw = 0.0;
-        let mut pitch = 0.0;
-        let mut roll = 0.0;
-        if held(mask, HOLD_LEFT) {
-            yaw -= rot_speed;
-        }
-        if held(mask, HOLD_RIGHT) {
-            yaw += rot_speed;
-        }
-        if held(mask, HOLD_UP) {
-            pitch += rot_speed;
-        }
-        if held(mask, HOLD_DOWN) {
-            pitch -= rot_speed;
-        }
-        if held(mask, HOLD_Q) {
-            roll -= rot_speed;
-        }
-        if held(mask, HOLD_E) {
-            roll += rot_speed;
-        }
-        if yaw != 0.0 || pitch != 0.0 || roll != 0.0 {
-            s.camera.tetrad.rotate_local(yaw, pitch, roll);
-        }
-
-        // 2. Proper acceleration thrusters (Lorentz boost in observer's local rest frame)
-        let boost_rate = 1.25 * dt_wall;
-        let mut d_rapidity = Vec3::default();
-        if held(mask, HOLD_W) {
-            d_rapidity.z += boost_rate;
-        }
-        if held(mask, HOLD_S) {
-            d_rapidity.z -= boost_rate;
-        }
-        if held(mask, HOLD_D) {
-            d_rapidity.x += boost_rate;
-        }
-        if held(mask, HOLD_A) {
-            d_rapidity.x -= boost_rate;
-        }
-        if held(mask, HOLD_SPACE) {
-            d_rapidity.y += boost_rate;
-        }
-        if held(mask, HOLD_C) {
-            d_rapidity.y -= boost_rate;
-        }
-        s.camera.tetrad.boost_local(d_rapidity);
-
-        // 3. Direct coordinate-space & time scrubbing
-        let scrub_speed = 6.0 * dt_wall;
-        let mut time_changed = false;
-        if held(mask, HOLD_BRACKET_LEFT) {
-            s.camera.position.t -= scrub_speed;
-            time_changed = true;
-        }
-        if held(mask, HOLD_BRACKET_RIGHT) {
-            s.camera.position.t += scrub_speed;
-            time_changed = true;
-        }
-        if held(mask, HOLD_I) {
-            s.camera.position += s
-                .camera
-                .tetrad
-                .local_spatial_to_world(Vec3::new(0.0, 0.0, scrub_speed));
-        }
-        if held(mask, HOLD_K) {
-            s.camera.position += s
-                .camera
-                .tetrad
-                .local_spatial_to_world(Vec3::new(0.0, 0.0, -scrub_speed));
-        }
-        if held(mask, HOLD_L) {
-            s.camera.position += s
-                .camera
-                .tetrad
-                .local_spatial_to_world(Vec3::new(scrub_speed, 0.0, 0.0));
-        }
-        if held(mask, HOLD_J) {
-            s.camera.position += s
-                .camera
-                .tetrad
-                .local_spatial_to_world(Vec3::new(-scrub_speed, 0.0, 0.0));
-        }
-        if held(mask, HOLD_U) {
-            s.camera.position += s
-                .camera
-                .tetrad
-                .local_spatial_to_world(Vec3::new(0.0, scrub_speed, 0.0));
-        }
-        if held(mask, HOLD_O) {
-            s.camera.position += s
-                .camera
-                .tetrad
-                .local_spatial_to_world(Vec3::new(0.0, -scrub_speed, 0.0));
-        }
-
-        // 4. Advance observer along their timelike worldline: dX^mu = u^mu * d_tau
-        let time_scale = TIME_SCALES[s.time_scale_idx];
-        if !s.paused_worldline {
-            let d_tau = dt_wall * time_scale;
-            s.camera.proper_time += d_tau;
-            s.camera.position += s.camera.tetrad.e[0] * d_tau;
-            time_changed = true;
-        }
-
-        let scene = &s.scenes[s.scene_idx];
-        if time_changed {
-            let t_loop = scene.t_max - scene.t_min;
-            if s.camera.position.t > scene.t_max || s.camera.position.t < scene.t_min {
-                let wrapped =
-                    scene.t_min + (s.camera.position.t - scene.t_min).rem_euclid(t_loop);
-                // The scene is periodic, so carry flashes along to the same moment of the loop.
-                s.dynamics.shift_time(wrapped - s.camera.position.t);
-                s.camera.position.t = wrapped;
-            }
-        }
-        s.dynamics.retire_flashes(s.camera.position.t);
-
-        let packed = &s.packed_scenes[s.scene_idx];
+        let app = &s.app;
+        let packed = &s.packed_scenes[app.scene_idx];
         s.uniforms = GpuUniforms::build(
-            &s.camera,
-            &s.cfg,
-            &s.dynamics,
+            &app.camera,
+            &app.cfg,
+            &app.dynamics,
             packed.num_nodes,
             packed.light_pos,
         );
@@ -430,37 +268,38 @@ pub extern "C" fn web_step(dt_secs: f32) {
         } else {
             "CPU"
         };
+        let demo = app.scene().demo;
 
         if s.gpu_available && s.use_gpu {
             if s.show_hud {
                 draw_hud_overlay(
                     &mut s.hud_overlay,
-                    scene.demo,
-                    &s.camera,
-                    &s.cfg,
-                    s.paused_worldline,
-                    time_scale,
+                    demo,
+                    &app.camera,
+                    &app.cfg,
+                    app.paused,
+                    app.time_scale(),
                     s.fps_smooth,
                     backend,
                 );
             }
         } else {
-            let total_px = s.cfg.width * s.cfg.height;
+            let total_px = app.cfg.width * app.cfg.height;
             if s.cpu_fb.len() != total_px {
                 s.cpu_fb.resize(total_px, 0);
             }
-            render_frame(scene, &s.camera, &s.cfg, &s.dynamics, &mut s.cpu_fb);
+            render_frame(app.scene(), &app.camera, &app.cfg, &app.dynamics, &mut s.cpu_fb);
 
             if s.gpu_available {
                 // WebGPU is presenting the canvas; composite the HUD in the blit shader.
                 if s.show_hud {
                     draw_hud_overlay(
                         &mut s.hud_overlay,
-                        scene.demo,
-                        &s.camera,
-                        &s.cfg,
-                        s.paused_worldline,
-                        time_scale,
+                        demo,
+                        &app.camera,
+                        &app.cfg,
+                        app.paused,
+                        app.time_scale(),
                         s.fps_smooth,
                         backend,
                     );
@@ -470,11 +309,11 @@ pub extern "C" fn web_step(dt_secs: f32) {
                 if s.show_hud {
                     draw_hud(
                         &mut s.cpu_fb,
-                        scene.demo,
-                        &s.camera,
-                        &s.cfg,
-                        s.paused_worldline,
-                        time_scale,
+                        demo,
+                        &app.camera,
+                        &app.cfg,
+                        app.paused,
+                        app.time_scale(),
                         s.fps_smooth,
                         backend,
                     );
@@ -564,12 +403,12 @@ pub extern "C" fn web_scene_materials_byte_len(scene_idx: usize) -> usize {
 
 #[no_mangle]
 pub extern "C" fn web_width() -> usize {
-    with_state(|s| s.cfg.width)
+    with_state(|s| s.app.cfg.width)
 }
 
 #[no_mangle]
 pub extern "C" fn web_height() -> usize {
-    with_state(|s| s.cfg.height)
+    with_state(|s| s.app.cfg.height)
 }
 
 #[no_mangle]
@@ -579,7 +418,7 @@ pub extern "C" fn web_res_scale() -> usize {
 
 #[no_mangle]
 pub extern "C" fn web_scene_idx() -> usize {
-    with_state(|s| s.scene_idx)
+    with_state(|s| s.app.scene_idx)
 }
 
 #[no_mangle]
