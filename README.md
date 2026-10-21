@@ -77,13 +77,29 @@ To run all unit and GPU-vs-CPU image-diff validation tests:
 cargo test --release
 ```
 
+### Running in a Browser (WASM + WebGPU)
+
+The entire 4D spacetime engine and WGSL compute shader can also be compiled directly to WebAssembly (`wasm32-unknown-unknown`) with **zero external build tools required**:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown
+cp target/wasm32-unknown-unknown/release/spec-rel.wasm web/spec-rel.wasm
+```
+
+Then serve the `web/` directory with any static HTTP server (for example using Node.js or Python) and open `http://localhost:8080` in a WebGPU-capable browser (Chrome, Edge, Firefox, or Safari):
+
+```bash
+python -m http.server 8080 --directory web
+```
+
 ---
 
 ## Controls
 
 | Key | Action |
 | :--- | :--- |
-| **`F`** | Toggle between **GPU Compute** (defaults to 2X 2560x1600) and **CPU Reference** (1X 1280x800) backend |
+| **`F`** | Toggle between **GPU Compute** (defaults to 2X 2560x1600 on desktop, 1X 1280x800 on web) and **CPU Reference** (1X 1280x800) backend |
 | **`Z`** / **`Y`** | Toggle resolution scale: **1X (1280x800)** vs. **2X (2560x1600)** |
 | **`1` – `5`** / **`N`**, **`B`** | Switch between the 5 Special Relativity demo scenes |
 | **`W` `A` `S` `D`** / **`Space`** / **`C`** | Fire proper-acceleration thrusters (Lorentz boost in local frame) |
@@ -112,8 +128,9 @@ If you are reading the code to learn how Special Relativity is implemented geome
 2. [`src/mesh4d.rs`](src/mesh4d.rs) — 3D rest-frame primitives (`Mesh3D`), `f64` worldline integration (`sample_accelerated_worldline`), Born-rigid worldtube extrusion with local proper-time gradients (`build_worldtube_simplices`), and affine ray–tetrahedron intersection (`SimplexGeom4D`, `Simplex4D`).
 3. [`src/bvh4d.rs`](src/bvh4d.rs) — 4D Bounding Volume Hierarchy (`Bvh4D`) with 8-bin 4D SAH construction and branchless slab traversal.
 4. [`src/renderer.rs`](src/renderer.rs) — Multithreaded (`rayon`) 4D raytracer reference renderer, rest-frame Lambertian shading (`compute_illumination`), procedural proper-time analog/digital clock and $T = 2L/c$ Einstein light-clock shaders, and 4D shadow modes.
-5. [`src/gpu.rs`](src/gpu.rs) — `wgpu` GPU compute backend managing static storage buffer uploads, uniform blocks, pipeline dispatch, readback, and CPU-vs-GPU validation tests.
+5. [`src/gpu.rs`](src/gpu.rs) — `wgpu` GPU compute backend and target-agnostic GPU buffer packing (`PackedSceneGpuData`, `GpuUniforms`), managing static storage buffer uploads, uniform blocks, pipeline dispatch, readback, and CPU-vs-GPU validation tests.
 6. [`src/shaders/render.wgsl`](src/shaders/render.wgsl) — High-performance WGSL compute shader executing full 4D BVH traversal, intersection, procedural clock dials, and lighting on the GPU.
 7. [`src/scene.rs`](src/scene.rs) — The 5 Special Relativity demo scenes with multi-iteration periodic worldtubes (`for_periodic_copies`) and physics verification tests.
-8. [`src/hud.rs`](src/hud.rs) — Software 5x7 bitmap font renderer for HUD and in-scene digital clock readouts.
-9. [`src/main.rs`](src/main.rs) — Interactive window loop (`minifb`), dynamic GPU/CPU backend switching, relativistic flight controls, and HUD overlay.
+8. [`src/hud.rs`](src/hud.rs) — Software 5x7 bitmap font renderer for HUD, GPU HUD overlay buffer, and in-scene digital clock readouts.
+9. [`src/main.rs`](src/main.rs) — Native desktop interactive window loop (`minifb`), dynamic GPU/CPU backend switching, and relativistic flight controls.
+10. [`src/web.rs`](src/web.rs) & [`web/index.html`](web/index.html) — Zero-copy WebAssembly (`wasm32-unknown-unknown`) bindings and browser WebGPU + Canvas2D frontend.

@@ -5,23 +5,36 @@ pub mod mesh4d;
 pub mod minkowski;
 pub mod renderer;
 pub mod scene;
+#[cfg(target_arch = "wasm32")]
+pub mod web;
 
+#[cfg(not(target_arch = "wasm32"))]
 use gpu::GpuRenderer;
-use hud::{draw_text_scaled, fill_rect_alpha};
+#[cfg(not(target_arch = "wasm32"))]
+use hud::draw_hud;
+#[cfg(not(target_arch = "wasm32"))]
 use minkowski::{Vec3, Vec4};
+#[cfg(not(target_arch = "wasm32"))]
 use minifb::{Key, KeyRepeat, Window, WindowOptions};
+#[cfg(not(target_arch = "wasm32"))]
 use renderer::{render_frame, Camera4D, RenderConfig, RenderMode, ShadowMode, ViewMode};
+#[cfg(not(target_arch = "wasm32"))]
 use scene::{DemoScene, Scene4D};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
+#[cfg(not(target_arch = "wasm32"))]
 const WIDTH: usize = 1280;
+#[cfg(not(target_arch = "wasm32"))]
 const HEIGHT: usize = 800;
 
+#[cfg(not(target_arch = "wasm32"))]
 const TIME_SCALES: [f32; 10] = [
     -4.0, -2.0, -1.0, -0.5, -0.25, 0.25, 0.5, 1.0, 2.0, 4.0,
 ];
 
 /// Render one frame with the GPU backend if it's available and selected, else on the CPU.
+#[cfg(not(target_arch = "wasm32"))]
 fn render_with_backend(
     gpu: Option<&mut GpuRenderer>,
     use_gpu: bool,
@@ -37,6 +50,10 @@ fn render_with_backend(
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn main() {}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -398,68 +415,4 @@ fn main() {
             .update_with_buffer(&framebuffer, cfg.width, cfg.height)
             .expect("Failed to update window buffer");
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_hud(
-    fb: &mut [u32],
-    demo: DemoScene,
-    camera: &Camera4D,
-    cfg: &RenderConfig,
-    paused: bool,
-    time_scale: f32,
-    fps: f32,
-    backend: &str,
-) {
-    let s = (cfg.width / WIDTH).max(1);
-    let box_w = (cfg.width - 24 * s).min(1240 * s);
-    fill_rect_alpha(fb, cfg.width, cfg.height, 12 * s, 12 * s, box_w, 200 * s);
-
-    let beta = camera.tetrad.beta();
-    let speed = beta.length();
-    let gamma = camera.tetrad.gamma();
-
-    let line_scene = format!("SCENE [1-5 / N,B]: {}", demo.title());
-    let line_desc = demo.description();
-
-    let time_status = if paused {
-        "PAUSED".to_string()
-    } else if time_scale < 0.0 {
-        format!("{:+5.2}X (REWIND)", time_scale)
-    } else {
-        format!("{:+5.2}X (FWD)", time_scale)
-    };
-
-    let line1 = format!(
-        "OBS EVENT (T,X,Y,Z): ({:+6.2}, {:+6.2}, {:+6.2}, {:+6.2})  OBS TAU: {:+6.2}S  TIME: {}",
-        camera.position.t,
-        camera.position.x,
-        camera.position.y,
-        camera.position.z,
-        camera.proper_time,
-        time_status
-    );
-    let line2 = format!(
-        "OBS 3-VEL: ({:+5.3}, {:+5.3}, {:+5.3})  |V|: {:5.3}C  GAMMA: {:6.3}  FPS: {:4.0} [F] {}  RES: {}x{} [Z]",
-        beta.x, beta.y, beta.z, speed, gamma, fps, backend, cfg.width, cfg.height
-    );
-    let line3 = format!(
-        "MODE [M]: {} | VIEW [G]: {} | SHADOWS [H]: {}",
-        cfg.mode.name(),
-        cfg.slice_mode.name(),
-        cfg.shadow_mode.name(),
-    );
-    let line4 =
-        "TIME: [P] PAUSE | [T/BKSP] REWIND | [-/=] SPEED | [ / ] SCRUB T | [R] RESET";
-    let line5 =
-        "THRUST: WASD/SPC/C | MATCH VEL: [V] | BRAKE: [X] | LOOK: ARROWS/QE | MOVE: IJKL/UO";
-
-    let text_scale = 2 * s;
-    draw_text_scaled(fb, cfg.width, cfg.height, 22 * s, 22 * s, &line_scene, 0xFF9944, text_scale);
-    draw_text_scaled(fb, cfg.width, cfg.height, 22 * s, 46 * s, line_desc, 0xFFD980, text_scale);
-    draw_text_scaled(fb, cfg.width, cfg.height, 22 * s, 74 * s, &line1, 0xFFE866, text_scale);
-    draw_text_scaled(fb, cfg.width, cfg.height, 22 * s, 98 * s, &line2, 0x66F2FF, text_scale);
-    draw_text_scaled(fb, cfg.width, cfg.height, 22 * s, 122 * s, &line3, 0xA8FF80, text_scale);
-    draw_text_scaled(fb, cfg.width, cfg.height, 22 * s, 148 * s, line4, 0xDDDDDD, text_scale);
-    draw_text_scaled(fb, cfg.width, cfg.height, 22 * s, 174 * s, line5, 0xAAAAAA, text_scale);
 }

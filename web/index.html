@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SpecRel 4D — Special-Relativistic Spacetime Raytracer (WASM + WebGPU)</title>
+  <style>
+    :root {
+      --bg: #070a12;
+      --panel: #101626;
+      --border: #23304d;
+      --text: #e4ecff;
+      --muted: #8fa3c7;
+      --accent: #ff9944;
+      --cyan: #66f2ff;
+      --green: #a8ff80;
+    }
+    * {
+      box-sizing: border-box;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    header {
+      width: 100%;
+      max-width: 1280px;
+      padding: 10px 14px 6px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .brand {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: 0.4px;
+    }
+    .brand span {
+      color: var(--cyan);
+      font-weight: 400;
+      font-size: 13px;
+      margin-left: 8px;
+    }
+    #status-badge {
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      color: var(--green);
+    }
+    .viewport-wrap {
+      position: relative;
+      width: 100%;
+      max-width: 1280px;
+      aspect-ratio: 16 / 10;
+      background: #04060b;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+      box-shadow: 0 12px 36px rgba(0, 0, 0, 0.6);
+    }
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: grab;
+      touch-action: none;
+    }
+    canvas:active {
+      cursor: grabbing;
+    }
+    #loading-overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: rgba(7, 10, 18, 0.92);
+      z-index: 10;
+      gap: 12px;
+      text-align: center;
+      padding: 20px;
+    }
+    .spinner {
+      width: 36px;
+      height: 36px;
+      border: 3px solid var(--border);
+      border-top-color: var(--cyan);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    .controls-bar {
+      width: 100%;
+      max-width: 1280px;
+      padding: 10px 4px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .btn-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }
+    .row-label {
+      font-size: 11px;
+      color: var(--muted);
+      min-width: 68px;
+      text-transform: uppercase;
+    }
+    button {
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 6px 10px;
+      font-family: inherit;
+      font-size: 12px;
+      cursor: pointer;
+      transition: background 0.12s, border-color 0.12s, transform 0.05s;
+    }
+    button:hover {
+      background: #1a243d;
+      border-color: #3b5284;
+    }
+    button:active, button.active-scene {
+      background: #233458;
+      border-color: var(--cyan);
+      color: #fff;
+    }
+    button kbd {
+      color: var(--accent);
+      font-weight: 700;
+      margin-right: 4px;
+    }
+    .hint {
+      font-size: 11px;
+      color: var(--muted);
+      margin-left: auto;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      SPECREL 4D <span>Special-Relativistic 4D Minkowski Spacetime Raytracer</span>
+    </div>
+    <div id="status-badge">Initializing WASM &amp; WebGPU...</div>
+  </header>
+
+  <div class="viewport-wrap">
+    <canvas id="viewport" width="1280" height="800" tabindex="0"></canvas>
+    <div id="loading-overlay">
+      <div class="spinner"></div>
+      <div id="loading-text">Building 5 Special Relativity 4D Worldtube Scenes &amp; SAH BVHs...</div>
+    </div>
+  </div>
+
+  <div class="controls-bar">
+    <div class="btn-row">
+      <span class="row-label">Scenes:</span>
+      <button data-key="1" id="scene-btn-0"><kbd>[1]</kbd>Twin Paradox</button>
+      <button data-key="2" id="scene-btn-1"><kbd>[2]</kbd>Barn &amp; Pole</button>
+      <button data-key="3" id="scene-btn-2"><kbd>[3]</kbd>Terrell–Penrose Street</button>
+      <button data-key="4" id="scene-btn-3"><kbd>[4]</kbd>Einstein Train Sync</button>
+      <button data-key="5" id="scene-btn-4"><kbd>[5]</kbd>Relativistic Carousel</button>
+      <span class="hint">Drag canvas to look around · WASD/Space/C to thrust</span>
+    </div>
+    <div class="btn-row">
+      <span class="row-label">Spacetime:</span>
+      <button data-key="9"><kbd>[G]</kbd>Real Camera / God's Eye</button>
+      <button data-key="8"><kbd>[M]</kbd>Render Mode</button>
+      <button data-key="10"><kbd>[H]</kbd>Shadow Mode</button>
+      <button data-key="20"><kbd>[V]</kbd>Match Velocity</button>
+      <button data-key="19"><kbd>[X]</kbd>Brake (Lab Frame)</button>
+      <button data-key="11"><kbd>[P]</kbd>Pause</button>
+      <button data-key="12"><kbd>[T]</kbd>Rewind</button>
+      <button data-key="13"><kbd>[-]</kbd>Slower</button>
+      <button data-key="14"><kbd>[=]</kbd>Faster</button>
+      <button data-hold="112"><kbd>[</kbd>Scrub −t</button>
+      <button data-hold="113"><kbd>]</kbd>Scrub +t</button>
+      <button data-key="16"><kbd>[F]</kbd>GPU/CPU</button>
+      <button data-key="17"><kbd>[Z]</kbd>1X/2X Res</button>
+      <button data-key="18"><kbd>[R]</kbd>Reset</button>
+      <button data-key="15"><kbd>[Tab]</kbd>HUD</button>
+    </div>
+  </div>
+
+  <script type="module">
+    // Fullscreen WGSL blit shader that composites the compute shader's packed 0x00RRGGBB
+    // scene output buffer and the 1X HUD overlay buffer directly onto the WebGPU canvas.
+    const BLIT_WGSL = /* wgsl */`
+      struct BlitParams {
+        width: u32,
+        height: u32,
+        hud_width: u32,
+        hud_height: u32,
+        hud_scale: u32,
+        show_hud: u32,
+        _pad0: u32,
+        _pad1: u32,
+      };
+
+      @group(0) @binding(0) var<uniform> params: BlitParams;
+      @group(0) @binding(1) var<storage, read> scene_pixels: array<u32>;
+      @group(0) @binding(2) var<storage, read> hud_pixels: array<u32>;
+
+      struct VsOut {
+        @builtin(position) pos: vec4<f32>,
+        @location(0) uv: vec2<f32>,
+      };
+
+      @vertex
+      fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+        let x = f32(i32(vi & 1u) * 4 - 1);
+        let y = f32(i32(vi & 2u) * 2 - 1);
+        var out: VsOut;
+        out.pos = vec4<f32>(x, y, 0.0, 1.0);
+        out.uv = vec2<f32>((x + 1.0) * 0.5, (1.0 - y) * 0.5);
+        return out;
+      }
+
+      @fragment
+      fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+        let px = min(u32(in.uv.x * f32(params.width)), params.width - 1u);
+        let py = min(u32(in.uv.y * f32(params.height)), params.height - 1u);
+        let raw = scene_pixels[py * params.width + px];
+        var r = (raw >> 16u) & 0xFFu;
+        var g = (raw >> 8u) & 0xFFu;
+        var b = raw & 0xFFu;
+
+        if params.show_hud != 0u {
+          let s = max(params.hud_scale, 1u);
+          let hx = px / s;
+          let hy = py / s;
+          if hx < params.hud_width && hy < params.hud_height {
+            let hraw = hud_pixels[hy * params.hud_width + hx];
+            let ha = (hraw >> 24u) & 0xFFu;
+            if ha == 0xFFu {
+              r = (hraw >> 16u) & 0xFFu;
+              g = (hraw >> 8u) & 0xFFu;
+              b = hraw & 0xFFu;
+            } else if ha == 0x80u {
+              r = r / 3u;
+              g = g / 3u;
+              b = b / 3u;
+            }
+          }
+        }
+
+        return vec4<f32>(f32(r) / 255.0, f32(g) / 255.0, f32(b) / 255.0, 1.0);
+      }
+    `;
+
+    const WORKGROUP_SIZE = 8;
+
+    // Map browser `KeyboardEvent.code` to `src/web.rs` constants
+    const DISCRETE_KEY_MAP = {
+      Digit1: 1, Numpad1: 1,
+      Digit2: 2, Numpad2: 2,
+      Digit3: 3, Numpad3: 3,
+      Digit4: 4, Numpad4: 4,
+      Digit5: 5, Numpad5: 5,
+      KeyN: 6,
+      KeyB: 7,
+      KeyM: 8,
+      KeyG: 9,
+      KeyH: 10,
+      KeyP: 11,
+      KeyT: 12, Backspace: 12,
+      Minus: 13, NumpadSubtract: 13,
+      Equal: 14, NumpadAdd: 14,
+      Tab: 15,
+      KeyF: 16,
+      KeyZ: 17, KeyY: 17,
+      KeyR: 18,
+      KeyX: 19,
+      KeyV: 20,
+    };
+
+    const HELD_KEY_MAP = {
+      ArrowLeft: 100,
+      ArrowRight: 101,
+      ArrowUp: 102,
+      ArrowDown: 103,
+      KeyQ: 104,
+      KeyE: 105,
+      KeyW: 106,
+      KeyS: 107,
+      KeyD: 108,
+      KeyA: 109,
+      Space: 110,
+      KeyC: 111, ShiftLeft: 111,
+      BracketLeft: 112,
+      BracketRight: 113,
+      KeyI: 114,
+      KeyK: 115,
+      KeyL: 116,
+      KeyJ: 117,
+      KeyU: 118,
+      KeyO: 119,
+    };
+
+    const canvas = document.getElementById("viewport");
+    const statusBadge = document.getElementById("status-badge");
+    const loadingOverlay = document.getElementById("loading-overlay");
+    const loadingText = document.getElementById("loading-text");
+
+    async function loadWasm() {
+      const candidates = [
+        "./spec-rel.wasm",
+        "../target/wasm32-unknown-unknown/release/spec-rel.wasm",
+      ];
+      for (const url of candidates) {
+        try {
+          const resp = await fetch(url);
+          if (!resp.ok) continue;
+          const bytes = await resp.arrayBuffer();
+          const { instance } = await WebAssembly.instantiate(bytes, {});
+          return instance.exports;
+        } catch (_) {}
+      }
+      throw new Error(
+        "Could not load spec-rel.wasm. Run `cargo build --release --target wasm32-unknown-unknown` first."
+      );
+    }
+
+    async function initWebGPU(canvas) {
+      if (!navigator.gpu) return null;
+      try {
+        const adapter = await navigator.gpu.requestAdapter({
+          powerPreference: "high-performance",
+        });
+        if (!adapter) return null;
+        const device = await adapter.requestDevice();
+        const context = canvas.getContext("webgpu");
+        if (!context) return null;
+        const format = navigator.gpu.getPreferredCanvasFormat();
+        context.configure({
+          device,
+          format,
+          alphaMode: "opaque",
+        });
+        const info = adapter.info || {};
+        const adapterLabel = info.description || info.device || info.vendor || "WebGPU";
+        return { adapter, device, context, format, adapterLabel };
+      } catch (e) {
+        console.warn("WebGPU initialization failed, falling back to CPU:", e);
+        return null;
+      }
+    }
+
+    function wasmBytes(wasm, ptr, len) {
+      return new Uint8Array(wasm.memory.buffer, ptr, len);
+    }
+
+    async function main() {
+      try {
+        const [wasm, gpu] = await Promise.all([loadWasm(), initWebGPU(canvas)]);
+        const gpuAvailable = gpu !== null;
+
+        wasm.web_init(gpuAvailable ? 1 : 0);
+
+        let gpuResources = null;
+        let ctx2d = null;
+
+        if (gpuAvailable) {
+          const { device, format, adapterLabel } = gpu;
+          const shaderBytes = wasmBytes(
+            wasm,
+            wasm.web_shader_ptr(),
+            wasm.web_shader_len()
+          );
+          const computeWgsl = new TextDecoder("utf-8").decode(shaderBytes);
+
+          const computeModule = device.createShaderModule({
+            label: "render.wgsl",
+            code: computeWgsl,
+          });
+          const blitModule = device.createShaderModule({
+            label: "blit.wgsl",
+            code: BLIT_WGSL,
+          });
+
+          const sceneLayout = device.createBindGroupLayout({
+            label: "scene layout",
+            entries: [
+              { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+              { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+              { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+              { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+            ],
+          });
+
+          const frameLayout = device.createBindGroupLayout({
+            label: "frame layout",
+            entries: [
+              { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+              { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+              { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+            ],
+          });
+
+          const computePipeline = device.createComputePipeline({
+            label: "render compute pipeline",
+            layout: device.createPipelineLayout({
+              bindGroupLayouts: [sceneLayout, frameLayout],
+            }),
+            compute: {
+              module: computeModule,
+              entryPoint: "main",
+            },
+          });
+
+          const blitLayout = device.createBindGroupLayout({
+            label: "blit layout",
+            entries: [
+              { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+              { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+              { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+            ],
+          });
+
+          const blitPipeline = device.createRenderPipeline({
+            label: "fullscreen blit pipeline",
+            layout: device.createPipelineLayout({
+              bindGroupLayouts: [blitLayout],
+            }),
+            vertex: {
+              module: blitModule,
+              entryPoint: "vs_main",
+            },
+            fragment: {
+              module: blitModule,
+              entryPoint: "fs_main",
+              targets: [{ format }],
+            },
+            primitive: { topology: "triangle-list" },
+          });
+
+          const createStorageBuffer = (label, bytes) => {
+            const buf = device.createBuffer({
+              label,
+              size: bytes.byteLength,
+              usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(buf, 0, bytes);
+            return buf;
+          };
+
+          const uniformBuf = device.createBuffer({
+            label: "uniforms",
+            size: wasm.web_uniforms_byte_len(),
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          });
+
+          const tablesBuf = createStorageBuffer(
+            "tables",
+            wasmBytes(wasm, wasm.web_tables_ptr(), wasm.web_tables_byte_len())
+          );
+
+          const hudBuf = device.createBuffer({
+            label: "hud overlay",
+            size: wasm.web_hud_overlay_byte_len(),
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+          });
+
+          const blitParamsBuf = device.createBuffer({
+            label: "blit params",
+            size: 32,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          });
+
+          const sceneCount = wasm.web_scene_count();
+          const sceneBindGroups = [];
+          for (let i = 0; i < sceneCount; i++) {
+            const nodesBuf = createStorageBuffer(
+              `scene ${i} nodes`,
+              wasmBytes(wasm, wasm.web_scene_nodes_ptr(i), wasm.web_scene_nodes_byte_len(i))
+            );
+            const geomsBuf = createStorageBuffer(
+              `scene ${i} geoms`,
+              wasmBytes(wasm, wasm.web_scene_geoms_ptr(i), wasm.web_scene_geoms_byte_len(i))
+            );
+            const attrsBuf = createStorageBuffer(
+              `scene ${i} attrs`,
+              wasmBytes(wasm, wasm.web_scene_attrs_ptr(i), wasm.web_scene_attrs_byte_len(i))
+            );
+            const matsBuf = createStorageBuffer(
+              `scene ${i} materials`,
+              wasmBytes(wasm, wasm.web_scene_materials_ptr(i), wasm.web_scene_materials_byte_len(i))
+            );
+
+            sceneBindGroups.push(
+              device.createBindGroup({
+                label: `scene ${i} bind group`,
+                layout: sceneLayout,
+                entries: [
+                  { binding: 0, resource: { buffer: nodesBuf } },
+                  { binding: 1, resource: { buffer: geomsBuf } },
+                  { binding: 2, resource: { buffer: attrsBuf } },
+                  { binding: 3, resource: { buffer: matsBuf } },
+                ],
+              })
+            );
+          }
+
+          gpuResources = {
+            device,
+            context: gpu.context,
+            adapterLabel,
+            computePipeline,
+            blitPipeline,
+            frameLayout,
+            blitLayout,
+            uniformBuf,
+            tablesBuf,
+            hudBuf,
+            blitParamsBuf,
+            sceneBindGroups,
+            frameWidth: 0,
+            frameHeight: 0,
+            outputBuf: null,
+            frameBindGroup: null,
+            blitBindGroup: null,
+          };
+        } else {
+          ctx2d = canvas.getContext("2d");
+        }
+
+        loadingOverlay.style.display = "none";
+
+        // Input wiring (keyboard, buttons, mouse/touch drag)
+        window.addEventListener("keydown", (e) => {
+          const holdCode = HELD_KEY_MAP[e.code];
+          if (holdCode !== undefined) {
+            e.preventDefault();
+            wasm.web_key_event(holdCode, 1, e.repeat ? 1 : 0);
+            return;
+          }
+          const discCode = DISCRETE_KEY_MAP[e.code];
+          if (discCode !== undefined) {
+            e.preventDefault();
+            wasm.web_key_event(discCode, 1, e.repeat ? 1 : 0);
+          }
+        });
+
+        window.addEventListener("keyup", (e) => {
+          const holdCode = HELD_KEY_MAP[e.code];
+          if (holdCode !== undefined) {
+            e.preventDefault();
+            wasm.web_key_event(holdCode, 0, 0);
+          }
+        });
+
+        window.addEventListener("blur", () => {
+          wasm.web_blur();
+        });
+
+        // On-screen buttons
+        document.querySelectorAll("button[data-key]").forEach((btn) => {
+          const code = Number(btn.dataset.key);
+          btn.addEventListener("click", () => {
+            wasm.web_key_event(code, 1, 0);
+            canvas.focus();
+          });
+        });
+
+        document.querySelectorAll("button[data-hold]").forEach((btn) => {
+          const code = Number(btn.dataset.hold);
+          const start = (e) => {
+            e.preventDefault();
+            wasm.web_key_event(code, 1, 0);
+          };
+          const end = (e) => {
+            e.preventDefault();
+            wasm.web_key_event(code, 0, 0);
+          };
+          btn.addEventListener("pointerdown", start);
+          btn.addEventListener("pointerup", end);
+          btn.addEventListener("pointerleave", end);
+          btn.addEventListener("pointercancel", end);
+        });
+
+        // Mouse / touch look on canvas
+        let dragging = false;
+        let lastX = 0;
+        let lastY = 0;
+        canvas.addEventListener("pointerdown", (e) => {
+          dragging = true;
+          lastX = e.clientX;
+          lastY = e.clientY;
+          canvas.setPointerCapture(e.pointerId);
+          canvas.focus();
+        });
+        canvas.addEventListener("pointermove", (e) => {
+          if (!dragging) return;
+          const dx = e.clientX - lastX;
+          const dy = e.clientY - lastY;
+          lastX = e.clientX;
+          lastY = e.clientY;
+          wasm.web_mouse_look(dx * 0.003, -dy * 0.003);
+        });
+        const stopDrag = () => { dragging = false; };
+        canvas.addEventListener("pointerup", stopDrag);
+        canvas.addEventListener("pointercancel", stopDrag);
+
+        let lastTime = performance.now();
+        let prevSceneIdx = -1;
+
+        function ensureGpuFrameBuffers(g, w, h) {
+          if (g.frameWidth === w && g.frameHeight === h && g.outputBuf) return;
+          if (g.outputBuf) g.outputBuf.destroy();
+          g.frameWidth = w;
+          g.frameHeight = h;
+          canvas.width = w;
+          canvas.height = h;
+          g.outputBuf = g.device.createBuffer({
+            label: "output pixels",
+            size: w * h * 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+          });
+          g.frameBindGroup = g.device.createBindGroup({
+            label: "frame bind group",
+            layout: g.frameLayout,
+            entries: [
+              { binding: 0, resource: { buffer: g.uniformBuf } },
+              { binding: 1, resource: { buffer: g.tablesBuf } },
+              { binding: 2, resource: { buffer: g.outputBuf } },
+            ],
+          });
+          g.blitBindGroup = g.device.createBindGroup({
+            label: "blit bind group",
+            layout: g.blitLayout,
+            entries: [
+              { binding: 0, resource: { buffer: g.blitParamsBuf } },
+              { binding: 1, resource: { buffer: g.outputBuf } },
+              { binding: 2, resource: { buffer: g.hudBuf } },
+            ],
+          });
+        }
+
+        function frame(now) {
+          const dt = (now - lastTime) * 0.001;
+          lastTime = now;
+
+          wasm.web_step(dt);
+
+          const w = wasm.web_width();
+          const h = wasm.web_height();
+          const sceneIdx = wasm.web_scene_idx();
+          const useGpu = wasm.web_use_gpu() !== 0;
+          const showHud = wasm.web_show_hud();
+          const resScale = wasm.web_res_scale();
+
+          if (sceneIdx !== prevSceneIdx) {
+            prevSceneIdx = sceneIdx;
+            for (let i = 0; i < 5; i++) {
+              const b = document.getElementById(`scene-btn-${i}`);
+              if (b) b.classList.toggle("active-scene", i === sceneIdx);
+            }
+          }
+
+          if (gpuResources) {
+            const g = gpuResources;
+            ensureGpuFrameBuffers(g, w, h);
+
+            if (showHud) {
+              g.device.queue.writeBuffer(
+                g.hudBuf,
+                0,
+                wasmBytes(wasm, wasm.web_hud_overlay_ptr(), wasm.web_hud_overlay_byte_len())
+              );
+            }
+
+            const blitParams = new Uint32Array([
+              w,
+              h,
+              wasm.web_hud_width(),
+              wasm.web_hud_height(),
+              resScale,
+              showHud,
+              0,
+              0,
+            ]);
+            g.device.queue.writeBuffer(g.blitParamsBuf, 0, blitParams);
+
+            const encoder = g.device.createCommandEncoder();
+
+            if (useGpu) {
+              g.device.queue.writeBuffer(
+                g.uniformBuf,
+                0,
+                wasmBytes(wasm, wasm.web_uniforms_ptr(), wasm.web_uniforms_byte_len())
+              );
+              const cpass = encoder.beginComputePass();
+              cpass.setPipeline(g.computePipeline);
+              cpass.setBindGroup(0, g.sceneBindGroups[sceneIdx]);
+              cpass.setBindGroup(1, g.frameBindGroup);
+              cpass.dispatchWorkgroups(
+                Math.ceil(w / WORKGROUP_SIZE),
+                Math.ceil(h / WORKGROUP_SIZE),
+                1
+              );
+              cpass.end();
+            } else {
+              // CPU Reference mode selected via [F]: upload CPU-rendered pixels to outputBuf
+              g.device.queue.writeBuffer(
+                g.outputBuf,
+                0,
+                wasmBytes(wasm, wasm.web_cpu_fb_ptr(), wasm.web_cpu_fb_byte_len())
+              );
+            }
+
+            const view = g.context.getCurrentTexture().createView();
+            const rpass = encoder.beginRenderPass({
+              colorAttachments: [
+                {
+                  view,
+                  loadOp: "clear",
+                  clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                  storeOp: "store",
+                },
+              ],
+            });
+            rpass.setPipeline(g.blitPipeline);
+            rpass.setBindGroup(0, g.blitBindGroup);
+            rpass.draw(3, 1, 0, 0);
+            rpass.end();
+
+            g.device.queue.submit([encoder.finish()]);
+            statusBadge.textContent = useGpu
+              ? `WebGPU Compute (${g.adapterLabel}) · ${w}×${h}`
+              : `WASM CPU Reference · ${w}×${h}`;
+          } else if (ctx2d) {
+            if (canvas.width !== w || canvas.height !== h) {
+              canvas.width = w;
+              canvas.height = h;
+            }
+            const rgba = new Uint8ClampedArray(
+              wasm.memory.buffer,
+              wasm.web_cpu_rgba_ptr(),
+              wasm.web_cpu_rgba_byte_len()
+            );
+            const imgData = new ImageData(rgba, w, h);
+            ctx2d.putImageData(imgData, 0, 0);
+            statusBadge.textContent = `WASM CPU Reference (WebGPU unavailable) · ${w}×${h}`;
+          }
+
+          requestAnimationFrame(frame);
+        }
+
+        requestAnimationFrame(frame);
+      } catch (err) {
+        console.error(err);
+        loadingText.textContent = `Error: ${err.message}`;
+        statusBadge.textContent = "Initialization Error";
+      }
+    }
+
+    main();
+  </script>
+</body>
+</html>

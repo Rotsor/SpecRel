@@ -6,6 +6,8 @@ description = "A special-relativity-aware 4D spacetime raytracer in Rust"
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 minifb = "0.27"
 pollster = "1.0.1"
 rayon = "1.10"

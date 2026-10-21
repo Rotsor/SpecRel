@@ -2,6 +2,7 @@ use crate::hud::glyph_5x7;
 use crate::mesh4d::{HitRecord4D, Material, SurfacePattern};
 use crate::minkowski::{rest_frame_cos, Tetrad, Vec3, Vec4};
 use crate::scene::Scene4D;
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::sync::OnceLock;
 
@@ -145,8 +146,12 @@ pub fn render_frame(
     let half_w = aspect * half_h;
     let lut = gamma_lut();
 
-    framebuffer
-        .par_chunks_mut(w)
+    #[cfg(not(target_arch = "wasm32"))]
+    let rows = framebuffer.par_chunks_mut(w);
+    #[cfg(target_arch = "wasm32")]
+    let rows = framebuffer.chunks_mut(w);
+
+    rows
         .enumerate()
         .for_each(|(py, row)| {
             let ndc_y = 1.0 - 2.0 * ((py as f32 + 0.5) / h as f32);

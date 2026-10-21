@@ -13,9 +13,11 @@ use crate::minkowski::Vec4;
 use crate::renderer::{gamma_lut, Camera4D, RenderConfig, RenderMode, ShadowMode, SliceMode};
 use crate::scene::Scene4D;
 use bytemuck::{Pod, Zeroable};
+#[cfg(not(target_arch = "wasm32"))]
 use wgpu::util::DeviceExt;
 
-const WORKGROUP_SIZE: u32 = 8;
+pub const WORKGROUP_SIZE: u32 = 8;
+pub const RENDER_WGSL: &str = include_str!("shaders/render.wgsl");
 
 /// Glyphs needed by the clock face's digital proper-time readout, in the order the shader
 /// expects (`0-9`, then `+`, `-`, `.`, `S`).
@@ -30,69 +32,224 @@ fn v4(v: Vec4) -> [f32; 4] {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuNode {
-    min: [f32; 4],
-    max: [f32; 4],
-    right_or_first: u32,
-    count: u32,
-    _pad: [u32; 2],
+pub(crate) struct GpuNode {
+    pub(crate) min: [f32; 4],
+    pub(crate) max: [f32; 4],
+    pub(crate) right_or_first: u32,
+    pub(crate) count: u32,
+    pub(crate) _pad: [u32; 2],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuGeom {
-    v0: [f32; 4],
-    n: [f32; 4],
-    b1: [f32; 4],
-    b2: [f32; 4],
-    b3: [f32; 4],
+pub(crate) struct GpuGeom {
+    pub(crate) v0: [f32; 4],
+    pub(crate) n: [f32; 4],
+    pub(crate) b1: [f32; 4],
+    pub(crate) b2: [f32; 4],
+    pub(crate) b3: [f32; 4],
 }
 
 /// Cold attributes, transposed so each row holds one component for all 4 vertices.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuAttr {
-    uv_u: [f32; 4],
-    uv_v: [f32; 4],
-    tb_x: [f32; 4],
-    tb_y: [f32; 4],
-    tb_z: [f32; 4],
-    tau: [f32; 4],
-    grad_u: [f32; 4],
-    grad_v: [f32; 4],
-    normal: [f32; 4],
-    four_vel: [f32; 4],
-    misc: [f32; 4],
+pub(crate) struct GpuAttr {
+    pub(crate) uv_u: [f32; 4],
+    pub(crate) uv_v: [f32; 4],
+    pub(crate) tb_x: [f32; 4],
+    pub(crate) tb_y: [f32; 4],
+    pub(crate) tb_z: [f32; 4],
+    pub(crate) tau: [f32; 4],
+    pub(crate) grad_u: [f32; 4],
+    pub(crate) grad_v: [f32; 4],
+    pub(crate) normal: [f32; 4],
+    pub(crate) four_vel: [f32; 4],
+    pub(crate) misc: [f32; 4],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuMaterial {
-    base: [f32; 4],
-    checker: [f32; 4],
-    params: [f32; 4],
+pub(crate) struct GpuMaterial {
+    pub(crate) base: [f32; 4],
+    pub(crate) checker: [f32; 4],
+    pub(crate) params: [f32; 4],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuUniforms {
-    cam_pos: [f32; 4],
-    e: [[f32; 4]; 4],
-    light_pos: [f32; 4],
-    half_wh: [f32; 2],
-    size: [u32; 2],
-    mode: u32,
-    shadow_mode: u32,
-    slice_mode: u32,
-    num_nodes: u32,
+pub(crate) struct GpuUniforms {
+    pub(crate) cam_pos: [f32; 4],
+    pub(crate) e: [[f32; 4]; 4],
+    pub(crate) light_pos: [f32; 4],
+    pub(crate) half_wh: [f32; 2],
+    pub(crate) size: [u32; 2],
+    pub(crate) mode: u32,
+    pub(crate) shadow_mode: u32,
+    pub(crate) slice_mode: u32,
+    pub(crate) num_nodes: u32,
 }
 
+impl GpuUniforms {
+    pub(crate) fn build(
+        camera: &Camera4D,
+        cfg: &RenderConfig,
+        num_nodes: u32,
+        light_pos: [f32; 4],
+    ) -> Self {
+        let (w, h) = (cfg.width, cfg.height);
+        let aspect = w as f32 / h as f32;
+        let half_h = (0.5 * camera.fov_y_rad).tan();
+        let half_w = aspect * half_h;
+
+        Self {
+            cam_pos: v4(camera.position),
+            e: camera.tetrad.e.map(v4),
+            light_pos,
+            half_wh: [half_w, half_h],
+            size: [w as u32, h as u32],
+            mode: match cfg.mode {
+                RenderMode::RelativisticShaded => 0,
+                RenderMode::LookbackIsochrones => 1,
+                RenderMode::Simplex4DInspector => 2,
+            },
+            shadow_mode: match cfg.shadow_mode {
+                ShadowMode::Off => 0,
+                ShadowMode::LorentzInvariant => 1,
+                ShadowMode::CameraSlice => 2,
+            },
+            slice_mode: match cfg.slice_mode {
+                SliceMode::PastLightCone => 0,
+                SliceMode::CameraSimultaneity => 1,
+            },
+            num_nodes,
+        }
+    }
+}
+
+/// Storage buffers can't be zero-sized; pad empty arrays with one zeroed element.
+fn non_empty<T: Pod + Zeroable>(mut v: Vec<T>) -> Vec<T> {
+    if v.is_empty() {
+        v.push(T::zeroed());
+    }
+    v
+}
+
+/// Build the shared lookup table buffer (4096-entry gamma LUT + 14 5x7 glyphs).
+pub(crate) fn build_tables_data() -> Vec<u32> {
+    let mut tables: Vec<u32> = gamma_lut().iter().map(|&b| b as u32).collect();
+    for &ch in &SHADER_GLYPHS {
+        tables.extend(crate::hud::glyph_5x7(ch).iter().map(|&row| row as u32));
+    }
+    tables
+}
+
+/// Packed GPU storage buffer arrays for a single [`Scene4D`], shared by native `wgpu` and browser WebGPU.
+pub(crate) struct PackedSceneGpuData {
+    pub(crate) nodes: Vec<GpuNode>,
+    pub(crate) num_nodes: u32,
+    pub(crate) geoms: Vec<GpuGeom>,
+    pub(crate) attrs: Vec<GpuAttr>,
+    pub(crate) materials: Vec<GpuMaterial>,
+    pub(crate) light_pos: [f32; 4],
+}
+
+impl PackedSceneGpuData {
+    pub(crate) fn from_scene(scene: &Scene4D) -> Self {
+        let bvh = &scene.bvh;
+
+        let nodes: Vec<GpuNode> = bvh
+            .nodes()
+            .iter()
+            .map(|n| GpuNode {
+                min: v4(n.aabb.min),
+                max: v4(n.aabb.max),
+                right_or_first: n.right_or_first,
+                count: n.count,
+                _pad: [0; 2],
+            })
+            .collect();
+        let num_nodes = nodes.len() as u32;
+
+        let geoms: Vec<GpuGeom> = bvh
+            .hot_geoms()
+            .iter()
+            .map(|g| GpuGeom {
+                v0: v4(g.v0),
+                n: v4(g.hyperplane_normal),
+                b1: v4(g.dual_b1),
+                b2: v4(g.dual_b2),
+                b3: v4(g.dual_b3),
+            })
+            .collect();
+
+        let attrs: Vec<GpuAttr> = bvh
+            .simplices
+            .iter()
+            .map(|s| {
+                let col = |f: &dyn Fn(usize) -> f32| [f(0), f(1), f(2), f(3)];
+                GpuAttr {
+                    uv_u: col(&|i| s.uv[i].0),
+                    uv_v: col(&|i| s.uv[i].1),
+                    tb_x: col(&|i| s.tri_bary[i].x),
+                    tb_y: col(&|i| s.tri_bary[i].y),
+                    tb_z: col(&|i| s.tri_bary[i].z),
+                    tau: s.proper_time,
+                    grad_u: col(&|i| s.tau_uv_grad[i].0),
+                    grad_v: col(&|i| s.tau_uv_grad[i].1),
+                    normal: v4(s.surface_normal_4d),
+                    four_vel: v4(s.four_velocity),
+                    misc: [
+                        s.uv_world_scale.0,
+                        s.uv_world_scale.1,
+                        f32::from_bits(s.material_id as u32),
+                        0.0,
+                    ],
+                }
+            })
+            .collect();
+
+        let materials: Vec<GpuMaterial> = scene
+            .materials
+            .iter()
+            .map(|m| {
+                let pattern: u32 = match m.pattern {
+                    SurfacePattern::Checkerboard => 0,
+                    SurfacePattern::ClockFace => 1,
+                    SurfacePattern::LightClock => 2,
+                };
+                GpuMaterial {
+                    base: [m.base_color.x, m.base_color.y, m.base_color.z, m.emission],
+                    checker: [
+                        m.checker_color.x,
+                        m.checker_color.y,
+                        m.checker_color.z,
+                        m.grid_scale,
+                    ],
+                    params: [m.wireframe_width, f32::from_bits(pattern), m.cavity_length, 0.0],
+                }
+            })
+            .collect();
+
+        let lp = scene.light_pos;
+        Self {
+            nodes: non_empty(nodes),
+            num_nodes,
+            geoms: non_empty(geoms),
+            attrs: non_empty(attrs),
+            materials: non_empty(materials),
+            light_pos: [0.0, lp.x, lp.y, lp.z],
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 struct SceneBuffers {
     bind_group: wgpu::BindGroup,
     num_nodes: u32,
     light_pos: [f32; 4],
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct FrameBuffers {
     width: usize,
     height: usize,
@@ -101,6 +258,7 @@ struct FrameBuffers {
     bind_group: wgpu::BindGroup,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -113,6 +271,7 @@ pub struct GpuRenderer {
     adapter_name: String,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -126,14 +285,7 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-/// Storage buffers can't be zero-sized; pad empty arrays with one zeroed element.
-fn non_empty<T: Pod + Zeroable>(mut v: Vec<T>) -> Vec<T> {
-    if v.is_empty() {
-        v.push(T::zeroed());
-    }
-    v
-}
-
+#[cfg(not(target_arch = "wasm32"))]
 impl GpuRenderer {
     /// Initialise a GPU device and upload all scenes. Returns an error if no suitable adapter
     /// is available, so callers can fall back to the CPU renderer.
@@ -218,10 +370,7 @@ impl GpuRenderer {
         });
 
         // Lookup tables: the CPU's gamma LUT verbatim (bit-exact tone mapping), then glyph rows.
-        let mut tables: Vec<u32> = gamma_lut().iter().map(|&b| b as u32).collect();
-        for &ch in &SHADER_GLYPHS {
-            tables.extend(crate::hud::glyph_5x7(ch).iter().map(|&row| row as u32));
-        }
+        let tables = build_tables_data();
         let tables_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tables"),
             contents: bytemuck::cast_slice(&tables),
@@ -251,80 +400,7 @@ impl GpuRenderer {
         layout: &wgpu::BindGroupLayout,
         scene: &Scene4D,
     ) -> SceneBuffers {
-        let bvh = &scene.bvh;
-
-        let nodes: Vec<GpuNode> = bvh
-            .nodes()
-            .iter()
-            .map(|n| GpuNode {
-                min: v4(n.aabb.min),
-                max: v4(n.aabb.max),
-                right_or_first: n.right_or_first,
-                count: n.count,
-                _pad: [0; 2],
-            })
-            .collect();
-        let num_nodes = nodes.len() as u32;
-
-        let geoms: Vec<GpuGeom> = bvh
-            .hot_geoms()
-            .iter()
-            .map(|g| GpuGeom {
-                v0: v4(g.v0),
-                n: v4(g.hyperplane_normal),
-                b1: v4(g.dual_b1),
-                b2: v4(g.dual_b2),
-                b3: v4(g.dual_b3),
-            })
-            .collect();
-
-        let attrs: Vec<GpuAttr> = bvh
-            .simplices
-            .iter()
-            .map(|s| {
-                let col = |f: &dyn Fn(usize) -> f32| [f(0), f(1), f(2), f(3)];
-                GpuAttr {
-                    uv_u: col(&|i| s.uv[i].0),
-                    uv_v: col(&|i| s.uv[i].1),
-                    tb_x: col(&|i| s.tri_bary[i].x),
-                    tb_y: col(&|i| s.tri_bary[i].y),
-                    tb_z: col(&|i| s.tri_bary[i].z),
-                    tau: s.proper_time,
-                    grad_u: col(&|i| s.tau_uv_grad[i].0),
-                    grad_v: col(&|i| s.tau_uv_grad[i].1),
-                    normal: v4(s.surface_normal_4d),
-                    four_vel: v4(s.four_velocity),
-                    misc: [
-                        s.uv_world_scale.0,
-                        s.uv_world_scale.1,
-                        f32::from_bits(s.material_id as u32),
-                        0.0,
-                    ],
-                }
-            })
-            .collect();
-
-        let materials: Vec<GpuMaterial> = scene
-            .materials
-            .iter()
-            .map(|m| {
-                let pattern: u32 = match m.pattern {
-                    SurfacePattern::Checkerboard => 0,
-                    SurfacePattern::ClockFace => 1,
-                    SurfacePattern::LightClock => 2,
-                };
-                GpuMaterial {
-                    base: [m.base_color.x, m.base_color.y, m.base_color.z, m.emission],
-                    checker: [
-                        m.checker_color.x,
-                        m.checker_color.y,
-                        m.checker_color.z,
-                        m.grid_scale,
-                    ],
-                    params: [m.wireframe_width, f32::from_bits(pattern), m.cavity_length, 0.0],
-                }
-            })
-            .collect();
+        let packed = PackedSceneGpuData::from_scene(scene);
 
         let mk = |label: &str, bytes: &[u8]| {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -333,10 +409,10 @@ impl GpuRenderer {
                 usage: wgpu::BufferUsages::STORAGE,
             })
         };
-        let nodes_buf = mk("bvh nodes", bytemuck::cast_slice(&non_empty(nodes)));
-        let geoms_buf = mk("hot geoms", bytemuck::cast_slice(&non_empty(geoms)));
-        let attrs_buf = mk("cold attrs", bytemuck::cast_slice(&non_empty(attrs)));
-        let mats_buf = mk("materials", bytemuck::cast_slice(&non_empty(materials)));
+        let nodes_buf = mk("bvh nodes", bytemuck::cast_slice(&packed.nodes));
+        let geoms_buf = mk("hot geoms", bytemuck::cast_slice(&packed.geoms));
+        let attrs_buf = mk("cold attrs", bytemuck::cast_slice(&packed.attrs));
+        let mats_buf = mk("materials", bytemuck::cast_slice(&packed.materials));
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scene bind group"),
@@ -361,11 +437,10 @@ impl GpuRenderer {
             ],
         });
 
-        let lp = scene.light_pos;
         SceneBuffers {
             bind_group,
-            num_nodes,
-            light_pos: [0.0, lp.x, lp.y, lp.z],
+            num_nodes: packed.num_nodes,
+            light_pos: packed.light_pos,
         }
     }
 
@@ -435,31 +510,7 @@ impl GpuRenderer {
         let scene = &self.scenes[scene_idx];
         let frame = self.frame.as_ref().expect("frame buffers initialised");
 
-        let aspect = w as f32 / h as f32;
-        let half_h = (0.5 * camera.fov_y_rad).tan();
-        let half_w = aspect * half_h;
-        let uniforms = GpuUniforms {
-            cam_pos: v4(camera.position),
-            e: camera.tetrad.e.map(v4),
-            light_pos: scene.light_pos,
-            half_wh: [half_w, half_h],
-            size: [w as u32, h as u32],
-            mode: match cfg.mode {
-                RenderMode::RelativisticShaded => 0,
-                RenderMode::LookbackIsochrones => 1,
-                RenderMode::Simplex4DInspector => 2,
-            },
-            shadow_mode: match cfg.shadow_mode {
-                ShadowMode::Off => 0,
-                ShadowMode::LorentzInvariant => 1,
-                ShadowMode::CameraSlice => 2,
-            },
-            slice_mode: match cfg.slice_mode {
-                SliceMode::PastLightCone => 0,
-                SliceMode::CameraSimultaneity => 1,
-            },
-            num_nodes: scene.num_nodes,
-        };
+        let uniforms = GpuUniforms::build(camera, cfg, scene.num_nodes, scene.light_pos);
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
@@ -506,7 +557,7 @@ impl GpuRenderer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use crate::renderer::render_frame;
