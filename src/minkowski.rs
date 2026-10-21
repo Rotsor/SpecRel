@@ -551,6 +551,14 @@ impl Tetrad {
         -self.e[0] + self.e[1] * n.x + self.e[2] * n.y + self.e[3] * n.z
     }
 
+    /// Future-directed null ray for the observer looking along `dir_local` in its rest frame:
+    /// `k^(A) = (+1, n)`. Used by the Frontier view to trace down the future light cone.
+    #[inline]
+    pub fn future_light_ray_direction(&self, dir_local: Vec3) -> Vec4 {
+        let n = dir_local.normalized();
+        self.e[0] + self.e[1] * n.x + self.e[2] * n.y + self.e[3] * n.z
+    }
+
     /// Gram-Schmidt re-orthonormalization with respect to the Minkowski metric (-, +, +, +).
     pub fn reorthonormalize(&mut self) {
         // Normalize e[0] with <e[0], e[0]>_eta = -1

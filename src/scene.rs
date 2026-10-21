@@ -153,7 +153,7 @@ impl Scene4D {
         }
     }
 
-    fn common_materials() -> Vec<Material> {
+    pub fn common_materials() -> Vec<Material> {
         vec![
             // 0: Ground grid (slate gray/blue checkerboard)
             Material::new(
@@ -662,7 +662,7 @@ mod tests {
     use crate::minkowski::Tetrad;
     use crate::renderer::{
         light_clock_bounce_fraction, render_frame, Camera4D, FrameDynamics, RenderConfig, RenderMode,
-        ShadowMode, SliceMode,
+        ShadowMode, SliceMode, PROPHECY_DELTA_DEFAULT,
     };
 
     #[test]
@@ -673,6 +673,7 @@ mod tests {
             mode: RenderMode::RelativisticShaded,
             shadow_mode: ShadowMode::LorentzInvariant,
             slice_mode: SliceMode::PastLightCone,
+            prophecy_delta: PROPHECY_DELTA_DEFAULT,
         };
         let mut fb = vec![0u32; cfg.width * cfg.height];
 
@@ -683,6 +684,37 @@ mod tests {
             render_frame(&scene, &cam, &cfg, &FrameDynamics::default(), &mut fb);
             assert!(fb.iter().all(|&px| px != 0));
         }
+    }
+
+    /// A player flash (`/`) emitted from a camera at rest is seen lighting a shell of radius
+    /// `tau / 2` after `tau` seconds (light out and back): after 10 s the twins' clocks ~5 ls
+    /// ahead are visibly lit, and after 120 s the shell (R = 60) is beyond all scene geometry.
+    #[test]
+    fn test_player_flash_visible_after_round_trip() {
+        let cfg = RenderConfig {
+            width: 160,
+            height: 100,
+            mode: RenderMode::RelativisticShaded,
+            shadow_mode: ShadowMode::LorentzInvariant,
+            slice_mode: SliceMode::PastLightCone,
+            prophecy_delta: PROPHECY_DELTA_DEFAULT,
+        };
+        let demo = DemoScene::TwinParadox;
+        let scene = Scene4D::build(demo);
+        let lit_fraction = |tau: f32| {
+            let mut cam = Camera4D::new(demo.initial_camera_pos(), 65.0);
+            let mut dynamics = FrameDynamics::default();
+            dynamics.emit_flash(cam.position);
+            cam.position += cam.tetrad.e[0] * tau;
+            let mut plain = vec![0u32; cfg.width * cfg.height];
+            let mut lit = vec![0u32; cfg.width * cfg.height];
+            render_frame(&scene, &cam, &cfg, &FrameDynamics::default(), &mut plain);
+            render_frame(&scene, &cam, &cfg, &dynamics, &mut lit);
+            plain.iter().zip(&lit).filter(|(a, b)| a != b).count() as f32 / plain.len() as f32
+        };
+        let at_10s = lit_fraction(10.0);
+        assert!(at_10s > 0.01, "flash lit only {:.2}% of pixels after 10 s", at_10s * 100.0);
+        assert_eq!(lit_fraction(120.0), 0.0);
     }
 
     #[test]

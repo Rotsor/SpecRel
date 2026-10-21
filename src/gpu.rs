@@ -96,7 +96,7 @@ pub(crate) struct GpuUniforms {
     pub(crate) frontier_active: u32,
     pub(crate) num_flashes: u32,
     pub(crate) frontier_tau: f32,
-    pub(crate) _pad0: u32,
+    pub(crate) prophecy_delta: f32,
     pub(crate) flash_at: [[f32; 4]; MAX_FLASHES],
     pub(crate) flash_col_width: [[f32; 4]; MAX_FLASHES],
 }
@@ -122,10 +122,7 @@ impl GpuUniforms {
             flash_at[i] = v4(f.at);
             flash_col_width[i] = [c.x, c.y, c.z, f.width];
         }
-        let (frontier_active, frontier_origin, frontier_tau) = match dynamics.frontier {
-            Some(fr) => (1, v4(fr.origin), fr.proper_time),
-            None => (0, [0.0; 4], 0.0),
-        };
+        let frontier = dynamics.frontier_or_camera(camera);
 
         Self {
             cam_pos: v4(camera.position),
@@ -137,6 +134,7 @@ impl GpuUniforms {
                 RenderMode::RelativisticShaded => 0,
                 RenderMode::LookbackIsochrones => 1,
                 RenderMode::Simplex4DInspector => 2,
+                RenderMode::DecisionAge => 3,
             },
             shadow_mode: match cfg.shadow_mode {
                 ShadowMode::Off => 0,
@@ -146,13 +144,15 @@ impl GpuUniforms {
             slice_mode: match cfg.slice_mode {
                 SliceMode::PastLightCone => 0,
                 SliceMode::CameraSimultaneity => 1,
+                SliceMode::Frontier => 2,
+                SliceMode::ProphecySlice => 3,
             },
             num_nodes,
-            frontier_origin,
-            frontier_active,
+            frontier_origin: v4(frontier.origin),
+            frontier_active: dynamics.frontier.is_some() as u32,
             num_flashes: flashes.len() as u32,
-            frontier_tau,
-            _pad0: 0,
+            frontier_tau: frontier.proper_time,
+            prophecy_delta: cfg.prophecy_delta,
             flash_at,
             flash_col_width,
         }
@@ -596,6 +596,7 @@ impl GpuRenderer {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use crate::renderer::PROPHECY_DELTA_DEFAULT;
     use crate::renderer::render_frame;
     use crate::scene::DemoScene;
     use crate::minkowski::Vec3;
@@ -714,6 +715,7 @@ mod tests {
                     mode: RenderMode::RelativisticShaded,
                     shadow_mode,
                     slice_mode: SliceMode::PastLightCone,
+                    prophecy_delta: PROPHECY_DELTA_DEFAULT,
                 };
                 render_frame(scene, &cam, &cfg, &FrameDynamics::default(), &mut plain_fb);
                 render_frame(scene, &cam, &cfg, &dynamics, &mut cpu_fb);
@@ -732,6 +734,88 @@ mod tests {
                     i + 1, shadow_mode, bad_frac * 100.0
                 );
             }
+        }
+    }
+
+    /// Decision-age shading of geometry stamped with `decided_at` (as Dynamic Mode will emit it)
+    /// under an active frontier must match the CPU reference, exercising the `decided_at`
+    /// attribute and the `frontier_origin` / `frontier_tau` uniforms.
+    #[test]
+    fn gpu_matches_cpu_decision_age_with_frontier() {
+        use crate::bvh4d::Bvh4D;
+        use crate::mesh4d::{
+            build_worldtube_simplices, build_worldtube_simplices_with_decided,
+            sample_inertial_worldline, Mesh3D,
+        };
+        use crate::renderer::Frontier;
+
+        // A ground plane (static) and a row of cubes whose worldtube steps were decided at
+        // camera proper times 0, 1, 2, ... (spanning several hue bands and contour rings).
+        let ground = Mesh3D::ground_grid(22.0, 22.0, -2.2, 4, 4);
+        let mut simplices = build_worldtube_simplices(
+            &ground,
+            &sample_inertial_worldline(Vec3::default(), Vec3::default(), -40.0, 40.0, 1),
+            0,
+        );
+        let cube = Mesh3D::cube(Vec3::new(0.6, 0.6, 0.6));
+        for k in 0..4 {
+            let pos = Vec3::new(-3.0 + 2.0 * k as f32, -1.0, 4.0);
+            let samples =
+                sample_inertial_worldline(pos, Vec3::new(0.0, 0.0, -0.3), -20.0, 0.0, 20);
+            let decided: Vec<f32> = (0..samples.len()).map(|i| i as f32 + k as f32).collect();
+            simplices.extend(build_worldtube_simplices_with_decided(
+                &cube,
+                &samples,
+                Some(&decided),
+                1,
+            ));
+        }
+        let scene = Scene4D {
+            demo: DemoScene::TwinParadox,
+            bvh: Bvh4D::build(simplices),
+            materials: Scene4D::common_materials(),
+            light_pos: Vec3::new(0.0, 6.0, 2.0),
+            t_min: -20.0,
+            t_max: 0.0,
+        };
+        let mut gpu = match GpuRenderer::new(std::slice::from_ref(&scene)) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping GPU test: {e}");
+                return;
+            }
+        };
+
+        let (w, h) = (192, 120);
+        let mut cpu_fb = vec![0u32; w * h];
+        let mut gpu_fb = vec![0u32; w * h];
+        let cam = Camera4D::new(Vec4::new(0.0, 0.0, 0.0, -4.0), 65.0);
+        let dynamics = FrameDynamics {
+            frontier: Some(Frontier {
+                origin: cam.position + Vec4::new(-0.5, 0.2, 0.0, 0.0),
+                proper_time: 24.0,
+            }),
+            flashes: Vec::new(),
+        };
+        for slice_mode in [SliceMode::PastLightCone, SliceMode::ProphecySlice] {
+            let cfg = RenderConfig {
+                width: w,
+                height: h,
+                mode: RenderMode::DecisionAge,
+                shadow_mode: ShadowMode::Off,
+                slice_mode,
+                prophecy_delta: PROPHECY_DELTA_DEFAULT,
+            };
+            render_frame(&scene, &cam, &cfg, &dynamics, &mut cpu_fb);
+            gpu.render(0, &cam, &cfg, &dynamics, &mut gpu_fb);
+            let distinct: std::collections::HashSet<u32> = cpu_fb.iter().copied().collect();
+            let (max_diff, bad_frac) = diff_stats(&cpu_fb, &gpu_fb, 4);
+            println!(
+                "decision age {:?}: {} distinct colours, max diff {}, {:.3}% px > 4",
+                slice_mode, distinct.len(), max_diff, bad_frac * 100.0
+            );
+            assert!(distinct.len() > 50, "{slice_mode:?}: image is suspiciously flat");
+            assert!(bad_frac < 0.005, "{slice_mode:?}: {:.3}% of pixels differ", bad_frac * 100.0);
         }
     }
 
@@ -776,6 +860,11 @@ mod tests {
             (RenderMode::RelativisticShaded, ShadowMode::CameraSlice, SliceMode::CameraSimultaneity),
             (RenderMode::LookbackIsochrones, ShadowMode::Off, SliceMode::PastLightCone),
             (RenderMode::Simplex4DInspector, ShadowMode::Off, SliceMode::PastLightCone),
+            (RenderMode::DecisionAge, ShadowMode::Off, SliceMode::PastLightCone),
+            (RenderMode::DecisionAge, ShadowMode::Off, SliceMode::ProphecySlice),
+            (RenderMode::RelativisticShaded, ShadowMode::LorentzInvariant, SliceMode::Frontier),
+            (RenderMode::RelativisticShaded, ShadowMode::CameraSlice, SliceMode::ProphecySlice),
+            (RenderMode::LookbackIsochrones, ShadowMode::Off, SliceMode::Frontier),
         ];
         let mut cpu_fb = vec![0u32; w * h];
         let mut gpu_fb = vec![0u32; w * h];
@@ -787,7 +876,14 @@ mod tests {
             cam.tetrad.boost_local(Vec3::new(0.2, 0.0, 0.6));
             cam.tetrad.rotate_local(0.15, -0.05, 0.0);
             for &(mode, shadow_mode, slice_mode) in &configs {
-                let cfg = RenderConfig { width: w, height: h, mode, shadow_mode, slice_mode };
+                let cfg = RenderConfig {
+                    width: w,
+                    height: h,
+                    mode,
+                    shadow_mode,
+                    slice_mode,
+                    prophecy_delta: PROPHECY_DELTA_DEFAULT,
+                };
                 render_frame(scene, &cam, &cfg, &no_dynamics, &mut cpu_fb);
                 gpu.render(i, &cam, &cfg, &no_dynamics, &mut gpu_fb);
                 let (max_diff, bad_frac) = diff_stats(&cpu_fb, &gpu_fb, 4);

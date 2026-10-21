@@ -13,6 +13,7 @@ use crate::hud::{draw_hud, draw_hud_overlay, HUD_BASE_WIDTH, HUD_OVERLAY_HEIGHT}
 use crate::minkowski::{Vec3, Vec4};
 use crate::renderer::{
     render_frame, Camera4D, FrameDynamics, RenderConfig, RenderMode, ShadowMode, ViewMode,
+    PROPHECY_DELTA_DEFAULT,
 };
 use crate::scene::{DemoScene, Scene4D};
 use std::cell::UnsafeCell;
@@ -45,6 +46,9 @@ pub const KEY_Z: u32 = 17;
 pub const KEY_R: u32 = 18;
 pub const KEY_X: u32 = 19;
 pub const KEY_V: u32 = 20;
+pub const KEY_SLASH: u32 = 21;
+pub const KEY_PAGE_UP: u32 = 22;
+pub const KEY_PAGE_DOWN: u32 = 23;
 
 // Continuous held-key bitflags (100 + bit index)
 pub const HOLD_LEFT: u32 = 100;
@@ -131,6 +135,7 @@ pub extern "C" fn web_init(gpu_available: u32) {
         mode: RenderMode::RelativisticShaded,
         shadow_mode: ShadowMode::LorentzInvariant,
         slice_mode: ViewMode::PastLightCone,
+        prophecy_delta: PROPHECY_DELTA_DEFAULT,
     };
     let dynamics = FrameDynamics::default();
     let uniforms = GpuUniforms::build(
@@ -178,6 +183,12 @@ pub extern "C" fn web_key_event(code: u32, pressed: u32, repeat: u32) {
             } else {
                 s.held_keys &= !bit;
             }
+            return;
+        }
+
+        // Prophecy-delta stepping auto-repeats while held, like the native build.
+        if pressed != 0 && (code == KEY_PAGE_UP || code == KEY_PAGE_DOWN) {
+            s.cfg.step_prophecy_delta(if code == KEY_PAGE_UP { 1.0 } else { -1.0 });
             return;
         }
 
@@ -229,7 +240,9 @@ pub extern "C" fn web_key_event(code: u32, pressed: u32, repeat: u32) {
                 s.camera = Camera4D::new(pos, 65.0);
                 s.time_scale_idx = 7;
                 s.paused_worldline = false;
+                s.dynamics.flashes.clear();
             }
+            KEY_SLASH => s.dynamics.emit_flash(s.camera.position),
             KEY_X => {
                 s.camera.tetrad.boost_to(Vec4::new(1.0, 0.0, 0.0, 0.0));
             }
@@ -253,6 +266,7 @@ pub extern "C" fn web_key_event(code: u32, pressed: u32, repeat: u32) {
                 let pos = s.scenes[s.scene_idx].demo.initial_camera_pos();
                 s.camera = Camera4D::new(pos, 65.0);
                 s.paused_worldline = false;
+                s.dynamics.flashes.clear();
             }
         }
     });
@@ -393,10 +407,14 @@ pub extern "C" fn web_step(dt_secs: f32) {
         if time_changed {
             let t_loop = scene.t_max - scene.t_min;
             if s.camera.position.t > scene.t_max || s.camera.position.t < scene.t_min {
-                s.camera.position.t =
+                let wrapped =
                     scene.t_min + (s.camera.position.t - scene.t_min).rem_euclid(t_loop);
+                // The scene is periodic, so carry flashes along to the same moment of the loop.
+                s.dynamics.shift_time(wrapped - s.camera.position.t);
+                s.camera.position.t = wrapped;
             }
         }
+        s.dynamics.retire_flashes(s.camera.position.t);
 
         let packed = &s.packed_scenes[s.scene_idx];
         s.uniforms = GpuUniforms::build(

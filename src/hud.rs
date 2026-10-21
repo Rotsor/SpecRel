@@ -1,4 +1,4 @@
-use crate::renderer::{Camera4D, RenderConfig};
+use crate::renderer::{Camera4D, RenderConfig, ViewMode};
 use crate::scene::DemoScene;
 
 pub const HUD_BASE_WIDTH: usize = 1280;
@@ -196,14 +196,18 @@ fn draw_hud_lines(
         "OBS 3-VEL: ({:+5.3}, {:+5.3}, {:+5.3})  |V|: {:5.3}C  GAMMA: {:6.3}  FPS: {:4.0} [F] {}  RES: {}x{} [Z]",
         beta.x, beta.y, beta.z, speed, gamma, fps, backend, cfg.width, cfg.height
     );
+    let view_name = if cfg.slice_mode == ViewMode::ProphecySlice {
+        format!("PROPHECY (DT'=+{:.1}S)", cfg.prophecy_delta)
+    } else {
+        cfg.slice_mode.name().to_string()
+    };
     let line3 = format!(
         "MODE [M]: {} | VIEW [G]: {} | SHADOWS [H]: {}",
         cfg.mode.name(),
-        cfg.slice_mode.name(),
+        view_name,
         cfg.shadow_mode.name(),
     );
-    let line4 =
-        "TIME: [P] PAUSE | [T/BKSP] REWIND | [-/=] SPEED | [ / ] SCRUB T | [R] RESET";
+    let line4 = "TIME: [P] PAUSE | [T] REWIND | [-/=] SPEED | [ / ] SCRUB T | [R] RESET | [/] FLASH | [PGUP/DN] DELTA";
     let line5 =
         "THRUST: WASD/SPC/C | MATCH VEL: [V] | BRAKE: [X] | LOOK: ARROWS/QE | MOVE: IJKL/UO";
 

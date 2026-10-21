@@ -1,5 +1,5 @@
 use crate::hud::glyph_5x7;
-use crate::mesh4d::{HitRecord4D, Material, SurfacePattern};
+use crate::mesh4d::{HitRecord4D, Material, SurfacePattern, DECIDED_AT_STATIC};
 use crate::minkowski::{rest_frame_cos, Tetrad, Vec3, Vec4};
 use crate::scene::Scene4D;
 #[cfg(not(target_arch = "wasm32"))]
@@ -14,6 +14,9 @@ pub enum RenderMode {
     LookbackIsochrones,
     /// Raw 4D Simplex (tetrahedron) barycentric inspector
     Simplex4DInspector,
+    /// Causal decision age: how much camera proper time has passed since each visible event
+    /// left the camera's open future light cone `I+(O)` and could no longer be influenced.
+    DecisionAge,
 }
 
 impl RenderMode {
@@ -21,7 +24,8 @@ impl RenderMode {
         match self {
             Self::RelativisticShaded => Self::LookbackIsochrones,
             Self::LookbackIsochrones => Self::Simplex4DInspector,
-            Self::Simplex4DInspector => Self::RelativisticShaded,
+            Self::Simplex4DInspector => Self::DecisionAge,
+            Self::DecisionAge => Self::RelativisticShaded,
         }
     }
 
@@ -30,6 +34,7 @@ impl RenderMode {
             Self::RelativisticShaded => "4D LIGHT-CONE SHADED",
             Self::LookbackIsochrones => "PAST LIGHT-CONE ISOCHRONES",
             Self::Simplex4DInspector => "4D TETRAHEDRAL MESH",
+            Self::DecisionAge => "CAUSAL DECISION AGE",
         }
     }
 }
@@ -70,6 +75,14 @@ pub enum ViewMode {
     /// and simultaneity as defined by the camera's current velocity!
     /// (Press `X` to brake to `v = 0` if you want the unboosted World Lab slice!)
     CameraSimultaneity,
+    /// Causal frontier: rays run down the *future* null cone `k^mu = +e_0 + n^a e_a` from
+    /// `O' = O - FRONTIER_RAY_OFFSET * e_0`, landing just outside `I+(O)`: the world as it is
+    /// being decided, and where the camera's current choices are about to propagate.
+    Frontier,
+    /// Prophecy slice: the God's-eye slice pushed into the camera's future by
+    /// `RenderConfig::prophecy_delta`. The ball of radius `delta` around the camera on that
+    /// slice lies inside `I+(O)` and is drawn as undetermined haze.
+    ProphecySlice,
 }
 
 /// Backwards-compatible alias for [`ViewMode`].
@@ -79,7 +92,9 @@ impl ViewMode {
     pub fn next(self) -> Self {
         match self {
             Self::PastLightCone => Self::CameraSimultaneity,
-            Self::CameraSimultaneity => Self::PastLightCone,
+            Self::CameraSimultaneity => Self::Frontier,
+            Self::Frontier => Self::ProphecySlice,
+            Self::ProphecySlice => Self::PastLightCone,
         }
     }
 
@@ -87,9 +102,22 @@ impl ViewMode {
         match self {
             Self::PastLightCone => "REAL CAMERA (DS2=0)",
             Self::CameraSimultaneity => "GOD'S EYE (DT'=0)",
+            Self::Frontier => "FRONTIER (FUTURE CONE)",
+            Self::ProphecySlice => "PROPHECY (DT'=+DELTA)",
         }
     }
 }
+
+/// Proper-time offset `delta` of the Frontier view's ray origin `O' = O - delta * e_0`. Every
+/// future-cone ray from `O'` beyond `lambda > delta / 2` lies outside `I+(O)`, so rays land on
+/// geometry that is already decided instead of grazing the frontier.
+pub const FRONTIER_RAY_OFFSET: f32 = 0.14;
+
+/// Range and step of the Prophecy slice's future offset (`PageUp` / `PageDown`).
+pub const PROPHECY_DELTA_DEFAULT: f32 = 3.5;
+pub const PROPHECY_DELTA_MIN: f32 = 0.5;
+pub const PROPHECY_DELTA_MAX: f32 = 20.0;
+pub const PROPHECY_DELTA_STEP: f32 = 0.5;
 
 /// Controls how 4D shadow rays are cast from surface hit events `X_hit^mu` toward the light worldline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +159,16 @@ pub struct RenderConfig {
     pub mode: RenderMode,
     pub shadow_mode: ShadowMode,
     pub slice_mode: SliceMode,
+    /// Future proper-time offset of [`ViewMode::ProphecySlice`]
+    pub prophecy_delta: f32,
+}
+
+impl RenderConfig {
+    /// Move the prophecy slice `steps` increments further into (or back from) the future.
+    pub fn step_prophecy_delta(&mut self, steps: f32) {
+        self.prophecy_delta = (self.prophecy_delta + steps * PROPHECY_DELTA_STEP)
+            .clamp(PROPHECY_DELTA_MIN, PROPHECY_DELTA_MAX);
+    }
 }
 
 /// Maximum number of light-pulse flashes uploaded to the GPU uniform block per frame.
@@ -167,11 +205,63 @@ pub struct FrameDynamics {
     pub flashes: Vec<FlashEvent>,
 }
 
+/// Flashes are dropped once their shell is this far (light-seconds) past the emission event:
+/// beyond the renderers' maximum ray length, nothing they light can be seen any more.
+pub const FLASH_MAX_RADIUS: f32 = 200.0;
+
 impl FrameDynamics {
     /// The flashes the renderers actually evaluate (both backends cap at [`MAX_FLASHES`]).
     pub fn active_flashes(&self) -> &[FlashEvent] {
         &self.flashes[..self.flashes.len().min(MAX_FLASHES)]
     }
+
+    /// The decision frontier the renderers measure against: the Dynamic Mode frontier if one
+    /// is running, else the camera event itself (static scenes, inertial-camera assumption).
+    pub fn frontier_or_camera(&self, camera: &Camera4D) -> Frontier {
+        self.frontier.unwrap_or(Frontier {
+            origin: camera.position,
+            proper_time: camera.proper_time,
+        })
+    }
+
+    /// Emit the player's light flash at event `at`, evicting the oldest if all slots are full.
+    pub fn emit_flash(&mut self, at: Vec4) {
+        if self.flashes.len() >= MAX_FLASHES {
+            self.flashes.remove(0);
+        }
+        self.flashes.push(FlashEvent {
+            at,
+            width: 0.8,
+            intensity: 2.5,
+            color: Vec3::new(1.0, 0.9, 0.7),
+        });
+    }
+
+    /// Drop flashes whose shell has expanded beyond [`FLASH_MAX_RADIUS`] by lab time `now_t`.
+    pub fn retire_flashes(&mut self, now_t: f32) {
+        self.flashes.retain(|f| now_t - f.at.t < FLASH_MAX_RADIUS);
+    }
+
+    /// Shift every flash by `dt` in lab time, e.g. when a periodic static scene wraps its clock,
+    /// so the flash stays attached to the same moment of the loop.
+    pub fn shift_time(&mut self, dt: f32) {
+        for f in &mut self.flashes {
+            f.at.t += dt;
+        }
+    }
+}
+
+/// Camera proper time elapsed since `event` left the open future light cone `I+` of an
+/// inertial worldline through `origin` with 4-velocity `u`: `T + R`, where `T` is the
+/// rest-frame time since the event and `R` its rest-frame distance. On the past light cone this
+/// is `2R`: anything you see was settled a full round trip ago. Negative for events still
+/// inside `I+(origin)` (not yet decided).
+pub fn analytic_decision_age(event: Vec4, origin: Vec4, u: Vec4) -> f32 {
+    let d = event - origin;
+    let time_ago = d.minkowski_dot(u);
+    // `d = -T u + w` with `w` spacelike and orthogonal to `u`, so `T^2 + d.d = |w|^2 = R^2`.
+    let dist = (time_ago * time_ago + d.minkowski_norm_sq()).max(0.0).sqrt();
+    time_ago + dist
 }
 
 pub fn render_frame(
@@ -187,6 +277,12 @@ pub fn render_frame(
     let half_h = (0.5 * camera.fov_y_rad).tan();
     let half_w = aspect * half_h;
     let lut = gamma_lut();
+
+    let ray_origin = match cfg.slice_mode {
+        SliceMode::PastLightCone | SliceMode::CameraSimultaneity => camera.position,
+        SliceMode::Frontier => camera.position - camera.tetrad.e[0] * FRONTIER_RAY_OFFSET,
+        SliceMode::ProphecySlice => camera.position + camera.tetrad.e[0] * cfg.prophecy_delta,
+    };
 
     #[cfg(not(target_arch = "wasm32"))]
     let rows = framebuffer.par_chunks_mut(w);
@@ -207,15 +303,20 @@ pub fn render_frame(
 
                 let ray_dir = match cfg.slice_mode {
                     SliceMode::PastLightCone => camera.tetrad.past_light_ray_direction(local_dir),
-                    SliceMode::CameraSimultaneity => {
+                    SliceMode::CameraSimultaneity | SliceMode::ProphecySlice => {
                         camera.tetrad.local_spatial_to_world(local_dir)
                     }
+                    SliceMode::Frontier => camera.tetrad.future_light_ray_direction(local_dir),
                 };
 
-                let color = if let Some(hit) =
-                    scene.bvh.trace(camera.position, ray_dir, 1e-3, 180.0)
+                let color = if let Some(hit) = scene.bvh.trace(ray_origin, ray_dir, 1e-3, 180.0)
                 {
-                    shade_hit(scene, camera, cfg, dynamics, ray_dir, &hit)
+                    let shaded = shade_hit(scene, camera, cfg, dynamics, ray_dir, &hit);
+                    if cfg.slice_mode == SliceMode::ProphecySlice {
+                        apply_undecided_haze(shaded, hit.event, dynamics.frontier_or_camera(camera))
+                    } else {
+                        shaded
+                    }
                 } else {
                     shade_sky(ray_dir)
                 };
@@ -283,7 +384,69 @@ fn shade_hit(
             );
             tint * edge
         }
+
+        RenderMode::DecisionAge => {
+            let frontier = dynamics.frontier_or_camera(camera);
+            let age = if hit.decided_at > DECIDED_AT_STATIC * 0.5 {
+                frontier.proper_time - hit.decided_at
+            } else {
+                analytic_decision_age(hit.event, frontier.origin, camera.tetrad.e[0])
+            };
+            let cos_view =
+                (-rest_frame_cos(ray_dir, hit.surface_normal_4d, hit.four_velocity)).max(0.0);
+            apply_distance_fog(
+                decision_age_color(age) * (0.55 + 0.45 * cos_view),
+                ray_dir,
+                hit.lambda,
+            )
+        }
     }
+}
+
+/// Undecided events (`age < 0`) are dark slate; decided ones run red -> yellow -> green -> blue
+/// over 60 s (a 30 ls round trip on the past cone), glow gold-white for the first 0.45 s after
+/// being decided, and get a contour every 2 s.
+fn decision_age_color(age: f32) -> Vec3 {
+    if age < 0.0 {
+        return Vec3::new(0.14, 0.14, 0.18);
+    }
+    let mut col = hsv_to_rgb((age * 4.0).min(240.0), 0.82, 0.88);
+    if age < 0.45 {
+        let f = 1.0 - age / 0.45;
+        col = col * (1.0 - f * 0.7) + Vec3::new(1.0, 0.96, 0.65) * (f * 0.9);
+    }
+    if ((age * 0.5).rem_euclid(1.0) - 0.5).abs() > 0.465 {
+        col = Vec3::new(0.95, 0.98, 1.0);
+    }
+    col
+}
+
+const HAZE_COLOR: Vec3 = Vec3::new(0.32, 0.18, 0.62);
+
+/// Prophecy-slice overlay: events inside the open future light cone `I+(O)` of the frontier
+/// are still undetermined and get an animated violet haze; a cyan shell marks where geometry
+/// crosses the frontier `dJ+(O)` itself.
+fn apply_undecided_haze(base: Vec3, event: Vec4, frontier: Frontier) -> Vec3 {
+    const SHELL: f32 = 0.18;
+    let d = event - frontier.origin;
+    // > 0 inside `I+(O)`, 0 on the frontier (sign is frame-independent; magnitude is lab-frame).
+    let inside = d.t - d.spatial().length();
+    if inside <= -SHELL {
+        return base;
+    }
+    let mut col = base;
+    if inside.abs() < SHELL {
+        let k = 1.0 - inside.abs() / SHELL;
+        col += Vec3::new(0.45, 0.92, 1.0) * (0.85 * k * k);
+    }
+    if inside > 0.0 {
+        let ripple = 0.5
+            + 0.5 * (event.x * 3.5 + event.z * 3.5 - event.t * 4.0).sin() * (inside * 5.0).cos();
+        let haze = HAZE_COLOR * (1.0 - 0.35 * ripple) + Vec3::new(0.18, 0.72, 0.92) * (0.35 * ripple);
+        let alpha = 0.55 + 0.25 * (inside * 0.5).min(1.0);
+        col = col * (1.0 - alpha) + haze * alpha;
+    }
+    col
 }
 
 /// Evaluate the intrinsic rest-frame procedural texture at `hit.uv` and `hit.proper_time`.
@@ -877,4 +1040,75 @@ fn pack_rgb_with_lut(c: Vec3, lut: &[u8; GAMMA_LUT_SIZE]) -> u32 {
 #[inline]
 pub fn pack_rgb(c: Vec3) -> u32 {
     pack_rgb_with_lut(c, gamma_lut())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analytic_decision_age_is_time_ago_plus_distance() {
+        let origin = Vec4::new(10.0, 1.0, 2.0, 3.0);
+        let u = Tetrad::rest().e[0];
+        let at = |dt: f32, r: f32| origin + Vec4::new(dt, r, 0.0, 0.0);
+        // Past event 3 s ago, 4 ls away: settled 7 s ago.
+        assert!((analytic_decision_age(at(-3.0, 4.0), origin, u) - 7.0).abs() < 1e-5);
+        // Spacelike future event: decided once the camera came within its past cone.
+        assert!((analytic_decision_age(at(1.0, 3.0), origin, u) - 2.0).abs() < 1e-5);
+        // On the frontier itself: decided just now.
+        assert!(analytic_decision_age(at(2.0, 2.0), origin, u).abs() < 1e-5);
+        // Inside the open future cone: not decided yet.
+        assert!(analytic_decision_age(at(3.0, 1.0), origin, u) < 0.0);
+    }
+
+    /// For a moving camera, anything seen on its past light cone at rest-frame distance `R` was
+    /// decided a round trip `2R` of the camera's own proper time ago.
+    #[test]
+    fn analytic_decision_age_on_past_cone_is_round_trip() {
+        let mut tetrad = Tetrad::rest();
+        tetrad.boost_local(Vec3::new(0.4, -0.2, 0.7));
+        tetrad.rotate_local(0.3, 0.1, -0.2);
+        let origin = Vec4::new(5.0, -1.0, 0.5, 2.0);
+        for (dir, lambda) in [(Vec3::new(0.0, 0.0, 1.0), 3.0), (Vec3::new(1.0, -0.5, 0.2), 7.5)] {
+            let event = origin + tetrad.past_light_ray_direction(dir) * lambda;
+            let age = analytic_decision_age(event, origin, tetrad.e[0]);
+            assert!((age - 2.0 * lambda).abs() < 1e-3, "age {age} for lambda {lambda}");
+        }
+    }
+
+    #[test]
+    fn flash_slots_evict_retire_and_shift() {
+        let mut d = FrameDynamics::default();
+        for i in 0..(MAX_FLASHES + 3) {
+            d.emit_flash(Vec4::new(i as f32, 0.0, 0.0, 0.0));
+        }
+        assert_eq!(d.flashes.len(), MAX_FLASHES);
+        assert_eq!(d.flashes[0].at.t, 3.0, "oldest flashes are evicted first");
+
+        d.shift_time(-100.0);
+        assert_eq!(d.flashes[0].at.t, -97.0);
+
+        // Flashes now sit at t = -97 ..= -82; at now = 110 only those with t > -90 survive.
+        d.retire_flashes(110.0);
+        assert!(d.flashes.iter().all(|f| 110.0 - f.at.t < FLASH_MAX_RADIUS));
+        assert_eq!(d.flashes.len(), 8);
+    }
+
+    #[test]
+    fn prophecy_delta_steps_are_clamped() {
+        let mut cfg = RenderConfig {
+            width: 1,
+            height: 1,
+            mode: RenderMode::RelativisticShaded,
+            shadow_mode: ShadowMode::Off,
+            slice_mode: ViewMode::ProphecySlice,
+            prophecy_delta: PROPHECY_DELTA_DEFAULT,
+        };
+        cfg.step_prophecy_delta(2.0);
+        assert_eq!(cfg.prophecy_delta, PROPHECY_DELTA_DEFAULT + 2.0 * PROPHECY_DELTA_STEP);
+        cfg.step_prophecy_delta(-1000.0);
+        assert_eq!(cfg.prophecy_delta, PROPHECY_DELTA_MIN);
+        cfg.step_prophecy_delta(1000.0);
+        assert_eq!(cfg.prophecy_delta, PROPHECY_DELTA_MAX);
+    }
 }

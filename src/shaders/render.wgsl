@@ -15,9 +15,15 @@ const GAMMA_LUT_SIZE: u32 = 4096u;
 // Enum encodings (see `gpu.rs`).
 const MODE_SHADED: u32 = 0u;
 const MODE_ISOCHRONES: u32 = 1u;
+const MODE_DECISION_AGE: u32 = 3u;
 const SHADOW_OFF: u32 = 0u;
 const SHADOW_CAMERA_SLICE: u32 = 2u;
 const SLICE_PAST_LIGHT_CONE: u32 = 0u;
+const SLICE_FRONTIER: u32 = 2u;
+const SLICE_PROPHECY: u32 = 3u;
+// Mirrors `renderer::FRONTIER_RAY_OFFSET` and `mesh4d::DECIDED_AT_STATIC`.
+const FRONTIER_RAY_OFFSET: f32 = 0.14;
+const DECIDED_AT_STATIC: f32 = -1.0e9;
 const PATTERN_CHECKERBOARD: u32 = 0u;
 const PATTERN_CLOCK_FACE: u32 = 1u;
 
@@ -40,12 +46,13 @@ struct Uniforms {
     shadow_mode: u32,
     slice_mode: u32,
     num_nodes: u32,
-    // Per-frame dynamics (`renderer::FrameDynamics`).
+    // Per-frame dynamics (`renderer::FrameDynamics`). `frontier_origin`/`frontier_tau` fall back
+    // to the camera event when no Dynamic Mode frontier is active.
     frontier_origin: vec4<f32>,
     frontier_active: u32,
     num_flashes: u32,
     frontier_tau: f32,
-    _pad0: u32,
+    prophecy_delta: f32,
     flash_at: array<vec4<f32>, 16>,         // emission event (t, x, y, z)
     flash_col_width: array<vec4<f32>, 16>,  // (color * intensity, shell width)
 };
@@ -793,6 +800,54 @@ fn compute_flash_illumination(hit: HitRecord) -> vec3<f32> {
     return total;
 }
 
+const HAZE_COLOR: vec3<f32> = vec3<f32>(0.32, 0.18, 0.62);
+
+// Mirrors `renderer::analytic_decision_age`.
+fn analytic_decision_age(event: vec4<f32>, origin: vec4<f32>, uu: vec4<f32>) -> f32 {
+    let d = event - origin;
+    let time_ago = mdot(d, uu);
+    let dist = sqrt(max(time_ago * time_ago + mdot(d, d), 0.0));
+    return time_ago + dist;
+}
+
+// Mirrors `renderer::decision_age_color`.
+fn decision_age_color(age: f32) -> vec3<f32> {
+    if age < 0.0 {
+        return vec3<f32>(0.14, 0.14, 0.18);
+    }
+    var col = hsv_to_rgb(min(age * 4.0, 240.0), 0.82, 0.88);
+    if age < 0.45 {
+        let f = 1.0 - age / 0.45;
+        col = col * (1.0 - f * 0.7) + vec3<f32>(1.0, 0.96, 0.65) * (f * 0.9);
+    }
+    if abs(rem_e(age * 0.5, 1.0) - 0.5) > 0.465 {
+        col = vec3<f32>(0.95, 0.98, 1.0);
+    }
+    return col;
+}
+
+// Mirrors `renderer::apply_undecided_haze`.
+fn apply_undecided_haze(base: vec3<f32>, event: vec4<f32>) -> vec3<f32> {
+    let shell = 0.18;
+    let d = event - u.frontier_origin;
+    let inside = d.x - length(d.yzw);
+    if inside <= -shell {
+        return base;
+    }
+    var col = base;
+    if abs(inside) < shell {
+        let k = 1.0 - abs(inside) / shell;
+        col += vec3<f32>(0.45, 0.92, 1.0) * (0.85 * k * k);
+    }
+    if inside > 0.0 {
+        let ripple = 0.5 + 0.5 * sin(event.y * 3.5 + event.w * 3.5 - event.x * 4.0) * cos(inside * 5.0);
+        let haze = HAZE_COLOR * (1.0 - 0.35 * ripple) + vec3<f32>(0.18, 0.72, 0.92) * (0.35 * ripple);
+        let alpha = 0.55 + 0.25 * min(inside * 0.5, 1.0);
+        col = col * (1.0 - alpha) + haze * alpha;
+    }
+    return col;
+}
+
 fn apply_distance_fog(surface: vec3<f32>, ray_dir: vec4<f32>, lambda: f32) -> vec3<f32> {
     let fog = exp(-0.008 * lambda);
     return surface * fog + shade_sky_gradient(ray_dir) * (1.0 - fog);
@@ -822,6 +877,17 @@ fn shade_hit(ray_dir: vec4<f32>, hit: HitRecord) -> vec3<f32> {
             return vec3<f32>(0.1);
         }
         return base;
+    }
+
+    if u.mode == MODE_DECISION_AGE {
+        var age: f32;
+        if hit.decided_at > DECIDED_AT_STATIC * 0.5 {
+            age = u.frontier_tau - hit.decided_at;
+        } else {
+            age = analytic_decision_age(hit.event, u.frontier_origin, u.e0);
+        }
+        let cos_view = max(-rest_frame_cos(ray_dir, hit.normal, hit.four_vel), 0.0);
+        return apply_distance_fog(decision_age_color(age) * (0.55 + 0.45 * cos_view), ray_dir, hit.lambda);
     }
 
     // Simplex4DInspector
@@ -861,19 +927,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let local_dir = normalized3(vec3<f32>(sx, sy, 1.0));
 
+    var ray_origin = u.cam_pos;
     var ray_dir: vec4<f32>;
     if u.slice_mode == SLICE_PAST_LIGHT_CONE {
         // `Tetrad::past_light_ray_direction` re-normalizes its input.
         let n = normalized3(local_dir);
         ray_dir = -u.e0 + u.e1 * n.x + u.e2 * n.y + u.e3 * n.z;
+    } else if u.slice_mode == SLICE_FRONTIER {
+        ray_origin = u.cam_pos - u.e0 * FRONTIER_RAY_OFFSET;
+        let n = normalized3(local_dir);
+        ray_dir = u.e0 + u.e1 * n.x + u.e2 * n.y + u.e3 * n.z;
     } else {
+        if u.slice_mode == SLICE_PROPHECY {
+            ray_origin = u.cam_pos + u.e0 * u.prophecy_delta;
+        }
         ray_dir = u.e1 * local_dir.x + u.e2 * local_dir.y + u.e3 * local_dir.z;
     }
 
-    let t = trace(u.cam_pos, ray_dir, 1e-3, 180.0);
+    let t = trace(ray_origin, ray_dir, 1e-3, 180.0);
     var color: vec3<f32>;
     if t.found {
-        color = shade_hit(ray_dir, make_hit_record(t));
+        let hit = make_hit_record(t);
+        color = shade_hit(ray_dir, hit);
+        if u.slice_mode == SLICE_PROPHECY {
+            color = apply_undecided_haze(color, hit.event);
+        }
     } else {
         color = shade_sky(ray_dir);
     }

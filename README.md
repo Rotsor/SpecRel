@@ -28,6 +28,8 @@ Every relativistic optical and geometric phenomenon—**time dilation**, **Loren
   * The CPU path remains an exact **reference renderer** with automated bit-level image comparison tests ensuring pixel-accurate cross-backend consistency.
 * **Interactive Spacetime View & Shadow Modes**:
   * Toggle between **Real Camera ($ds^2 = 0$)** (what a physical camera sees down the past light-cone) and **God's Eye ($dt' = 0$)** (an instantaneous 3D simultaneity slice across the observer's current Lorentz frame $\langle X - O, u_{\text{cam}} \rangle_\eta = 0$).
+  * **Causal views** (groundwork for the planned Dynamic Mode, see [`docs/DYNAMIC_MODE_PLAN.md`](docs/DYNAMIC_MODE_PLAN.md)): **Frontier** traces rays down the camera's *future* light cone, showing the world exactly as it leaves your reach; **Prophecy** pushes the God's-Eye slice $\Delta$ seconds into your future, where the ball of radius $\Delta$ that you can still influence is drawn as violet haze; the **Causal Decision Age** render mode colours every event by how long ago it became immune to anything you do ($T + R$, i.e. $2R$ for everything you see).
+  * **Light flashes** (`/`): emit a spherical light pulse from the camera and watch its wavefront sweep the scene, seen with the extra delay of the light coming back to you.
   * Cycle between **Lorentz-Invariant Null Shadows** ($t_{\text{emit}} = t_{\text{hit}} - \|\mathbf{x}_L - \mathbf{x}_{\text{hit}}\|$), **Camera-Slice Faked Shadows** ($\langle X_{\text{emit}} - X_{\text{hit}}, u_{\text{cam}} \rangle_\eta = 0$), and **Shadows Off**.
 
 ---
@@ -106,9 +108,11 @@ python -m http.server 8080 --directory web
 | **`V`** | Toggle velocity match with the scene's moving object (Pole / Train / Traveler) |
 | **`X`** | Brake immediately to the Lab rest frame ($\boldsymbol{\beta} = 0$) |
 | **`Arrow Keys`** / **`Q` `E`** | Rotate local camera look direction (Yaw / Pitch / Roll) |
-| **`G`** | Toggle Spacetime View: **Real Camera ($ds^2 = 0$)** vs. **God's Eye ($dt' = 0$)** |
+| **`G`** | Cycle Spacetime View: **Real Camera ($ds^2 = 0$)** $\to$ **God's Eye ($dt' = 0$)** $\to$ **Frontier (future cone)** $\to$ **Prophecy ($dt' = +\Delta$)** |
+| **`PageUp`** / **`PageDown`** | Push the Prophecy slice further into / back from the future ($\Delta$ = 0.5 .. 20 s) |
+| **`/`** | Emit a spherical light flash from the camera |
 | **`H`** | Cycle Shadow Mode: **Lorentz-Invariant (Null)** $\to$ **Camera-Slice Faked** $\to$ **Off** |
-| **`M`** | Cycle Render Mode: **Shaded** $\to$ **Lookback Isochrones** $\to$ **4D Tetrahedral Mesh** |
+| **`M`** | Cycle Render Mode: **Shaded** $\to$ **Lookback Isochrones** $\to$ **4D Tetrahedral Mesh** $\to$ **Causal Decision Age** |
 | **`P`** | Pause / Resume observer worldline evolution |
 | **`T`** / **`Backspace`** | Toggle **Rewind** (reverse time playback direction) |
 | **`-`** / **`=`** | Decrease / Increase time playback speed (`-4x` .. `+4x`) |

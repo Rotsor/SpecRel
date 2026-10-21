@@ -19,6 +19,7 @@ use minifb::{Key, KeyRepeat, Window, WindowOptions};
 #[cfg(not(target_arch = "wasm32"))]
 use renderer::{
     render_frame, Camera4D, FrameDynamics, RenderConfig, RenderMode, ShadowMode, ViewMode,
+    PROPHECY_DELTA_DEFAULT,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use scene::{DemoScene, Scene4D};
@@ -105,6 +106,7 @@ fn main() {
         mode: RenderMode::RelativisticShaded,
         shadow_mode: ShadowMode::LorentzInvariant,
         slice_mode: ViewMode::PastLightCone,
+        prophecy_delta: PROPHECY_DELTA_DEFAULT,
     };
 
     let mut framebuffer = vec![0u32; WIDTH * HEIGHT];
@@ -183,8 +185,8 @@ fn main() {
     window.set_target_fps(60);
 
     let mut paused_worldline = false;
-    // Static scenes have no causal frontier or flashes; Dynamic Mode will drive these per frame.
-    let dynamics = FrameDynamics::default();
+    // Static scenes have no causal frontier (Dynamic Mode will drive it); flashes come from `/`.
+    let mut dynamics = FrameDynamics::default();
     let mut time_scale_idx: usize = 7; // Default +1.0x forward
     let mut show_hud = true;
     let mut last_frame = Instant::now();
@@ -218,6 +220,7 @@ fn main() {
             scene_idx = idx;
             camera = Camera4D::new(scenes[scene_idx].demo.initial_camera_pos(), 65.0);
             paused_worldline = false;
+            dynamics.flashes.clear();
         }
 
         let scene = &scenes[scene_idx];
@@ -270,6 +273,16 @@ fn main() {
             camera = Camera4D::new(scene.demo.initial_camera_pos(), 65.0);
             time_scale_idx = 7; // +1.0x
             paused_worldline = false;
+            dynamics.flashes.clear();
+        }
+        if window.is_key_pressed(Key::Slash, KeyRepeat::No) {
+            dynamics.emit_flash(camera.position);
+        }
+        if window.is_key_pressed(Key::PageUp, KeyRepeat::Yes) {
+            cfg.step_prophecy_delta(1.0);
+        }
+        if window.is_key_pressed(Key::PageDown, KeyRepeat::Yes) {
+            cfg.step_prophecy_delta(-1.0);
         }
         if window.is_key_pressed(Key::X, KeyRepeat::No) {
             // Brake to lab rest frame via a single pure planar Lorentz boost
@@ -387,10 +400,13 @@ fn main() {
         if time_changed {
             let t_loop = scene.t_max - scene.t_min;
             if camera.position.t > scene.t_max || camera.position.t < scene.t_min {
-                camera.position.t =
-                    scene.t_min + (camera.position.t - scene.t_min).rem_euclid(t_loop);
+                let wrapped = scene.t_min + (camera.position.t - scene.t_min).rem_euclid(t_loop);
+                // The scene is periodic, so carry flashes along to the same moment of the loop.
+                dynamics.shift_time(wrapped - camera.position.t);
+                camera.position.t = wrapped;
             }
         }
+        dynamics.retire_flashes(camera.position.t);
 
         render_with_backend(
             gpu.as_mut(),

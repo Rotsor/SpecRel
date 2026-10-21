@@ -359,22 +359,34 @@ fast-forwarded to it.
   shadow modes, also asserts the flashes visibly light ≥ 1% of pixels);
   `worldtube_decided_at_follows_steps`.
 
-### Phase 2 — New views on static scenes
-Frontier view, Prophecy slice (+ Δ keys), Decision-Age mode with the analytic fallback, and a
-`/` key that emits a flash from the ship into `FrameDynamics` (lighting already exists from
-phase 1). All are useful before any simulation exists.
-* **Reuse from the draft:** `minkowski.rs` `future_light_ray_direction`; `renderer.rs`
-  `ViewMode::{Frontier, ProphecySlice}`, `RenderMode::DecisionAge`, `FRONTIER_RAY_OFFSET`,
-  `shade_decision_age`, `apply_causal_bubble`, `Camera4D.prophecy_delta`; `render.wgsl`
-  equivalents (`SLICE_FRONTIER`, `SLICE_PROPHECY`, `MODE_DECISION_AGE`, bubble). The bubble
-  and decision age read the frontier from `FrameDynamics` / `u.frontier_*`.
-* **Fix:** in Frontier view every hit sits ~δ outside the frontier and gets a faint ring tint;
-  the ring should only draw when `δ` is smaller than the ring width, or move the ring test to
-  `|signed_inside + δ|`.
-* **Tests:** GPU-vs-CPU diffs for each new view/mode on a static scene; analytic
-  decision-age = `T + R`.
+### Phase 2 — New views on static scenes ✅
+* `ViewMode::{Frontier, ProphecySlice}` (`G` cycles all four) and `RenderMode::DecisionAge`
+  (`M`), on CPU and WGSL; `/` emits a flash from the camera; `PageUp`/`PageDown` step the
+  prophecy Δ (`RenderConfig::prophecy_delta`, 0.5–20 s). All of this is wired in `main.rs`,
+  `web.rs`, and the `index.html` key map and buttons, and shown in the HUD and README.
+* Shared state helpers live on `FrameDynamics` (`emit_flash`, `retire_flashes`, `shift_time`,
+  `frontier_or_camera`) and `RenderConfig::step_prophecy_delta`, so both frontends call the
+  same logic. When a static scene's clock wraps, flashes shift with it.
+* **Decision age** = `T + R` (`analytic_decision_age`) for static geometry, measured from the
+  frontier if there is one, else the camera. It is **negative inside `I⁺(O)`**, and those
+  events are drawn dark slate as "undecided" rather than clamped to "just decided". The hue
+  runs 4°/s up to 240° (60 s), because the draft's 16°/s saturated to the haze's violet
+  beyond ~8 ls. Stamped geometry uses `frontier.proper_time − decided_at`.
+* **Undecided haze** (`apply_undecided_haze`, the draft's `apply_causal_bubble`) draws only in
+  the Prophecy view, which removes the draft's Frontier-view tint. The sky is left untouched
+  (no veil).
+* **Tests:** five new view/mode configs in `gpu_matches_cpu_reference`;
+  `gpu_matches_cpu_decision_age_with_frontier` (stamped tubes + an offset frontier, both views);
+  analytic age (`T + R`, and `2λ` on a boosted camera's past cone); flash slot
+  eviction/retire/shift; Δ clamping; `test_player_flash_visible_after_round_trip`.
+* **Known issue (pre-existing):** HUD line 3 overflows the 1240 px box in its longest
+  combinations (isochrones + camera-slice shadows); the Prophecy label adds two characters.
 
 ### Phase 3 — Dynamic world skeleton + scene 6 (inert)
+* **First, extract shared app state.** `main.rs` and `web.rs` duplicate all input handling
+  and time stepping. Phase 2 added three more keys to both. Move camera, config, dynamics,
+  time scale and a `handle_action(Action)` / `step(dt)` API into an `app.rs` used by both
+  frontends before adding the per-frame simulation step, so it is written once.
 * Add `src/dynamic/` with `DynWorld`, `Body`, the frontier rule and scheduler, ship-as-body,
   and the input log.
 * Add the billiards scene with **inert** pucks only (no collisions yet); their tubes grow up
