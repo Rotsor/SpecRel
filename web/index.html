@@ -151,6 +151,9 @@
       font-weight: 700;
       margin-right: 4px;
     }
+    button[data-hold] {
+      touch-action: none;
+    }
     .hint {
       font-size: 11px;
       color: var(--muted);
@@ -207,6 +210,26 @@
       <button data-key="17"><kbd>[Z]</kbd>1X/2X Res</button>
       <button data-key="18"><kbd>[R]</kbd>Reset</button>
       <button data-key="15"><kbd>[Tab]</kbd>HUD</button>
+    </div>
+    <div class="btn-row">
+      <span class="row-label">Thrust:</span>
+      <button data-hold="106"><kbd>W</kbd>Forward</button>
+      <button data-hold="107"><kbd>S</kbd>Back</button>
+      <button data-hold="109"><kbd>A</kbd>Left</button>
+      <button data-hold="108"><kbd>D</kbd>Right</button>
+      <button data-hold="110"><kbd>Space</kbd>Up</button>
+      <button data-hold="111"><kbd>C</kbd>Down</button>
+      <span class="hint">Hold to accelerate (proper acceleration in your own frame)</span>
+    </div>
+    <div class="btn-row">
+      <span class="row-label">Teleport:</span>
+      <button data-hold="114"><kbd>I</kbd>Forward</button>
+      <button data-hold="115"><kbd>K</kbd>Back</button>
+      <button data-hold="117"><kbd>J</kbd>Left</button>
+      <button data-hold="116"><kbd>L</kbd>Right</button>
+      <button data-hold="118"><kbd>U</kbd>Up</button>
+      <button data-hold="119"><kbd>O</kbd>Down</button>
+      <span class="hint">Hold to shift position at fixed coordinate time t</span>
     </div>
   </div>
 

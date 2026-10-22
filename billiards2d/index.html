@@ -1,0 +1,958 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Causal Relativistic Billiards</title>
+<style>
+  :root {
+    --bg: #070a12; --panel: #101626; --panel2: #0c1120; --border: #23304d; --text: #e4ecff;
+    --muted: #8fa3c7; --accent: #ff9944; --cyan: #66f2ff; --green: #a8ff80; --violet: #c49bff;
+    --red: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+  body { display: flex; flex-direction: column; min-height: 100vh; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding: 10px 16px 6px; }
+  header h1 { margin: 0; font-size: 15px; color: var(--accent); letter-spacing: .4px; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  header a { color: var(--cyan); font-size: 12px; margin-left: auto; }
+  main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 10px; padding: 0 16px 16px; }
+  @media (max-width: 900px) { main { grid-template-columns: minmax(0, 1fr); } }
+  .view { position: sticky; top: 8px; height: calc(100vh - 60px); min-height: 360px; background: #04060b;
+    border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  @media (max-width: 900px) { .view { position: relative; top: 0; height: 62vh; } }
+  #table { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
+  #table:active { cursor: grabbing; }
+  .overlay { position: absolute; left: 10px; top: 8px; pointer-events: none; color: var(--muted); font-size: 12px;
+    text-shadow: 0 0 4px #000; white-space: pre; }
+  .overlay b { color: var(--text); font-weight: 600; }
+  #tip { position: absolute; pointer-events: none; background: rgba(16,22,38,.95); border: 1px solid var(--border);
+    border-radius: 4px; padding: 6px 8px; font-size: 11px; white-space: pre; display: none; z-index: 2; }
+  aside { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+  section { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 10px; }
+  section h2 { margin: 0 0 8px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; font-weight: 600; }
+  select, button { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 4px;
+    font: inherit; padding: 5px 9px; cursor: pointer; }
+  button:hover, select:hover { border-color: #3b5284; }
+  button.on { border-color: var(--cyan); background: #18284a; }
+  select { width: 100%; }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .param { display: grid; grid-template-columns: 128px 1fr 52px; gap: 6px; align-items: center; margin-top: 6px; }
+  .param label { color: var(--muted); font-size: 12px; }
+  .param output { text-align: right; font-size: 12px; }
+  .param input[type=range] { width: 100%; accent-color: var(--cyan); }
+  .check { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .check input { accent-color: var(--cyan); }
+  .desc { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+  table.num { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+  table.num td { padding: 1px 0; }
+  table.num td:first-child { color: var(--muted); }
+  table.num td:last-child { text-align: right; }
+  table.num tr.total td { border-top: 1px solid var(--border); color: var(--text); padding-top: 3px; }
+  .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  canvas.chart { width: 100%; height: 130px; display: block; margin-top: 6px; }
+  .readout { white-space: pre-wrap; font-size: 12px; color: var(--text); }
+  .readout .dim { color: var(--muted); }
+  .good { color: var(--green); } .warn { color: var(--accent); } .bad { color: var(--red); }
+  details { color: var(--muted); font-size: 12px; }
+  details summary { cursor: pointer; color: var(--text); }
+  details p { margin: 6px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CAUSAL RELATIVISTIC BILLIARDS</h1>
+  <span class="sub">2D · centre-of-momentum frame · c = 1 · lengths in ball radii</span>
+  <a href="../spec-rel/">SpecRel 4D &rarr;</a>
+</header>
+<main>
+  <div class="view">
+    <canvas id="table"></canvas>
+    <div class="overlay" id="hud"></div>
+    <div id="tip"></div>
+  </div>
+  <aside>
+    <section>
+      <h2>Scenario</h2>
+      <select id="scenario"></select>
+      <div id="params"></div>
+      <p class="desc" id="scenario-desc"></p>
+    </section>
+    <section>
+      <h2>Playback</h2>
+      <div class="row">
+        <button id="play">Pause</button>
+        <button id="step">Step</button>
+        <button id="reset">Restart</button>
+        <button id="fit" class="on" title="Keep every ball in view (drag or scroll to take over)">Auto-fit</button>
+      </div>
+      <div class="param"><label for="speed">Sim speed (r/c per s)</label><input type="range" id="speed" min="-2" max="4.4" step="0.05" value="1.6" /><output id="speed-out"></output></div>
+      <label class="check"><input type="checkbox" id="show-light" checked /> Light fronts of pending contacts</label>
+      <label class="check"><input type="checkbox" id="show-vel" checked /> Velocity arrows</label>
+      <label class="check"><input type="checkbox" id="show-trail" checked /> Trails</label>
+    </section>
+    <section>
+      <h2>Conservation</h2>
+      <table class="num" id="cons"></table>
+      <canvas class="chart" id="chart-e"></canvas>
+      <canvas class="chart" id="chart-p"></canvas>
+    </section>
+    <section>
+      <h2>Scenario readout</h2>
+      <div class="readout" id="readout"></div>
+      <canvas class="chart" id="chart-h" style="display:none"></canvas>
+    </section>
+    <section>
+      <details>
+        <summary>How the causal model works</summary>
+        <p>Every ball stores its exact 4-momentum (E, p<sub>x</sub>, p<sub>y</sub>); its rest mass is &radic;(E&sup2;&minus;p&sup2;) and its velocity p/E. All balls coast in lockstep in the centre-of-momentum (CM) frame.</p>
+        <p>When two balls first touch, at event P (found exactly within the step), the collision is solved in the pair's own CM frame: elastic contacts reverse the momentum component along the contact normal, sticky ones leave both balls co-moving with a rest-mass share of the total. The two impulses cancel exactly.</p>
+        <p>But neither ball may feel its impulse until P is in the causal past of <i>every</i> point of it (|P&minus;centre| + r &le; t &minus; t<sub>P</sub>): there are no rigid bodies in relativity. Until then a ball coasts on and overlaps what it hit, like a compressible body. The violet circles are the light fronts from P; a ball changes course once the front has swept over all of it. A push therefore can't run down a line of balls faster than light.</p>
+        <p>While an impulse is pending, its 4-momentum is "in transit": it has left the balls' sum but not arrived. Conservation holds for balls + transit, to rounding error.</p>
+        <p>A ball can be hit again before it has felt the first hit (a rack, a pile-up). The new collision is then solved with its <i>effective</i> momentum: felt plus still-pending impulses. The earlier contacts become dependencies, and nobody feels the new impulse until their light fronts have crossed them too. So a ball always passes through states of an ordinary chain of two-body collisions: elastic contacts never change rest mass, and heat (rest-mass gain) comes only from sticky contacts.</p>
+        <p>Simplification: balls are drawn and collided as circles in the CM frame, not Lorentz-contracted ellipses.</p>
+      </details>
+    </section>
+  </aside>
+</main>
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------------------------
+// Relativistic kinematics (c = 1). 4-vectors are (t|E, x, y).
+// ---------------------------------------------------------------------------------------------
+
+/** Components of the 4-vector (t, x, y) in the frame moving with velocity (bx, by). */
+function boost(t, x, y, bx, by) {
+  const b2 = bx * bx + by * by;
+  if (b2 < 1e-30) return [t, x, y];
+  const g = 1 / Math.sqrt(1 - b2);
+  const bs = bx * x + by * y;
+  const k = (g - 1) * bs / b2 - g * t;
+  return [g * (t - bs), x + k * bx, y + k * by];
+}
+
+const restMass = (E, px, py) => Math.sqrt(Math.max(E * E - px * px - py * py, 0));
+
+/**
+ * Elastic contact of a and b along separation a -> b (equal lab time). In the pair's CM frame
+ * the momenta are equal and opposite; reversing the component along the contact normal keeps
+ * both energies. Returns a's 4-momentum change (b's is its negative), or null if separating.
+ */
+function elasticImpulse(Ea, ax, ay, Eb, bx_, by_, sx, sy) {
+  const E = Ea + Eb, bx = (ax + bx_) / E, by = (ay + by_) / E;
+  const s = boost(0, sx, sy, bx, by);
+  const sl = Math.hypot(s[1], s[2]);
+  const nx = s[1] / sl, ny = s[2] / sl;
+  const pa = boost(Ea, ax, ay, bx, by);
+  const along = pa[1] * nx + pa[2] * ny;
+  if (along <= 0) return null;
+  const pn = boost(pa[0], pa[1] - 2 * along * nx, pa[2] - 2 * along * ny, -bx, -by);
+  return [pn[0] - Ea, pn[1] - ax, pn[2] - ay];
+}
+
+/** Perfectly inelastic contact: each ball gets its rest-mass share of the total 4-momentum. */
+function stickyImpulse(Ea, ax, ay, Eb, bx, by) {
+  const ma = restMass(Ea, ax, ay), mb = restMass(Eb, bx, by);
+  const f = ma / (ma + mb);
+  return [(Ea + Eb) * f - Ea, (ax + bx) * f - ax, (ay + by) * f - ay];
+}
+
+// ---------------------------------------------------------------------------------------------
+// Simulation
+// ---------------------------------------------------------------------------------------------
+
+const DT = 0.01;
+const TRAIL_LEN = 160, TRAIL_EVERY = 8;
+
+class World {
+  /**
+   * bodies: [{x, y, vx, vy, m, r, sticky, color}] in the setup frame at setup time 0.
+   * They are moved to the CM frame (each worldline cut at CM time 0) unless `periodic` is set
+   * (a periodic box is only periodic in its own frame, so periodic scenarios start in the CM frame).
+   */
+  constructor(bodies, periodic) {
+    const n = this.n = bodies.length;
+    this.L = periodic || 0;
+    this.t = 0; this.stepCount = 0;
+    this.x = new Float64Array(n); this.y = new Float64Array(n);
+    this.E = new Float64Array(n); this.px = new Float64Array(n); this.py = new Float64Array(n);
+    this.m0 = new Float64Array(n); this.r = new Float64Array(n);
+    this.sticky = new Uint8Array(n); this.color = bodies.map((b) => b.color || "#e8dcc0");
+    this.firstFelt = new Float64Array(n).fill(NaN);
+    this.pending = bodies.map(() => []);
+    this.touching = new Uint8Array(n * n);
+    this.pairPending = new Uint8Array(n * n);
+    this.contacts = [];          // drawn light fronts: {t, x, y, left}
+    this.contactCount = 0; this.spacelike = 0;
+    this.firstContact = null;
+    this.trail = new Float32Array(n * TRAIL_LEN * 2); this.trailHead = 0; this.trailFill = 0;
+
+    let E = 0, Px = 0, Py = 0;
+    for (const b of bodies) {
+      const g = 1 / Math.sqrt(1 - b.vx * b.vx - b.vy * b.vy);
+      E += g * b.m; Px += g * b.m * b.vx; Py += g * b.m * b.vy;
+    }
+    const bx = this.L ? 0 : Px / E, by = this.L ? 0 : Py / E;
+    this.cmBeta = [bx, by];
+    bodies.forEach((b, i) => {
+      // The event on b's worldline at CM time 0: gamma (t - beta.x) = 0.
+      const bv = bx * b.vx + by * b.vy;
+      const te = (bx * b.x + by * b.y) / (1 - bv);
+      const ev = boost(te, b.x + b.vx * te, b.y + b.vy * te, bx, by);
+      const g = 1 / Math.sqrt(1 - b.vx * b.vx - b.vy * b.vy);
+      const p = boost(g * b.m, g * b.m * b.vx, g * b.m * b.vy, bx, by);
+      this.x[i] = ev[1]; this.y[i] = ev[2];
+      this.E[i] = p[0]; this.px[i] = p[1]; this.py[i] = p[2];
+      this.m0[i] = b.m; this.r[i] = b.r; this.sticky[i] = b.sticky ? 1 : 0;
+    });
+    this.effE = this.E.slice(); this.effPx = this.px.slice(); this.effPy = this.py.slice();
+    this.wrapAll();
+    this.initial = this.totals();
+    this.initialP = Array.from({ length: n }, (_, i) => [this.E[i], this.px[i], this.py[i]]);
+    // Contacts already overlapping at the start (none in the built-in scenarios) never fire.
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+      const [dx, dy] = this.delta(i, j);
+      if (dx * dx + dy * dy < (this.r[i] + this.r[j]) ** 2) this.touching[i * n + j] = 1;
+    }
+    this.pushTrail();
+  }
+
+  wrap(v) { const L = this.L; return L ? v - L * Math.round(v / L) : v; }
+  wrapAll() { if (this.L) for (let i = 0; i < this.n; i++) { this.x[i] = this.wrap(this.x[i]); this.y[i] = this.wrap(this.y[i]); } }
+  delta(i, j) { return [this.wrap(this.x[j] - this.x[i]), this.wrap(this.y[j] - this.y[i])]; }
+
+  /** Total 4-momentum of the balls and of the impulses in transit, plus the energy split. */
+  totals() {
+    let E = 0, Px = 0, Py = 0, rest0 = 0, heat = 0, kin = 0, tE = 0, tx = 0, ty = 0;
+    let hMax = -Infinity, hMin = Infinity;
+    for (let i = 0; i < this.n; i++) {
+      const m = restMass(this.E[i], this.px[i], this.py[i]);
+      E += this.E[i]; Px += this.px[i]; Py += this.py[i];
+      rest0 += this.m0[i]; heat += m - this.m0[i]; kin += this.E[i] - m;
+      const h = (m - this.m0[i]) / this.m0[i];
+      if (h > hMax) hMax = h; if (h < hMin) hMin = h;
+      for (const imp of this.pending[i]) { tE += imp.dE; tx += imp.dx; ty += imp.dy; }
+    }
+    return { E, Px, Py, rest0, heat, kin, tE, tx, ty, hMax, hMin,
+      allE: E + tE, allPx: Px + tx, allPy: Py + ty };
+  }
+
+  /** Register a contact between i and j at event (tc, cx, cy) with separation (sx, sy) i -> j. */
+  //
+  // The collision is solved with each ball's *effective* 4-momentum: what it has felt plus the
+  // impulses already dealt to it but still on their way. Those earlier contacts become
+  // dependencies of this one, and nobody feels this impulse before every dependency's light front
+  // has crossed them too. So a ball's felt states are always prefixes of a chain of ordinary
+  // two-body collisions (never an inconsistent mix), and every change still waits for its causes.
+  contact(i, j, tc, cx, cy, sx, sy) {
+    const n = this.n, eE = this.effE, ex = this.effPx, ey = this.effPy;
+    const closing = (ex[j] / eE[j] - ex[i] / eE[i]) * sx + (ey[j] / eE[j] - ey[i] / eE[i]) * sy < 0;
+    if (!closing) return;
+    const d = this.sticky[i] || this.sticky[j]
+      ? stickyImpulse(eE[i], ex[i], ey[i], eE[j], ex[j], ey[j])
+      : elasticImpulse(eE[i], ex[i], ey[i], eE[j], ex[j], ey[j], sx, sy);
+    if (!d) return;
+    const c = { t: tc, x: cx, y: cy, left: 2 };
+    const deps = new Set([c]);
+    for (const imp of this.pending[i]) for (const e of imp.deps) deps.add(e);
+    for (const imp of this.pending[j]) for (const e of imp.deps) deps.add(e);
+    const depList = [...deps];
+    const pair = i * n + j;
+    this.pending[i].push({ dE: d[0], dx: d[1], dy: d[2], pair, c, deps: depList });
+    this.pending[j].push({ dE: -d[0], dx: -d[1], dy: -d[2], pair, c, deps: depList });
+    eE[i] += d[0]; ex[i] += d[1]; ey[i] += d[2];
+    eE[j] -= d[0]; ex[j] -= d[1]; ey[j] -= d[2];
+    this.pairPending[pair] = 2;
+    this.contacts.push(c);
+    this.contactCount++;
+    if (!this.firstContact) this.firstContact = c;
+  }
+
+  step() {
+    const n = this.n, x = this.x, y = this.y, E = this.E, px = this.px, py = this.py, r = this.r;
+    const t0 = this.t, t1 = t0 + DT;
+
+    // 1. Coast.
+    for (let i = 0; i < n; i++) { x[i] += px[i] / E[i] * DT; y[i] += py[i] / E[i] * DT; }
+    this.wrapAll();
+    this.t = t1; this.stepCount++;
+
+    // 2. Contacts. A new contact is placed exactly where the two circles first touched during
+    //    the step. A pair that stays overlapped re-contacts only once both have felt the last
+    //    impulse and they are still closing (e.g. pushed together again by a third ball).
+    for (let i = 0; i < n; i++) {
+      const vxi = px[i] / E[i], vyi = py[i] / E[i], ri = r[i];
+      for (let j = i + 1; j < n; j++) {
+        let dx = x[j] - x[i], dy = y[j] - y[i];
+        if (this.L) { dx = this.wrap(dx); dy = this.wrap(dy); }
+        const R = ri + r[j];
+        const pair = i * n + j;
+        if (dx * dx + dy * dy >= R * R) { this.touching[pair] = 0; continue; }
+        const dvx = px[j] / E[j] - vxi, dvy = py[j] / E[j] - vyi;
+        if (!this.touching[pair]) {
+          this.touching[pair] = 1;
+          // |d0 + dv s| = R for the step-start separation d0, earliest s in [0, DT].
+          const d0x = dx - dvx * DT, d0y = dy - dvy * DT;
+          const a = dvx * dvx + dvy * dvy, b = 2 * (d0x * dvx + d0y * dvy), c = d0x * d0x + d0y * d0y - R * R;
+          let s = 0;
+          if (c > 0 && a > 0) s = Math.min(DT, Math.max(0, (-b - Math.sqrt(Math.max(b * b - 4 * a * c, 0))) / (2 * a)));
+          const back = DT - s;
+          const xi = x[i] - vxi * back, yi = y[i] - vyi * back;
+          const sx = d0x + dvx * s, sy = d0y + dvy * s;
+          const f = ri / R;
+          this.contact(i, j, t0 + s, this.wrap(xi + sx * f), this.wrap(yi + sy * f), sx, sy);
+        } else if (this.pairPending[pair] === 0) {
+          const f = ri / R;
+          this.contact(i, j, t1, this.wrap(x[i] + dx * f), this.wrap(y[i] + dy * f), dx, dy);
+        }
+      }
+    }
+
+    // 3. Feel every impulse whose news (and its dependencies' news) has crossed the whole ball:
+    //    |P - centre| + r <= t - tP for every contact event P it depends on.
+    for (let i = 0; i < n; i++) {
+      const list = this.pending[i];
+      if (!list.length) continue;
+      let kept = 0;
+      for (let k = 0; k < list.length; k++) {
+        const imp = list[k];
+        let reached = kept === 0; // a chain: never feel an impulse before the ones it builds on
+        if (reached) for (const P of imp.deps) {
+          if (Math.hypot(this.wrap(P.x - x[i]), this.wrap(P.y - y[i])) + r[i] > t1 - P.t + 1e-12) { reached = false; break; }
+        }
+        if (reached) {
+          E[i] += imp.dE; px[i] += imp.dx; py[i] += imp.dy;
+          if (E[i] * E[i] <= px[i] * px[i] + py[i] * py[i]) this.spacelike++;
+          this.pairPending[imp.pair]--;
+          imp.c.left--;
+          if (imp.c.left === 0) imp.c.done = t1;
+          if (Number.isNaN(this.firstFelt[i])) this.firstFelt[i] = t1;
+        } else list[kept++] = imp;
+      }
+      list.length = kept;
+    }
+
+    if (this.stepCount % TRAIL_EVERY === 0) this.pushTrail();
+    if (this.contacts.length > 400 || (this.stepCount & 63) === 0) {
+      this.contacts = this.contacts.filter((c) => c.left > 0 || t1 - c.done < 3);
+    }
+  }
+
+  pushTrail() {
+    const n = this.n, base = this.trailHead * n * 2;
+    for (let i = 0; i < n; i++) { this.trail[base + 2 * i] = this.x[i]; this.trail[base + 2 * i + 1] = this.y[i]; }
+    this.trailHead = (this.trailHead + 1) % TRAIL_LEN;
+    this.trailFill = Math.min(this.trailFill + 1, TRAIL_LEN);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scenarios: bodies in a convenient setup frame; World moves them to the CM frame.
+// ---------------------------------------------------------------------------------------------
+
+const POOL = ["#f5c542", "#3d6fe0", "#e0453d", "#7a4fc4", "#f0883e", "#3fa45b", "#8c3b2e", "#222630",
+  "#f5c542", "#3d6fe0", "#e0453d", "#7a4fc4", "#f0883e", "#3fa45b", "#8c3b2e"];
+const CUE = "#f4f1e8";
+const fmt = (v, d = 3) => (Number.isFinite(v) ? (Math.abs(v) < 1e-12 ? 0 : v).toFixed(d) : "—");
+const deg = (rad) => (rad * 180 / Math.PI).toFixed(1) + "°";
+const angle = (ax, ay, bx, by) => Math.acos(Math.max(-1, Math.min(1, (ax * bx + ay * by) / (Math.hypot(ax, ay) * Math.hypot(bx, by)))));
+const settled = (w) => w.contactCount > 0 && w.pending.every((l) => l.length === 0);
+
+const SCENARIOS = [
+  {
+    name: "Two balls: impact offset",
+    desc: "A projectile hits a ball at rest in the setup frame, offset from centre by a fraction of the contact distance. Shown in the CM frame, where both deflect by the same angle. Back in the target's frame, relativity closes the famous 90° opening angle of equal-mass billiards.",
+    params: [
+      { key: "v", label: "Projectile speed", min: 0.05, max: 0.99, step: 0.01, value: 0.8 },
+      { key: "b", label: "Offset (b / 2r)", min: 0, max: 0.99, step: 0.01, value: 0.5 },
+      { key: "mr", label: "Target mass ratio", min: 0.2, max: 5, step: 0.05, value: 1 },
+      { key: "sticky", label: "Sticky", type: "check", value: false },
+    ],
+    build(p) {
+      const rB = Math.cbrt(p.mr), R = 1 + rB;
+      return [
+        { x: -4 - R, y: p.b * R, vx: p.v, vy: 0, m: 1, r: 1, sticky: p.sticky, color: CUE },
+        { x: 0, y: 0, vx: 0, vy: 0, m: p.mr, r: rB, sticky: p.sticky, color: POOL[2] },
+      ];
+    },
+    readout(w, p) {
+      const out = [];
+      if (!w.contactCount) return "Waiting for contact…";
+      if (!settled(w)) return "Contact made; impulses in transit…";
+      const [a0] = w.initialP;
+      if (p.sticky) out.push("Stuck together: both balls at rest in the CM frame");
+      else out.push(`CM-frame deflection of the projectile: ${deg(angle(a0[1], a0[2], w.px[0], w.py[0]))}`);
+      if (!p.sticky && p.b > 0) {
+        // Final momenta back in the target's (setup) frame.
+        const [bx, by] = w.cmBeta;
+        const a = boost(w.E[0], w.px[0], w.py[0], -bx, -by), b = boost(w.E[1], w.px[1], w.py[1], -bx, -by);
+        out.push(`Opening angle in the target's frame: ${deg(angle(a[1], a[2], b[1], b[2]))}`);
+        if (Math.abs(p.mr - 1) < 1e-9) out.push(`<span class="dim">(Newtonian equal-mass billiards: always 90°)</span>`);
+      }
+      const t = w.totals();
+      out.push(`Heat generated: ${fmt(t.heat, 4)} (${fmt(100 * t.heat / (t.E - t.rest0), 1)}% of the kinetic energy)`);
+      return out.join("\n");
+    },
+  },
+  {
+    name: "Newton's cradle",
+    desc: "A striker hits a line of resting balls. Each ball only moves once the light front from its contact has swept over all of it, so the push crawls down the line just under light speed, and the balls squeeze into each other while they wait.",
+    params: [
+      { key: "n", label: "Balls in line", min: 2, max: 14, step: 1, value: 7 },
+      { key: "gap", label: "Gap (r)", min: 0, max: 1, step: 0.01, value: 0.05 },
+      { key: "v", label: "Striker speed", min: 0.05, max: 0.99, step: 0.01, value: 0.6 },
+      { key: "ms", label: "Striker mass", min: 0.2, max: 5, step: 0.05, value: 1 },
+    ],
+    build(p) {
+      const rs = Math.cbrt(p.ms);
+      const bodies = [{ x: -3 - rs - 1, y: 0, vx: p.v, vy: 0, m: p.ms, r: rs, color: CUE }];
+      for (let k = 0; k < p.n; k++) bodies.push({ x: k * (2 + p.gap), y: 0, vx: 0, vy: 0, m: 1, r: 1, color: POOL[k % 7] });
+      return bodies;
+    },
+    readout(w) {
+      const c = w.firstContact;
+      if (!c) return "Waiting for the striker…";
+      const last = w.n - 1;
+      if (Number.isNaN(w.firstFelt[last])) {
+        const moved = w.firstFelt.reduce((s, f) => s + (Number.isNaN(f) ? 0 : 1), 0) - 1;
+        return `Push travelling… ${Math.max(moved, 0)} of ${w.n - 1} balls set moving`;
+      }
+      const dt = w.firstFelt[last] - c.t;
+      // Light from the first contact needs this long to cover all of the last ball, wherever it was.
+      const [fx, fy] = w.feltAt(last);
+      const reach = Math.hypot(fx - c.x, fy - c.y) + w.r[last];
+      const lines = [
+        `First contact → last ball moves: ${fmt(dt, 2)} r/c`,
+        `Light from the first contact covers the last ball in: ${fmt(reach, 2)} r/c`,
+        `Effective signal speed: <b class="${reach / dt <= 1 + 1e-9 ? "good" : "bad"}">${fmt(reach / dt, 3)} c</b>`,
+        `<span class="dim">A rigid line would pass the push instantly; here it is capped at c.</span>`,
+      ];
+      const sp = Math.hypot(w.px[last], w.py[last]) / w.E[last];
+      lines.push(`Last ball speed now: ${fmt(sp, 3)} (CM frame)`);
+      return lines.join("\n");
+    },
+  },
+  {
+    name: "Billiard break",
+    desc: "A cue ball breaks a 15-ball rack. Contacts overlap: balls are hit again before they have felt the last hit, so a lot of momentum is briefly in transit, and the balls alone don't conserve it. Make the rack sticky to turn the break into heat.",
+    params: [
+      { key: "v", label: "Cue speed", min: 0.05, max: 0.99, step: 0.01, value: 0.7 },
+      { key: "b", label: "Cue offset (r)", min: -1, max: 1, step: 0.01, value: 0.05 },
+      { key: "gap", label: "Rack gap (r)", min: 0, max: 0.5, step: 0.01, value: 0.03 },
+      { key: "sticky", label: "Sticky rack", type: "check", value: false },
+    ],
+    build(p) {
+      const bodies = [{ x: -12, y: p.b, vx: p.v, vy: 0, m: 1, r: 1, color: CUE }];
+      const d = 2 + p.gap;
+      let k = 0;
+      for (let row = 0; row < 5; row++) for (let c = 0; c <= row; c++) {
+        bodies.push({ x: row * d * Math.sqrt(3) / 2, y: (c - row / 2) * d, vx: 0, vy: 0, m: 1, r: 1, sticky: p.sticky, color: POOL[k++] });
+      }
+      return bodies;
+    },
+    readout(w) {
+      const t = w.totals();
+      return [
+        `Contacts so far: ${w.contactCount}`,
+        `Hottest ball ΔM/M₀: ${fmt(t.hMax, 5)}   coldest: ${fmt(t.hMin, 5)}`,
+        `Heat Σ(M−M₀): ${fmt(t.heat, 5)} of initial kinetic ${fmt(w.initial.kin, 4)}`,
+      ].join("\n");
+    },
+  },
+  {
+    name: "Converging ring",
+    desc: "Balls on a ring all fly at the centre at once. With sticky balls every bit of kinetic energy ends up as rest mass: the clump sits still, heavier than its parts.",
+    params: [
+      { key: "n", label: "Balls", min: 2, max: 16, step: 1, value: 8 },
+      { key: "v", label: "Speed", min: 0.05, max: 0.99, step: 0.01, value: 0.8 },
+      { key: "jit", label: "Aim jitter (r)", min: 0, max: 1, step: 0.01, value: 0 },
+      { key: "sticky", label: "Sticky", type: "check", value: true },
+    ],
+    build(p) {
+      const R = Math.max(8, 2.6 * p.n / Math.PI);
+      let seed = 12345;
+      const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff) * 2 - 1;
+      return Array.from({ length: p.n }, (_, k) => {
+        const a = (2 * Math.PI * k) / p.n, j = p.jit * rnd();
+        const ux = -Math.cos(a), uy = -Math.sin(a);
+        return { x: -ux * R - uy * j, y: -uy * R + ux * j, vx: p.v * ux, vy: p.v * uy, m: 1, r: 1, sticky: p.sticky, color: POOL[k % 15] };
+      });
+    },
+    readout(w) {
+      const t = w.totals();
+      return [
+        `Kinetic: ${fmt(t.kin, 4)}   heat: ${fmt(t.heat, 4)}   in transit: ${fmt(t.tE, 4)}`,
+        `Converted to heat: ${fmt(100 * t.heat / w.initial.kin, 1)}% of the initial kinetic energy`,
+        `Rest mass now ${fmt(t.rest0 + t.heat, 4)} vs ${fmt(t.rest0, 4)} at the start`,
+      ].join("\n");
+    },
+  },
+  {
+    name: "Relativistic gas (periodic box)",
+    desc: "Balls in a periodic box (it wraps around), all at the same speed in random directions, in pairs of opposite velocity so the total momentum is exactly zero. Collisions spread the speeds out; sticky balls turn the motion into heat.",
+    params: [
+      { key: "n", label: "Balls", min: 10, max: 240, step: 2, value: 90 },
+      { key: "v", label: "Initial speed", min: 0.05, max: 0.98, step: 0.01, value: 0.7 },
+      { key: "fill", label: "Packing fraction", min: 0.05, max: 0.45, step: 0.01, value: 0.22 },
+      { key: "sf", label: "Sticky fraction", min: 0, max: 1, step: 0.05, value: 0 },
+    ],
+    periodic: (p) => Math.sqrt((p.n * Math.PI) / p.fill),
+    build(p) {
+      const L = this.periodic(p);
+      let seed = 987654;
+      const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+      const out = [];
+      const wrap = (v) => v - L * Math.round(v / L);
+      for (let k = 0; k < p.n; k += 2) {
+        const a = 2 * Math.PI * rnd();
+        for (const s of [1, -1]) {
+          let x, y, ok, tries = 0;
+          do {
+            x = (rnd() - 0.5) * L; y = (rnd() - 0.5) * L; ok = true;
+            for (const b of out) { const dx = wrap(b.x - x), dy = wrap(b.y - y); if (dx * dx + dy * dy < 4.4) { ok = false; break; } }
+          } while (!ok && ++tries < 2000);
+          out.push({ x, y, vx: s * p.v * Math.cos(a), vy: s * p.v * Math.sin(a), m: 1, r: 1,
+            sticky: rnd() < p.sf, color: `hsl(${(200 + 140 * rnd()) | 0} 45% 62%)` });
+        }
+      }
+      return out;
+    },
+    readout(w) {
+      const t = w.totals();
+      return [
+        `Contacts: ${w.contactCount}    ⟨kinetic⟩ per ball: ${fmt(t.kin / w.n, 4)}`,
+        `Heat Σ(M−M₀): ${fmt(t.heat, 5)}   hottest ΔM/M₀: ${fmt(t.hMax, 4)}`,
+        `<span class="dim">Speed histogram (0 … c):</span>`,
+      ].join("\n");
+    },
+    histogram: true,
+  },
+];
+
+// ---------------------------------------------------------------------------------------------
+// UI and state
+// ---------------------------------------------------------------------------------------------
+
+const $ = (id) => document.getElementById(id);
+const canvas = $("table"), ctx = canvas.getContext("2d");
+let scenario = SCENARIOS[0], params = {}, world = null, history = null;
+let playing = true, autoFit = true;
+const cam = { cx: 0, cy: 0, scale: 20 };
+let hover = -1;
+
+SCENARIOS.forEach((s, i) => $("scenario").add(new Option(s.name, i)));
+$("scenario").addEventListener("change", (e) => selectScenario(SCENARIOS[+e.target.value]));
+
+function selectScenario(s) {
+  scenario = s;
+  params = {};
+  const box = $("params");
+  box.innerHTML = "";
+  for (const q of s.params) {
+    params[q.key] = q.value;
+    if (q.type === "check") {
+      const lab = document.createElement("label");
+      lab.className = "check";
+      lab.innerHTML = `<input type="checkbox" ${q.value ? "checked" : ""}/> ${q.label}`;
+      lab.firstChild.addEventListener("change", (e) => { params[q.key] = e.target.checked; restart(); });
+      box.appendChild(lab);
+    } else {
+      const row = document.createElement("div");
+      row.className = "param";
+      row.innerHTML = `<label>${q.label}</label><input type="range" min="${q.min}" max="${q.max}" step="${q.step}" value="${q.value}"/><output>${q.value}</output>`;
+      const input = row.children[1], out = row.children[2];
+      input.addEventListener("input", () => { params[q.key] = +input.value; out.textContent = input.value; restart(); });
+      box.appendChild(row);
+    }
+  }
+  $("scenario-desc").textContent = s.desc;
+  $("chart-h").style.display = s.histogram ? "block" : "none";
+  autoFit = true; $("fit").classList.add("on");
+  restart(true);
+}
+
+function restart(snapCamera) {
+  const L = scenario.periodic ? scenario.periodic(params) : 0;
+  world = new World(scenario.build(params), L);
+  // The Newton's-cradle readout needs where the last ball was when it first moved.
+  world.feltPos = new Float64Array(world.n * 2).fill(NaN);
+  history = { t: [], kin: [], heat: [], tE: [], sum: [], pxB: [], pyB: [], pxT: [], pyT: [], pAll: [] };
+  sample();
+  if (snapCamera || autoFit) fitCamera(1);
+}
+
+World.prototype.feltAt = function (i) { return [this.feltPos[2 * i], this.feltPos[2 * i + 1]]; };
+
+function sample() {
+  const t = world.totals();
+  const h = history;
+  h.t.push(world.t); h.kin.push(t.kin); h.heat.push(t.heat); h.tE.push(t.tE);
+  h.sum.push(t.kin + t.heat + t.tE);
+  h.pxB.push(t.Px); h.pyB.push(t.Py); h.pxT.push(t.tx); h.pyT.push(t.ty);
+  h.pAll.push(Math.hypot(t.allPx, t.allPy));
+  if (h.t.length > 1600) for (const k in h) h[k] = h[k].filter((_, i) => i % 2 === 0);
+}
+
+function stepWorld() {
+  const before = world.firstFelt.slice();
+  world.step();
+  for (let i = 0; i < world.n; i++) {
+    if (Number.isNaN(before[i]) && !Number.isNaN(world.firstFelt[i])) {
+      world.feltPos[2 * i] = world.x[i]; world.feltPos[2 * i + 1] = world.y[i];
+    }
+  }
+}
+
+// Playback controls
+const speedOf = () => Math.pow(2, +$("speed").value);
+const showSpeed = () => ($("speed-out").textContent = speedOf().toFixed(speedOf() < 1 ? 2 : 1));
+$("speed").addEventListener("input", showSpeed); showSpeed();
+$("play").addEventListener("click", () => { playing = !playing; $("play").textContent = playing ? "Pause" : "Play"; });
+$("step").addEventListener("click", () => { playing = false; $("play").textContent = "Play"; for (let k = 0; k < 5; k++) stepWorld(); sample(); });
+$("reset").addEventListener("click", () => restart());
+$("fit").addEventListener("click", () => { autoFit = !autoFit; $("fit").classList.toggle("on", autoFit); });
+window.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" && e.target.type === "range") return;
+  if (e.code === "Space") { e.preventDefault(); $("play").click(); }
+  else if (e.code === "KeyR") restart();
+  else if (e.code === "Period") $("step").click();
+});
+
+// Camera: drag to pan, wheel / pinch to zoom; either turns auto-fit off.
+const drag = { on: false, x: 0, y: 0, pts: new Map(), pinch: 0 };
+canvas.addEventListener("pointerdown", (e) => {
+  canvas.setPointerCapture(e.pointerId);
+  drag.pts.set(e.pointerId, [e.clientX, e.clientY]);
+  drag.on = true; drag.x = e.clientX; drag.y = e.clientY; drag.pinch = 0;
+});
+canvas.addEventListener("pointermove", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  if (!drag.on) { pick(e.clientX - rect.left, e.clientY - rect.top); return; }
+  drag.pts.set(e.pointerId, [e.clientX, e.clientY]);
+  if (drag.pts.size === 2) {
+    const [a, b] = [...drag.pts.values()];
+    const d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+    if (drag.pinch) zoomAt(d / drag.pinch, (a[0] + b[0]) / 2 - rect.left, (a[1] + b[1]) / 2 - rect.top);
+    drag.pinch = d;
+    return;
+  }
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  if (dx || dy) setManual();
+  cam.cx -= dx / cam.scale; cam.cy += dy / cam.scale;
+  drag.x = e.clientX; drag.y = e.clientY;
+});
+const endDrag = (e) => { drag.pts.delete(e.pointerId); drag.on = drag.pts.size > 0; drag.pinch = 0;
+  if (drag.on) { const [p] = drag.pts.values(); drag.x = p[0]; drag.y = p[1]; } };
+canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointercancel", endDrag);
+canvas.addEventListener("pointerleave", () => { hover = -1; $("tip").style.display = "none"; });
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  zoomAt(Math.exp(-e.deltaY * 0.0015), e.clientX - rect.left, e.clientY - rect.top);
+}, { passive: false });
+function setManual() { if (autoFit) { autoFit = false; $("fit").classList.remove("on"); } }
+function zoomAt(f, sx, sy) {
+  setManual();
+  const [wx, wy] = toWorld(sx, sy);
+  cam.scale = Math.min(400, Math.max(0.5, cam.scale * f));
+  cam.cx = wx - (sx - viewW / 2) / cam.scale; cam.cy = wy + (sy - viewH / 2) / cam.scale;
+}
+
+let viewW = 0, viewH = 0, dpr = 1;
+const toScreen = (x, y) => [viewW / 2 + (x - cam.cx) * cam.scale, viewH / 2 - (y - cam.cy) * cam.scale];
+const toWorld = (sx, sy) => [cam.cx + (sx - viewW / 2) / cam.scale, cam.cy - (sy - viewH / 2) / cam.scale];
+
+function fitCamera(alpha) {
+  let x0, x1, y0, y1;
+  if (world.L) { x0 = y0 = -world.L / 2; x1 = y1 = world.L / 2; }
+  else {
+    x0 = y0 = Infinity; x1 = y1 = -Infinity;
+    for (let i = 0; i < world.n; i++) {
+      const r = world.r[i];
+      x0 = Math.min(x0, world.x[i] - r); x1 = Math.max(x1, world.x[i] + r);
+      y0 = Math.min(y0, world.y[i] - r); y1 = Math.max(y1, world.y[i] + r);
+    }
+  }
+  const pad = 1.15;
+  const w = Math.max(x1 - x0, 12) * pad, h = Math.max(y1 - y0, 12) * pad;
+  const scale = Math.min(viewW / w, viewH / h);
+  const k = alpha;
+  cam.cx += ((x0 + x1) / 2 - cam.cx) * k;
+  cam.cy += ((y0 + y1) / 2 - cam.cy) * k;
+  // Zoom out quickly, zoom back in slowly so the view doesn't breathe.
+  const ks = scale < cam.scale ? Math.min(1, k * 3) : k * 0.3;
+  cam.scale += (scale - cam.scale) * ks;
+}
+
+function pick(sx, sy) {
+  const [wx, wy] = toWorld(sx, sy);
+  hover = -1;
+  for (let i = 0; i < world.n; i++) {
+    if (Math.hypot(world.wrap(world.x[i] - wx), world.wrap(world.y[i] - wy)) < world.r[i]) { hover = i; break; }
+  }
+  const tip = $("tip");
+  if (hover < 0) { tip.style.display = "none"; return; }
+  tip.style.display = "block";
+  tip.style.left = Math.min(sx + 14, viewW - 200) + "px";
+  tip.style.top = (sy + 14) + "px";
+}
+
+function heatColor(base, h) {
+  // h = ΔM/M₀: heat turns a ball toward glowing orange-white, a deficit toward blue.
+  if (Math.abs(h) < 1e-9) return base;
+  const k = Math.min(1, Math.abs(h) * 4);
+  return h > 0 ? `color-mix(in srgb, ${base} ${100 - 85 * k}%, #ffa040)` : `color-mix(in srgb, ${base} ${100 - 85 * k}%, #4080ff)`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Drawing
+// ---------------------------------------------------------------------------------------------
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  viewW = rect.width; viewH = rect.height;
+  canvas.width = Math.round(viewW * dpr); canvas.height = Math.round(viewH * dpr);
+  for (const id of ["chart-e", "chart-p", "chart-h"]) {
+    const c = $(id), r = c.getBoundingClientRect();
+    if (r.width) { c.width = Math.round(r.width * dpr); c.height = Math.round(r.height * dpr); }
+  }
+}
+window.addEventListener("resize", resize);
+
+function drawWorld() {
+  const w = world;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#04060b";
+  ctx.fillRect(0, 0, viewW, viewH);
+
+  // Grid at a "nice" spacing.
+  const step = Math.pow(10, Math.ceil(Math.log10(60 / cam.scale)));
+  const grid = step / 2 * cam.scale >= 30 ? step / 2 : step;
+  const [gx0, gy1] = toWorld(0, 0), [gx1, gy0] = toWorld(viewW, viewH);
+  ctx.strokeStyle = "#111a2c"; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let gx = Math.ceil(gx0 / grid) * grid; gx <= gx1; gx += grid) { const [sx] = toScreen(gx, 0); ctx.moveTo(sx, 0); ctx.lineTo(sx, viewH); }
+  for (let gy = Math.ceil(gy0 / grid) * grid; gy <= gy1; gy += grid) { const [, sy] = toScreen(0, gy); ctx.moveTo(0, sy); ctx.lineTo(viewW, sy); }
+  ctx.stroke();
+
+  if (w.L) {
+    const [ax, ay] = toScreen(-w.L / 2, w.L / 2);
+    ctx.strokeStyle = "#2b3a5e"; ctx.setLineDash([6, 6]);
+    ctx.strokeRect(ax, ay, w.L * cam.scale, w.L * cam.scale);
+    ctx.setLineDash([]);
+  }
+
+  // The CM (centre of energy) stays put: mark the origin.
+  const [ox, oy] = toScreen(0, 0);
+  ctx.strokeStyle = "#2b3a5e"; ctx.beginPath();
+  ctx.moveTo(ox - 6, oy); ctx.lineTo(ox + 6, oy); ctx.moveTo(ox, oy - 6); ctx.lineTo(ox, oy + 6); ctx.stroke();
+
+  if ($("show-trail").checked && w.trailFill > 1) {
+    ctx.lineWidth = 1.2;
+    for (let i = 0; i < w.n; i++) {
+      ctx.strokeStyle = w.color[i]; ctx.globalAlpha = 0.28;
+      ctx.beginPath();
+      let px = 0, py = 0;
+      for (let k = 0; k < w.trailFill; k++) {
+        const slot = (w.trailHead - w.trailFill + k + TRAIL_LEN) % TRAIL_LEN;
+        const x = w.trail[(slot * w.n + i) * 2], y = w.trail[(slot * w.n + i) * 2 + 1];
+        const [sx, sy] = toScreen(x, y);
+        if (k === 0 || (w.L && (Math.abs(x - px) > w.L / 2 || Math.abs(y - py) > w.L / 2))) ctx.moveTo(sx, sy);
+        else ctx.lineTo(sx, sy);
+        px = x; py = y;
+      }
+      const [sx, sy] = toScreen(w.x[i], w.y[i]);
+      if (!(w.L && (Math.abs(w.x[i] - px) > w.L / 2 || Math.abs(w.y[i] - py) > w.L / 2))) ctx.lineTo(sx, sy);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // Balls (overlaps are real: a ball coasts into what it hit until the news arrives).
+  for (let i = 0; i < w.n; i++) {
+    const m = restMass(w.E[i], w.px[i], w.py[i]);
+    const h = (m - w.m0[i]) / w.m0[i];
+    const [sx, sy] = toScreen(w.x[i], w.y[i]);
+    const rs = w.r[i] * cam.scale;
+    if (sx < -rs || sx > viewW + rs || sy < -rs || sy > viewH + rs) continue;
+    if (h > 1e-4) {
+      const g = ctx.createRadialGradient(sx, sy, rs * 0.8, sx, sy, rs * (1.4 + Math.min(h * 6, 1.2)));
+      g.addColorStop(0, `rgba(255,150,60,${Math.min(0.55, 0.15 + h * 3)})`); g.addColorStop(1, "rgba(255,150,60,0)");
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(sx, sy, rs * 2.6, 0, 2 * Math.PI); ctx.fill();
+    }
+    ctx.globalAlpha = 0.82;
+    ctx.fillStyle = heatColor(w.color[i], h);
+    ctx.beginPath(); ctx.arc(sx, sy, rs, 0, 2 * Math.PI); ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = i === hover ? 2 : 1;
+    ctx.strokeStyle = w.pending[i].length ? "#c49bff" : i === hover ? "#fff" : "rgba(255,255,255,.35)";
+    ctx.stroke();
+  }
+
+  // Light fronts from contact events, until both balls have felt the contact.
+  if ($("show-light").checked) {
+    for (const c of w.contacts) {
+      const [sx, sy] = toScreen(c.x, c.y);
+      const age = w.t - c.t;
+      if (c.left > 0) {
+        ctx.strokeStyle = "rgba(196,155,255,.75)"; ctx.lineWidth = 1.2;
+        ctx.beginPath(); ctx.arc(sx, sy, Math.max(age, 0) * cam.scale, 0, 2 * Math.PI); ctx.stroke();
+        ctx.fillStyle = "#c49bff";
+      } else {
+        ctx.fillStyle = `rgba(196,155,255,${Math.max(0, 1 - (w.t - c.done) / 3) * 0.7})`;
+      }
+      ctx.beginPath(); ctx.arc(sx, sy, 2.5, 0, 2 * Math.PI); ctx.fill();
+    }
+  }
+
+  if ($("show-vel").checked) {
+    ctx.strokeStyle = "#66f2ff"; ctx.fillStyle = "#66f2ff"; ctx.lineWidth = 1.5;
+    for (let i = 0; i < w.n; i++) {
+      const vx = w.px[i] / w.E[i], vy = w.py[i] / w.E[i], v = Math.hypot(vx, vy);
+      if (v < 1e-3) continue;
+      const len = 2.2 * w.r[i] * cam.scale * v; // arrow length ∝ speed; c = 2.2 radii
+      const [sx, sy] = toScreen(w.x[i], w.y[i]);
+      const ex = sx + vx / v * len, ey = sy - vy / v * len;
+      ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(ex, ey); ctx.stroke();
+      const a = Math.atan2(ey - sy, ex - sx), hs = Math.min(7, len * 0.4);
+      ctx.beginPath(); ctx.moveTo(ex, ey);
+      ctx.lineTo(ex - hs * Math.cos(a - 0.45), ey - hs * Math.sin(a - 0.45));
+      ctx.lineTo(ex - hs * Math.cos(a + 0.45), ey - hs * Math.sin(a + 0.45)); ctx.fill();
+    }
+  }
+
+  const [bx, by] = w.cmBeta, b = Math.hypot(bx, by);
+  $("hud").innerHTML = `t = <b>${w.t.toFixed(2)}</b> r/c    balls ${w.n}    contacts ${w.contactCount}` +
+    (b > 1e-9 ? `\nCM frame moves at ${b.toFixed(3)}c relative to the setup frame` : "") +
+    (playing ? "" : "\n<b>paused</b>");
+
+  if (hover >= 0) {
+    const i = hover, m = restMass(w.E[i], w.px[i], w.py[i]);
+    const v = Math.hypot(w.px[i], w.py[i]) / w.E[i];
+    $("tip").textContent =
+      `ball ${i}${w.sticky[i] ? " (sticky)" : ""}\n|v| = ${v.toFixed(4)}   γ = ${(w.E[i] / m).toFixed(4)}\n` +
+      `E = ${w.E[i].toFixed(5)}\nM = ${m.toFixed(6)} (M₀ = ${w.m0[i]})\nΔM/M₀ = ${((m - w.m0[i]) / w.m0[i]).toExponential(3)}\n` +
+      `pending impulses: ${w.pending[i].length}`;
+  }
+}
+
+function drawChart(id, series, title) {
+  const c = $(id), g = c.getContext("2d");
+  const W = c.width / dpr, H = c.height / dpr;
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  const t = history.t, n = t.length;
+  if (n < 2) return;
+  let lo = Infinity, hi = -Infinity;
+  for (const s of series) for (const v of s.data) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  lo = Math.min(lo, 0); hi = Math.max(hi, 0);
+  const span = Math.max(hi - lo, 1e-6); hi += span * 0.08; lo -= span * 0.08;
+  const L = 4, R = W - 4, T = 16, B = H - 4;
+  const X = (k) => L + (R - L) * (t[k] - t[0]) / Math.max(t[n - 1] - t[0], 1e-9);
+  const Y = (v) => B - (B - T) * (v - lo) / (hi - lo);
+  g.strokeStyle = "#23304d"; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(L, Y(0)); g.lineTo(R, Y(0)); g.stroke();
+  for (const s of series) {
+    g.strokeStyle = s.color; g.lineWidth = s.width || 1.3; g.setLineDash(s.dash || []);
+    g.beginPath();
+    for (let k = 0; k < n; k++) (k ? g.lineTo : g.moveTo).call(g, X(k), Y(s.data[k]));
+    g.stroke();
+  }
+  g.setLineDash([]);
+  g.font = "10px ui-monospace, monospace"; g.textBaseline = "top";
+  let x = L;
+  g.fillStyle = "#8fa3c7"; g.fillText(title, x, 2); x += g.measureText(title).width + 8;
+  for (const s of series) {
+    g.fillStyle = s.color; g.fillRect(x, 4, 8, 3); x += 11;
+    g.fillStyle = "#8fa3c7"; g.fillText(s.label, x, 1); x += g.measureText(s.label).width + 8;
+  }
+}
+
+function drawHistogram() {
+  const c = $("chart-h"), g = c.getContext("2d");
+  const W = c.width / dpr, H = c.height / dpr, bins = 25, counts = new Array(bins).fill(0);
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  for (let i = 0; i < world.n; i++) {
+    const v = Math.hypot(world.px[i], world.py[i]) / world.E[i];
+    counts[Math.min(bins - 1, Math.floor(v * bins))]++;
+  }
+  const max = Math.max(...counts, 1), bw = (W - 8) / bins;
+  g.fillStyle = "#66f2ff";
+  counts.forEach((k, b) => { const h = (H - 14) * k / max; g.fillRect(4 + b * bw + 1, H - 12 - h, bw - 2, h); });
+  g.fillStyle = "#8fa3c7"; g.font = "10px ui-monospace, monospace"; g.textBaseline = "bottom";
+  g.fillText("0", 4, H); g.fillText("c", W - 12, H);
+}
+
+const sci = (v) => (Math.abs(v) < 5e-16 ? "0" : v.toExponential(2));
+function drawPanel() {
+  const t = world.totals(), i0 = world.initial;
+  const dE = Math.abs(t.allE - i0.allE) / i0.allE;
+  const dP = Math.hypot(t.allPx - i0.allPx, t.allPy - i0.allPy) / i0.allE;
+  const cls = (e) => (e < 1e-10 ? "good" : e < 1e-6 ? "warn" : "bad");
+  $("cons").innerHTML = `
+    <tr><td><span class="sw" style="background:#5c6b8a"></span>Rest mass at start ΣM₀</td><td>${t.rest0.toFixed(6)}</td></tr>
+    <tr><td><span class="sw" style="background:#ff9944"></span>Heat Σ(M − M₀)</td><td>${t.heat.toFixed(6)}</td></tr>
+    <tr><td><span class="sw" style="background:#66f2ff"></span>Kinetic Σ(E − M)</td><td>${t.kin.toFixed(6)}</td></tr>
+    <tr><td><span class="sw" style="background:#c49bff"></span>In transit (pending impulses)</td><td>${t.tE.toFixed(6)}</td></tr>
+    <tr class="total"><td>Total energy E</td><td>${t.allE.toFixed(6)}</td></tr>
+    <tr><td>Total momentum (p<sub>x</sub>, p<sub>y</sub>)</td><td>${sci(t.allPx)}, ${sci(t.allPy)}</td></tr>
+    <tr><td>Balls only (p<sub>x</sub>, p<sub>y</sub>)</td><td>${t.Px.toFixed(4)}, ${t.Py.toFixed(4)}</td></tr>
+    <tr><td>Invariant mass √(E² − p²)</td><td>${restMass(t.allE, t.allPx, t.allPy).toFixed(6)}</td></tr>
+    <tr><td>Drift |ΔE|/E · |Δp|/E</td><td><span class="${cls(dE)}">${sci(dE)}</span> · <span class="${cls(dP)}">${sci(dP)}</span></td></tr>
+    <tr><td>Temperature ΔM/M₀ (max · min)</td><td>${fmt(t.hMax, 5)} · ${fmt(t.hMin, 5)}</td></tr>` +
+    (world.spacelike ? `<tr><td class="bad">Spacelike 4-momenta</td><td class="bad">${world.spacelike}</td></tr>` : "");
+
+  const h = history;
+  drawChart("chart-e", [
+    { data: h.kin, color: "#66f2ff", label: "kinetic" },
+    { data: h.heat, color: "#ff9944", label: "heat" },
+    { data: h.tE, color: "#c49bff", label: "transit" },
+    { data: h.sum, color: "#e4ecff", label: "E − ΣM₀", dash: [4, 3] },
+  ], "Energy");
+  drawChart("chart-p", [
+    { data: h.pxB, color: "#66f2ff", label: "balls px" },
+    { data: h.pyB, color: "#a8ff80", label: "py" },
+    { data: h.pxT, color: "#c49bff", label: "transit px" },
+    { data: h.pyT, color: "#ff9944", label: "py" },
+    { data: h.pAll, color: "#e4ecff", label: "|total|", dash: [4, 3] },
+  ], "Momentum");
+  $("readout").innerHTML = scenario.readout(world, params);
+  if (scenario.histogram) drawHistogram();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------------------------
+
+let last = performance.now(), acc = 0, frame = 0;
+function tick(now) {
+  const dtWall = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  if (playing) {
+    acc += dtWall * speedOf();
+    let steps = Math.floor(acc / DT);
+    acc -= steps * DT;
+    // Keep the frame budget: big worlds at high speed slow down rather than stall.
+    const budget = Math.max(4, Math.floor(1.2e6 / (world.n * world.n + 1)));
+    if (steps > budget) { steps = budget; acc = 0; }
+    for (let k = 0; k < steps; k++) stepWorld();
+    if (steps) sample();
+  }
+  if (autoFit) fitCamera(0.08);
+  drawWorld();
+  if (frame++ % 3 === 0 || !playing) drawPanel();
+  requestAnimationFrame(tick);
+}
+
+resize();
+selectScenario(SCENARIOS[0]);
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

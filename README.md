@@ -100,6 +100,12 @@ Then serve the `web/` directory with any static HTTP server (for example using N
 python -m http.server 8080 --directory web
 ```
 
+On touch screens, the **Thrust** and **Teleport** button rows under the viewport stand in for the held `W A S D Space C` and `I J K L U O` keys.
+
+### Companion 2D demo: causal billiards
+
+[`billiards2d/index.html`](billiards2d/index.html) is a standalone, dependency-free JavaScript page (no WASM, no build step: just open it) that runs the same causal collision model in 2D, top-down in the centre-of-momentum frame: offset two-ball hits, Newton's cradle, a billiard break, a converging ring and a periodic relativistic gas. It tracks the energy split (rest mass, heat as rest-mass gain, kinetic, impulses in transit) and total 4-momentum live, conserved to rounding error.
+
 ---
 
 ## Controls
