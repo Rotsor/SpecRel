@@ -17,6 +17,9 @@ pub const PLAYERS: usize = 2;
 /// The HUD banner while the local player is held back.
 pub const WAITING_BANNER: &str = "WAITING FOR THE OTHER PLAYER";
 
+/// The HUD banner until the other player has joined: the match starts paused.
+pub const NOT_JOINED_BANNER: &str = "WAITING FOR A PLAYER TO JOIN";
+
 /// Every player's ship at its spawn event, at rest, clock at zero.
 pub fn spawns() -> Vec<ShipSample> {
     (0..PLAYERS as PlayerId).map(|p| ShipSample::at_rest(billiards::spawn_event(p))).collect()
@@ -86,20 +89,28 @@ impl Match {
         changed
     }
 
-    /// Whether the local ship may move from `current` to the tentative `next` event: never
-    /// into the other player's future cone, as far as we know it (see [`Pacer`]). Once the
-    /// other player has left, nothing holds us back.
+    /// Whether the local ship may move from `current` to the tentative `next` event: not at
+    /// all until the other player has joined, then never into their future cone, as far as we
+    /// know it (see [`Pacer`]). Once the other player has left, nothing holds us back.
     pub fn may_advance(&mut self, current: &ShipSample, next: &ShipSample) -> bool {
         if self.session.peer_left() {
             self.pacer = Pacer::default();
             return true;
         }
+        if self.awaiting_peer() {
+            return false;
+        }
         self.pacer.may_advance(current, next, &self.remote_latest)
     }
 
-    /// The local player is held back until the other one catches up.
+    /// The other player has not joined yet (and has not given up either).
+    fn awaiting_peer(&self) -> bool {
+        !self.session.peer_joined() && !self.session.peer_left()
+    }
+
+    /// The local player is held back: until the other one joins, then until they catch up.
     pub fn is_waiting(&self) -> bool {
-        self.pacer.is_waiting()
+        self.awaiting_peer() || self.pacer.is_waiting()
     }
 
     /// Send the local ship's latest event. Sent every frame, also while waiting (a heartbeat
@@ -141,6 +152,10 @@ impl Match {
 
     /// A message to show across the screen, if the local player cannot play right now.
     pub fn banner(&self) -> Option<&'static str> {
-        self.is_waiting().then_some(WAITING_BANNER)
+        if self.awaiting_peer() {
+            Some(NOT_JOINED_BANNER)
+        } else {
+            self.is_waiting().then_some(WAITING_BANNER)
+        }
     }
 }

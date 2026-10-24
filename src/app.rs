@@ -687,6 +687,35 @@ mod tests {
         assert!(away.scene_description().contains("PLAYER 2 OF 2"));
     }
 
+    /// A match starts paused: nothing moves, and the ship can't thrust or fire, until the
+    /// other player's hello arrives.
+    #[test]
+    fn a_match_starts_paused_until_the_other_player_joins() {
+        let (a, _b) = crate::multiplayer::link::LocalLink::pair();
+        let scenes = vec![Scene4D::build(DemoScene::RelativisticBilliards)];
+        let mut alone = App::new_multiplayer(scenes, 64, 40, 0, Box::new(a));
+        let start = alone.camera.position;
+        let shots = |app: &App| app.world.as_ref().unwrap().ships[0].shots;
+        for _ in 0..40 {
+            alone.apply(Action::Fire);
+            alone.step(0.05, &HeldInput { thrust_forward: true, ..Default::default() });
+        }
+        assert_eq!(alone.camera.position, start, "time stands still before anyone joins");
+        assert_eq!(alone.camera.proper_time, 0.0);
+        assert_eq!(shots(&alone), 0, "no firing while alone");
+        assert!(alone.is_waiting());
+        assert_eq!(alone.banner(), Some(game::NOT_JOINED_BANNER));
+
+        // Once both sides are there, play starts.
+        let (mut p0, mut p1) = match_apps();
+        for _ in 0..20 {
+            p0.step(0.05, &HeldInput::default());
+            p1.step(0.05, &HeldInput::default());
+        }
+        assert!(p0.camera.proper_time > 0.5 && p1.camera.proper_time > 0.5);
+        assert_eq!(p0.banner(), None);
+    }
+
     /// Shots, flashes and the worlds they shape are shared: both replicas agree.
     #[test]
     fn a_match_shares_shots_and_flashes() {

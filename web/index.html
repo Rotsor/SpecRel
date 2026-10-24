@@ -248,6 +248,23 @@
     #p2p-help {
       order: 4;
     }
+    #p2p-share-step {
+      order: 1;
+    }
+    .p2p-share-row {
+      display: flex;
+      gap: 6px;
+    }
+    .p2p-share-row input {
+      flex: 1;
+      min-width: 0;
+      background: var(--bg);
+      color: var(--cyan);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 6px;
+      font: 12px ui-monospace, Consolas, monospace;
+    }
   </style>
 </head>
 <body>
@@ -277,6 +294,13 @@
         <textarea id="p2p-out" rows="3" spellcheck="false" readonly></textarea>
         <button id="p2p-copy">Copy</button>
       </div>
+      <div class="p2p-step" id="p2p-share-step" hidden>
+        <label for="p2p-share">Send this link to the other player</label>
+        <div class="p2p-share-row">
+          <input id="p2p-share" readonly>
+          <button id="p2p-share-copy">Copy</button>
+        </div>
+      </div>
       <div id="p2p-status"></div>
       <a class="mp-link" id="p2p-help" href="online.html" target="_blank">How does this work?</a>
     </div>
@@ -287,6 +311,7 @@
       <span class="row-label">2-Player:</span>
       <span id="mp-single">
         <button id="mp-start">Start 2-player match</button>
+        <button id="lobby-create">Create online lobby</button>
         <a class="mp-link" href="?mp=0">Player 1</a>
         <a class="mp-link" href="?mp=1" target="_blank">Player 2</a>
         <span class="mp-sep">·</span>
@@ -295,7 +320,7 @@
         <a class="mp-link" href="online.html">How?</a>
       </span>
       <span id="mp-label" hidden></span>
-      <span class="hint" id="mp-hint">Two tabs of this browser, or two computers peer to peer; each player controls a ship</span>
+      <span class="hint" id="mp-hint">Two tabs of this browser, or an online lobby with a link to share; each player controls a ship</span>
     </div>
     <div class="btn-row" id="scene-row">
       <span class="row-label">Scenes:</span>
@@ -720,7 +745,13 @@
       if (p2pRoom) {
         $("p2p-in-step").hidden = true;
         $("p2p-out-step").hidden = true;
-        $("p2p-title").textContent = `${host ? "Hosting" : "Joining"} room "${p2pRoom}"`;
+        $("p2p-title").textContent = `${host ? "Hosting" : "Joining"} lobby "${p2pRoom}"`;
+        if (host) {
+          $("p2p-share").value = joinLink(p2pRoom);
+          $("p2p-share-step").hidden = false;
+          $("p2p-share").addEventListener("focus", (e) => e.target.select());
+          $("p2p-share-copy").addEventListener("click", () => copyText($("p2p-share"), $("p2p-share-copy")));
+        }
         signalViaServer(pc, host, gathered, status).catch((e) => {
           fail(e);
           link.setState(2);
@@ -750,17 +781,35 @@
           fail(e);
         }
       });
-      $("p2p-copy").addEventListener("click", async () => {
-        out.select();
-        try {
-          await navigator.clipboard.writeText(out.value);
-          $("p2p-copy").textContent = "Copied";
-        } catch {
-          document.execCommand("copy");
-        }
-      });
+      $("p2p-copy").addEventListener("click", () => copyText(out, $("p2p-copy")));
 
       return transport;
+    }
+
+    async function copyText(field, button) {
+      field.select();
+      try {
+        await navigator.clipboard.writeText(field.value);
+      } catch {
+        document.execCommand("copy");
+      }
+      button.textContent = "Copied";
+    }
+
+    // The link a joiner opens: this page, joining `room` (through the same signalling server).
+    function joinLink(room) {
+      const url = new URL(location.pathname, location.origin);
+      url.searchParams.set("p2p", "join");
+      url.searchParams.set("room", room);
+      if (params.get("signal")) url.searchParams.set("signal", params.get("signal"));
+      return url.href;
+    }
+
+    // A fresh lobby name such as "k7m-q2xp": 7 characters from an alphabet without look-alikes.
+    function newLobbyName() {
+      const alphabet = "abcdefghjkmnpqrstuvwxyz23456789";
+      const chars = Array.from(crypto.getRandomValues(new Uint8Array(7)), (b) => alphabet[b % alphabet.length]);
+      return `${chars.slice(0, 3).join("")}-${chars.slice(3).join("")}`;
     }
 
     // Swaps the offer and answer through the signalling server's room. The host posts its
@@ -774,7 +823,7 @@
           body: JSON.stringify({ type: desc.type, sdp: desc.sdp }),
         });
         if (resp.status === 409) {
-          throw new Error(host ? "Someone is already hosting this room. Pick another room name." : "This room already has two players.");
+          throw new Error(host ? "Someone is already hosting this lobby. Create a new one." : "This lobby already has two players.");
         }
         if (!resp.ok) throw new Error(`Signalling server error (${resp.status}).`);
       };
@@ -791,10 +840,10 @@
           status("Finding network addresses...");
           await gathered();
           await post("offer", pc.localDescription);
-          status("Waiting for the other player to join this room.");
+          status("Waiting for the other player to open the link.");
           await pc.setRemoteDescription(await poll("answer"));
         } else {
-          status("Waiting for the host to open this room.");
+          status("Waiting for the host to open this lobby.");
           await pc.setRemoteDescription(await poll("offer"));
           await pc.setLocalDescription(await pc.createAnswer());
           status("Finding network addresses...");
@@ -819,6 +868,16 @@
         // No signalling server here: keep STUN only.
       }
     }
+
+    // A new online lobby: host it here, and share the join link the panel shows.
+    document.getElementById("lobby-create").addEventListener("click", () => {
+      const url = new URL(location.href);
+      url.search = "";
+      url.searchParams.set("p2p", "host");
+      url.searchParams.set("room", newLobbyName());
+      if (params.get("signal")) url.searchParams.set("signal", params.get("signal"));
+      location.href = url.href;
+    });
 
     // Single player: one click opens both sides of a match (this tab and a new one).
     document.getElementById("mp-start").addEventListener("click", () => {

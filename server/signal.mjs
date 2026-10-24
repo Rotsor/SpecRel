@@ -14,7 +14,8 @@
 //
 // A timed-out long poll answers 204. Posting an offer to a room that already has one, or an
 // answer to a room without an offer or with an answer already, answers 409. Rooms are dropped
-// ROOM_TTL_MS after creation, or shortly after the host has fetched the answer.
+// ROOM_TTL_MS after creation or after the host last polled for the answer (so a lobby lives as
+// long as its host keeps waiting), or shortly after the host has fetched the answer.
 //
 // With `--static DIR` the server also serves DIR (e.g. `web/`), so the game and the signalling
 // share one origin and the page needs no `signal=` parameter.
@@ -167,6 +168,8 @@ async function handleRoom(req, res, name, kind, url) {
     }
   };
   if (room && room[kind]) return finish(room[kind]);
+  // A host still waiting for a joiner keeps its lobby open.
+  if (room && kind === "answer") room.expires = Math.max(room.expires, Date.now() + ROOM_TTL_MS);
   const wait = Math.min(MAX_WAIT_S, Math.max(0, Number(url.searchParams.get("wait")) || 0));
   if (wait === 0) return send(res, 204);
   // Waiting for an offer may create the room (the joiner can arrive first); waiting for an

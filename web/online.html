@@ -92,7 +92,13 @@
       </a>
     </div>
 
-    <h2>Connecting</h2>
+    <h2>The easy way: a lobby link</h2>
+    <p>If this game is served by a SpecRel lobby server, press <b>Create online lobby</b> under the game. A
+      panel shows a link: copy it and send it to the other player. When they open it you are both in, and the
+      game starts. Until then the game stays paused. If no direct path exists between your two networks, the
+      server also relays the game traffic, so this works on almost any network.</p>
+
+    <h2>Without a server: swapping codes</h2>
     <ol>
       <li><span class="who">Host:</span> open <a href="./?p2p=host">Host a match</a>. After a few seconds an
         <b>invite code</b> (starting with <code>SR4W</code>) appears. Press <b>Copy</b> and send it to the other
@@ -124,16 +130,17 @@
     <ul>
       <li>Make sure both of you opened the same build (this page's links) in an up-to-date Chrome, Edge,
         Firefox or Safari.</li>
-      <li>The connection needs a direct path between the two networks. Most home Wi-Fi works. Some mobile
-        networks and corporate or university networks block direct connections; if the panel says
-        <i>Could not connect</i>, try another network (a phone hotspot often helps).</li>
+      <li>With codes, the connection needs a direct path between the two networks. Most home Wi-Fi works. Some
+        mobile networks and corporate or university networks block direct connections; if the panel says
+        <i>Could not connect</i>, use a lobby on a server with a relay, or try another network (a phone hotspot
+        often helps).</li>
       <li>Mixed up the codes? The host pastes the <i>reply</i> code and the joiner pastes the <i>invite</i>
         code. The game tells you if you pasted the wrong one.</li>
     </ul>
 
     <h2>Other ways to play together</h2>
     <ul>
-      <li><b>With a room name:</b> if someone runs the SpecRel signalling server
+      <li><b>With a room name of your choice:</b> if someone runs the SpecRel lobby server
         (<code>node server/signal.mjs --static web</code>), open the game from it with
         <code>?p2p=host&amp;room=NAME</code> and <code>?p2p=join&amp;room=NAME</code>. The browsers then swap the
         codes through the server and nobody has to paste anything. If the game page is hosted somewhere else, add
