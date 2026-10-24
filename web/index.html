@@ -609,7 +609,8 @@
     const p2pRoom = params.get("room");
     const signalBase = (params.get("signal") || location.origin).replace(/\/+$/, "");
 
-    const ICE_SERVERS = [{ urls: ["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"] }];
+    // STUN only, unless the signalling server's /turn also offers a TURN relay (see loadIceServers).
+    let iceServers = [{ urls: ["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"] }];
     const ICE_GATHER_TIMEOUT_MS = 5000;
 
     function toBase64Url(bytes) {
@@ -667,7 +668,7 @@
       $("p2p-out-step").style.order = host ? 1 : 2;
       $("p2p-out-step").hidden = !host;
 
-      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      const pc = new RTCPeerConnection({ iceServers });
       // Negotiated on both sides with the same id, so neither waits for `ondatachannel`.
       const dc = pc.createDataChannel("specrel", { negotiated: true, id: 0, ordered: true });
       dc.binaryType = "arraybuffer";
@@ -681,7 +682,9 @@
         const state = pc.connectionState;
         if (state === "connecting") status("Connecting...");
         if (state === "failed") {
-          status("Could not connect: no direct path between the two networks.");
+          status(iceServers.some((s) => s.username)
+            ? "Could not connect, even through the relay."
+            : "Could not connect: no direct path between the two networks, and no relay is configured.");
           panel.hidden = false;
           link.setState(2);
         }
@@ -805,6 +808,18 @@
       }
     }
 
+    // Fetches ICE servers, with TURN relay credentials, from the signalling server. The browser
+    // still prefers a direct path and only falls back to the relay when none works.
+    async function loadIceServers() {
+      if (!p2pRole) return;
+      try {
+        const resp = await fetch(`${signalBase}/turn`);
+        if (resp.ok) iceServers = (await resp.json()).iceServers;
+      } catch {
+        // No signalling server here: keep STUN only.
+      }
+    }
+
     // Single player: one click opens both sides of a match (this tab and a new one).
     document.getElementById("mp-start").addEventListener("click", () => {
       window.open("?mp=1", "_blank");
@@ -813,7 +828,7 @@
 
     async function main() {
       try {
-        const [wasm, gpu] = await Promise.all([loadWasm(), initWebGPU(canvas)]);
+        const [wasm, gpu] = await Promise.all([loadWasm(), initWebGPU(canvas), loadIceServers()]);
         const gpuAvailable = gpu !== null;
 
         wasm.web_init(gpuAvailable ? 1 : 0, mpPlayer);
