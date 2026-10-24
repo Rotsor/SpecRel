@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SpecRel 4D — Play Online</title>
+  <style>
+    :root {
+      --bg: #070a12;
+      --panel: #101626;
+      --border: #23304d;
+      --text: #e4ecff;
+      --muted: #8fa3c7;
+      --accent: #ff9944;
+      --cyan: #66f2ff;
+    }
+    body {
+      margin: 0;
+      padding: 32px 16px 64px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      line-height: 1.55;
+    }
+    main { max-width: 720px; margin: 0 auto; }
+    h1 { color: var(--accent); font-size: 1.4rem; margin: 0 0 4px; }
+    h2 { color: var(--accent); font-size: 1.05rem; margin: 36px 0 12px; }
+    p.sub { color: var(--muted); margin: 0 0 24px; }
+    a { color: var(--cyan); }
+    .play {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }
+    a.big {
+      display: block;
+      padding: 16px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      text-decoration: none;
+    }
+    a.big:hover { border-color: var(--cyan); }
+    a.big .name { color: var(--cyan); font-weight: bold; }
+    a.big .desc { color: var(--muted); font-size: 0.9rem; margin-top: 6px; }
+    ol, ul { padding-left: 1.4em; }
+    li { margin-bottom: 8px; }
+    li::marker { color: var(--accent); }
+    .who { color: var(--accent); font-weight: bold; }
+    kbd {
+      border: 1px solid var(--border);
+      border-bottom-width: 2px;
+      border-radius: 4px;
+      padding: 0 5px;
+      background: var(--panel);
+      color: var(--cyan);
+      font-family: inherit;
+      font-size: 0.9em;
+    }
+    pre {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 12px;
+      overflow-x: auto;
+      color: var(--cyan);
+    }
+    .note {
+      border-left: 3px solid var(--accent);
+      padding: 4px 12px;
+      color: var(--muted);
+      background: var(--panel);
+      border-radius: 0 6px 6px 0;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Play SpecRel 4D online</h1>
+    <p class="sub">Two players, two computers, one causal relativistic billiards table. The game connects the
+      two browsers directly, peer to peer. No server or account is needed: you just swap two codes by chat.</p>
+
+    <div class="play">
+      <a class="big" href="./?p2p=host">
+        <div class="name">Host a match →</div>
+        <div class="desc">You are player 1. You get an invite code to send.</div>
+      </a>
+      <a class="big" href="./?p2p=join">
+        <div class="name">Join a match →</div>
+        <div class="desc">You are player 2. Paste the host's invite code.</div>
+      </a>
+    </div>
+
+    <h2>Connecting</h2>
+    <ol>
+      <li><span class="who">Host:</span> open <a href="./?p2p=host">Host a match</a>. After a few seconds an
+        <b>invite code</b> (starting with <code>SR4W</code>) appears. Press <b>Copy</b> and send it to the other
+        player over any chat.</li>
+      <li><span class="who">Joiner:</span> open <a href="./?p2p=join">Join a match</a>, paste the invite code
+        into the box and press <b>Connect</b>. A <b>reply code</b> appears. Copy it and send it back.</li>
+      <li><span class="who">Host:</span> paste the reply code into the second box and press <b>Connect</b>.</li>
+      <li>The panel disappears on both screens and the HUD's top line names the other player. You're in.</li>
+    </ol>
+    <p class="note">Each pair of codes works once. If something goes wrong, reload both pages and start over
+      with fresh codes. Keep both tabs in front: browsers pause background tabs, so a hidden tab stops
+      playing (and holds up the other player).</p>
+
+    <h2>Playing</h2>
+    <ul>
+      <li>Fly with <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>, <kbd>Space</kbd> and <kbd>C</kbd>
+        (or the on-screen buttons), and drag the view to look around. Fire pucks with <kbd>Enter</kbd> and change
+        the ammo with <kbd>\</kbd>. <kbd>X</kbd> brakes.</li>
+      <li>You see the other ship as a cube with a clock on it, showing their proper time. You see it, like
+        everything else, where it was when the light reaching you left it.</li>
+      <li><b>WAITING FOR THE OTHER PLAYER</b> is physics, not lag. Fly off fast and come back, and you'll have
+        aged less but moved further into the lab's future than the player who stayed put (the twin paradox).
+        Your view needs everything the other player could still change to be settled, so the game holds you
+        until they catch up. You can still look around while you wait.</li>
+      <li>Both players see exactly the same collisions: each browser runs an identical copy of the world.</li>
+    </ul>
+
+    <h2>If it won't connect</h2>
+    <ul>
+      <li>Make sure both of you opened the same build (this page's links) in an up-to-date Chrome, Edge,
+        Firefox or Safari.</li>
+      <li>The connection needs a direct path between the two networks. Most home Wi-Fi works. Some mobile
+        networks and corporate or university networks block direct connections; if the panel says
+        <i>Could not connect</i>, try another network (a phone hotspot often helps).</li>
+      <li>Mixed up the codes? The host pastes the <i>reply</i> code and the joiner pastes the <i>invite</i>
+        code. The game tells you if you pasted the wrong one.</li>
+    </ul>
+
+    <h2>Other ways to play together</h2>
+    <ul>
+      <li><b>On one computer:</b> <a href="./?mp=0">player 1</a> and <a href="./?mp=1" target="_blank">player 2</a>
+        in two tabs (or the <i>Start 2-player match</i> button in the game). The tabs talk to each other
+        directly, with no codes.</li>
+      <li><b>Desktop app:</b> if you build SpecRel from source with Rust, both players run the command below,
+        then paste each other's <code>SR4D-</code> code:
+        <pre>cargo run --release -- --p2p</pre>
+        To skip the pasting, anyone with a public IP can run a rendezvous server
+        (<code>--rendezvous</code>, UDP port 7778), and both players join the same room:
+        <pre>cargo run --release -- --p2p myroom@server.example.com</pre>
+        Desktop and browser players can't play each other.</li>
+    </ul>
+
+    <p class="sub" style="margin-top: 36px"><a href="./">← Back to the game</a></p>
+  </main>
+</body>
+</html>
