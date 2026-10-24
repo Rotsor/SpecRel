@@ -44,6 +44,17 @@ and distance from `O_remote` to `O_local`.
 * While waiting, the player can look around and change views. Thrust and firing are frozen, and
   the HUD shows **WAITING FOR THE OTHER PLAYER**.
 
+**The ship is rigid.** The camera is the centre of a ship of radius `SHIP_RADIUS` (0.4). A
+Born-rigid body whose centre accelerates at `a` has a Rindler horizon `1/a` behind the centre.
+The hull's trailing point, at distance `R`, accelerates at `a / (1 − aR)`, and that blows up as
+`aR → 1`. So in a match the ship's proper acceleration is capped at `SHIP_ACCEL = 0.8 / R`, which
+is 80% of the bound. The cap is measured per second of the ship's own clock (`d_tau`, so a paused
+ship cannot boost at all) and in every direction (diagonal thrust is normalized). `X` (brake to
+the lab frame) and `V` (match velocity) do not jump: they boost at `SHIP_ACCEL` toward the target
+for as long as the key is held. Releasing the key mid-brake leaves the ship coasting at whatever
+velocity it reached. Collision kicks stay instantaneous. They already reach the camera only once
+their news has crossed the hull.
+
 A player with `Δt ≤ 0` never needs to stop, so at least one player can always move. Both can be
 stopped only briefly, when their information about each other is stale; heartbeats resolve that.
 Before the other player has connected, they are taken to be at their spawn event, at rest. This

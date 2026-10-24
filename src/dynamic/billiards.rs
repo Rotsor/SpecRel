@@ -15,8 +15,13 @@ pub const TABLE_Y: f32 = -2.2;
 pub const PUCK_RADIUS: f64 = 0.35;
 pub const PUCK_MASS: f64 = 1.0;
 /// The ship is a heavy sphere around its camera (you never see your own: you are inside it).
-pub const SHIP_RADIUS: f64 = 0.8;
+pub const SHIP_RADIUS: f64 = 0.4;
 pub const SHIP_MASS: f64 = 6.0;
+/// The ship's proper acceleration (at its center, in `c` per second) in a match. A Born-rigid
+/// body accelerating at `a` has a Rindler horizon `1 / a` behind its center, and the hull's
+/// trailing side must stay in front of it (its own acceleration `a / (1 - a R)` diverges as
+/// `a R -> 1`), so `a < 1 / SHIP_RADIUS`. Thrusters and steering run at 80% of that bound.
+pub const SHIP_ACCEL: f64 = 0.8 / SHIP_RADIUS;
 /// Launch speed of fired pucks in the ship's rest frame.
 pub const FIRE_SPEED: f64 = 0.6;
 /// Bodies this far from the table leave play.

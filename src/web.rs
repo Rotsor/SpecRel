@@ -42,8 +42,6 @@ pub const KEY_TAB: u32 = 15;
 pub const KEY_F: u32 = 16;
 pub const KEY_Z: u32 = 17;
 pub const KEY_R: u32 = 18;
-pub const KEY_X: u32 = 19;
-pub const KEY_V: u32 = 20;
 pub const KEY_SLASH: u32 = 21;
 pub const KEY_PAGE_UP: u32 = 22;
 pub const KEY_PAGE_DOWN: u32 = 23;
@@ -72,6 +70,10 @@ pub const HOLD_L: u32 = 116;
 pub const HOLD_J: u32 = 117;
 pub const HOLD_U: u32 = 118;
 pub const HOLD_O: u32 = 119;
+/// `X` and `V` are held keys too: in a match the ship brakes / matches velocity while they are
+/// down. Pressing one also fires its [`Action`].
+pub const HOLD_X: u32 = 120;
+pub const HOLD_V: u32 = 121;
 
 /// Map a discrete JS key code to an app action (frontend-only keys are handled separately).
 fn key_action(code: u32) -> Option<Action> {
@@ -90,8 +92,6 @@ fn key_action(code: u32) -> Option<Action> {
         KEY_MINUS => Action::Slower,
         KEY_EQUAL => Action::Faster,
         KEY_R => Action::Reset,
-        KEY_X => Action::Brake,
-        KEY_V => Action::MatchVelocity,
         KEY_SLASH => Action::EmitFlash,
         KEY_PAGE_UP => Action::ProphecyDeltaUp,
         KEY_PAGE_DOWN => Action::ProphecyDeltaDown,
@@ -114,6 +114,8 @@ fn held_input(mask: u32) -> HeldInput {
         thrust_left: held(HOLD_A),
         thrust_up: held(HOLD_SPACE),
         thrust_down: held(HOLD_C),
+        brake: held(HOLD_X),
+        match_velocity: held(HOLD_V),
         scrub_back: held(HOLD_BRACKET_LEFT),
         scrub_forward: held(HOLD_BRACKET_RIGHT),
         move_forward: held(HOLD_I),
@@ -230,6 +232,14 @@ pub extern "C" fn web_key_event(code: u32, pressed: u32, repeat: u32) {
             let bit = 1u32 << (code - 100);
             if pressed != 0 {
                 s.held_keys |= bit;
+                let action = match code {
+                    HOLD_X => Some(Action::Brake),
+                    HOLD_V => Some(Action::MatchVelocity),
+                    _ => None,
+                };
+                if let Some(action) = action.filter(|_| repeat == 0) {
+                    s.app.apply(action);
+                }
             } else {
                 s.held_keys &= !bit;
             }

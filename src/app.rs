@@ -3,7 +3,7 @@
 //! translate their own key events into [`Action`]s and [`HeldInput`], and keep only what is
 //! genuinely theirs (rendering backend, resolution, HUD visibility, presentation).
 
-use crate::dynamic::billiards::{self, Ammo, FIRE_SPEED, SHIP_MASS, SHIP_RADIUS};
+use crate::dynamic::billiards::{self, Ammo, FIRE_SPEED, SHIP_ACCEL, SHIP_MASS, SHIP_RADIUS};
 use crate::dynamic::body::{BodyState, Impulse};
 use crate::dynamic::collide::P4;
 use crate::dynamic::{DynWorld, PlayerId, ShipSample};
@@ -46,9 +46,11 @@ pub enum Action {
     Faster,
     /// Back to the scene's initial event and rest frame.
     Reset,
-    /// Boost to the lab rest frame.
+    /// Boost to the lab rest frame (in a match: decelerate toward it while held, see
+    /// [`HeldInput::brake`]).
     Brake,
-    /// Toggle between the lab frame and the scene's moving object's rest frame.
+    /// Toggle between the lab frame and the scene's moving object's rest frame (in a match:
+    /// accelerate toward it while held, see [`HeldInput::match_velocity`]).
     MatchVelocity,
     EmitFlash,
     ProphecyDeltaUp,
@@ -74,6 +76,10 @@ pub struct HeldInput {
     pub thrust_left: bool,
     pub thrust_up: bool,
     pub thrust_down: bool,
+    /// The [`Action::Brake`] key is (still) down.
+    pub brake: bool,
+    /// The [`Action::MatchVelocity`] key is (still) down.
+    pub match_velocity: bool,
     pub scrub_back: bool,
     pub scrub_forward: bool,
     pub move_forward: bool,
@@ -82,6 +88,15 @@ pub struct HeldInput {
     pub move_left: bool,
     pub move_up: bool,
     pub move_down: bool,
+}
+
+/// Multiplayer: an [`Action::Brake`] or [`Action::MatchVelocity`] in progress. The ship is a
+/// rigid body of radius [`SHIP_RADIUS`], so it cannot change velocity at once: it boosts toward
+/// `target` at [`SHIP_ACCEL`] for as long as its key stays down.
+#[derive(Clone, Copy)]
+struct Steer {
+    target: Vec4,
+    held: fn(&HeldInput) -> bool,
 }
 
 pub struct App {
@@ -98,6 +113,7 @@ pub struct App {
     pub ammo: Ammo,
     /// Ship collision impulses whose news has not crossed the hull yet.
     kicks_in_flight: Vec<Impulse>,
+    steer: Option<Steer>,
     /// Bumped whenever a scene's geometry is replaced, so frontends know to re-upload it.
     pub scene_generation: u64,
     world_grew: bool,
@@ -128,6 +144,7 @@ impl App {
             world: None,
             ammo: Ammo::Puck,
             kicks_in_flight: Vec::new(),
+            steer: None,
             scene_generation: 0,
             world_grew: false,
             rebuild_timer: 0.0,
@@ -202,8 +219,8 @@ impl App {
             // Both players' worlds must start alike, so a match never leaves its scene.
             Action::SelectScene(_) | Action::NextScene | Action::PrevScene | Action::Reset
                 if multiplayer => {}
-            // A waiting player's ship is frozen.
-            Action::Brake | Action::MatchVelocity | Action::Fire if self.is_waiting() => {}
+            // A waiting player's ship is frozen (steering waits with it, see `step`).
+            Action::Fire if self.is_waiting() => {}
             Action::SelectScene(idx) => {
                 if idx < n {
                     self.enter_scene(idx);
@@ -232,13 +249,20 @@ impl App {
                 self.enter_scene(self.scene_idx);
                 self.time_scale_idx = DEFAULT_TIME_SCALE_IDX;
             }
-            Action::Brake => self.camera.tetrad.boost_to(Vec4::new(1.0, 0.0, 0.0, 0.0)),
-            Action::MatchVelocity => {
-                if self.camera.tetrad.beta().length() > 0.1 {
-                    self.camera.tetrad.boost_to(Vec4::new(1.0, 0.0, 0.0, 0.0));
+            Action::Brake | Action::MatchVelocity => {
+                let rest = Vec4::new(1.0, 0.0, 0.0, 0.0);
+                let (target, held): (_, fn(&HeldInput) -> bool) = match action {
+                    Action::Brake => (rest, |i| i.brake),
+                    _ if self.camera.tetrad.beta().length() > 0.1 => (rest, |i| i.match_velocity),
+                    _ => {
+                        let beta = self.scene().demo.comoving_beta(self.camera.position.t);
+                        (Vec4::four_velocity_from_beta(beta), |i| i.match_velocity)
+                    }
+                };
+                if multiplayer {
+                    self.steer = Some(Steer { target, held });
                 } else {
-                    let beta = self.scene().demo.comoving_beta(self.camera.position.t);
-                    self.camera.tetrad.boost_to(Vec4::four_velocity_from_beta(beta));
+                    self.camera.tetrad.boost_to(target);
                 }
             }
             Action::EmitFlash => {
@@ -280,14 +304,31 @@ impl App {
         let looked = self.camera;
 
         // 2. Proper acceleration thrusters (Lorentz boost in observer's local rest frame)
-        let boost_rate = 1.25 * dt_wall; // Rapidity per second
-        self.camera.tetrad.boost_local(
-            Vec3::new(
-                axis(input.thrust_right, input.thrust_left),
-                axis(input.thrust_up, input.thrust_down),
-                axis(input.thrust_forward, input.thrust_back),
-            ) * boost_rate,
+        let d_tau = if self.paused { 0.0 } else { dt_wall * self.time_scale() };
+        let thrust = Vec3::new(
+            axis(input.thrust_right, input.thrust_left),
+            axis(input.thrust_up, input.thrust_down),
+            axis(input.thrust_forward, input.thrust_back),
         );
+        if self.multiplayer.is_some() {
+            // The ship is rigid: its proper acceleration stays below the Rindler bound in any
+            // direction (see `SHIP_ACCEL`), per second of its own clock. Steering (`X` / `V`)
+            // takes over the thrusters while its key is held.
+            let max_boost = SHIP_ACCEL as f32 * d_tau;
+            self.steer = self.steer.filter(|s| (s.held)(input));
+            match self.steer {
+                Some(s) => {
+                    self.camera.tetrad.boost_toward(s.target, max_boost);
+                }
+                None if thrust != Vec3::default() => {
+                    self.camera.tetrad.boost_local(thrust.normalized() * max_boost)
+                }
+                None => {}
+            }
+        } else {
+            let boost_rate = 1.25 * dt_wall; // Rapidity per second
+            self.camera.tetrad.boost_local(thrust * boost_rate);
+        }
 
         // 3. Direct coordinate-space & time scrubbing. Because scrubbing `t` at fixed
         // `(x, y, z)` is a coordinate translation rather than motion along the observer's
@@ -309,7 +350,6 @@ impl App {
 
         // 4. Advance observer along their timelike worldline: dX^mu = u^mu * d_tau
         if !self.paused {
-            let d_tau = dt_wall * self.time_scale();
             self.camera.proper_time += d_tau;
             self.camera.position += self.camera.tetrad.e[0] * d_tau;
             time_changed = true;
@@ -463,6 +503,7 @@ impl App {
         self.paused = false;
         self.dynamics.flashes.clear();
         self.kicks_in_flight.clear();
+        self.steer = None;
 
         self.world = demo.is_dynamic().then(|| match player {
             Some(p) => DynWorld::new_match(demo, &game::spawns(), p),
@@ -685,6 +726,70 @@ mod tests {
         assert!(!waits_now, "and resumed once the stay-at-home twin caught up");
         assert!(away.camera.proper_time < home.camera.proper_time - 1.0, "the traveller is younger");
         assert!(away.scene_description().contains("PLAYER 2 OF 2"));
+    }
+
+    /// Rapidity of the camera relative to the lab.
+    fn rapidity(app: &App) -> f32 {
+        app.camera.tetrad.gamma().acosh()
+    }
+
+    /// In a match the ship is rigid: thrust in any direction (diagonals included) stays below
+    /// the Rindler bound `1 / SHIP_RADIUS` per second of the ship's clock, and a paused ship
+    /// cannot change velocity at all.
+    #[test]
+    fn match_thrust_respects_the_rindler_bound() {
+        let (mut p0, _p1) = match_apps();
+        let all = HeldInput {
+            thrust_forward: true,
+            thrust_right: true,
+            thrust_up: true,
+            ..Default::default()
+        };
+        p0.step(0.1, &all);
+        let accel = rapidity(&p0) / 0.1;
+        assert!((accel - SHIP_ACCEL as f32).abs() < 1e-3, "proper acceleration {accel}");
+        assert!(accel * SHIP_RADIUS as f32 <= 0.8 + 1e-4);
+
+        p0.apply(Action::Slower); // half as much proper time per frame: half the boost
+        let before = rapidity(&p0);
+        p0.step(0.1, &all);
+        assert!((rapidity(&p0) - before - 0.05 * SHIP_ACCEL as f32).abs() < 1e-3);
+
+        p0.apply(Action::TogglePause);
+        let u = p0.camera.tetrad.e[0];
+        p0.step(0.1, &all);
+        assert_eq!(p0.camera.tetrad.e[0], u, "no proper time, no boost");
+    }
+
+    /// In a match `X` brakes gradually while held, and releasing it mid-brake coasts on.
+    #[test]
+    fn match_brake_is_gradual_and_stops_on_release() {
+        let (mut p0, _p1) = match_apps();
+        let dt = 0.05;
+        let forward = HeldInput { thrust_forward: true, ..Default::default() };
+        for _ in 0..10 {
+            p0.step(dt, &forward);
+        }
+        let cruise = rapidity(&p0);
+        assert!((cruise - 10.0 * dt * SHIP_ACCEL as f32).abs() < 1e-3);
+
+        let brake = HeldInput { brake: true, ..Default::default() };
+        p0.apply(Action::Brake);
+        p0.step(dt, &brake);
+        p0.step(dt, &brake);
+        let braked = rapidity(&p0);
+        assert!((cruise - braked - 2.0 * dt * SHIP_ACCEL as f32).abs() < 1e-3, "{cruise} -> {braked}");
+
+        p0.step(dt, &HeldInput::default()); // released: coast
+        assert!((rapidity(&p0) - braked).abs() < 1e-4);
+        p0.step(dt, &brake); // held again without a new press: still coasting
+        assert!((rapidity(&p0) - braked).abs() < 1e-4);
+
+        p0.apply(Action::Brake);
+        for _ in 0..20 {
+            p0.step(dt, &brake);
+        }
+        assert_eq!(p0.camera.tetrad.beta(), Vec3::default(), "came to rest in the lab");
     }
 
     /// Shots, flashes and the worlds they shape are shared: both replicas agree.

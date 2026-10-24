@@ -478,6 +478,21 @@ impl Tetrad {
         self.boost_to(new_u0);
     }
 
+    /// Boost toward the 4-velocity `target` by at most `max_rapidity`, along the straight
+    /// (single-plane) path to it, so that repeated steps arrive exactly. Returns whether
+    /// `e[0]` reached `target`.
+    pub fn boost_toward(&mut self, target: Vec4, max_rapidity: f32) -> bool {
+        // `target` in our rest frame is `gamma (1, v)`, `v` its velocity relative to us.
+        let gamma_v = self.world_to_local_spatial(target) / (-target.minkowski_norm_sq()).sqrt();
+        let eta = gamma_v.length().asinh();
+        if eta <= max_rapidity {
+            self.boost_to(target);
+            return true;
+        }
+        self.boost_local(gamma_v.normalized() * max_rapidity);
+        false
+    }
+
     /// Rotate the spatial triad (e[1], e[2], e[3]) inside the observer's instantaneous rest frame.
     /// `yaw` rotates in the (e[3], e[1]) plane; `pitch` in the (e[3], e[2]) plane; `roll` in (e[1], e[2]).
     pub fn rotate_local(&mut self, yaw: f32, pitch: f32, roll: f32) {

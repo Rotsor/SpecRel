@@ -82,6 +82,8 @@ fn held_input(window: &Window) -> HeldInput {
         thrust_left: down(Key::A),
         thrust_up: down(Key::Space),
         thrust_down: down(Key::C) || down(Key::LeftShift),
+        brake: down(Key::X),
+        match_velocity: down(Key::V),
         scrub_back: down(Key::LeftBracket),
         scrub_forward: down(Key::RightBracket),
         move_forward: down(Key::I),

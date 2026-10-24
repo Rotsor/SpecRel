@@ -125,7 +125,7 @@ On touch screens, the **Thrust** and **Teleport** button rows under the viewport
 | **`1` – `6`** / **`N`**, **`B`** | Switch between the 5 Special Relativity demo scenes and the Dynamic Mode billiards scene |
 | **`W` `A` `S` `D`** / **`Space`** / **`C`** | Fire proper-acceleration thrusters (Lorentz boost in local frame) |
 | **`V`** | Toggle velocity match with the scene's moving object (Pole / Train / Traveler) |
-| **`X`** | Brake immediately to the Lab rest frame ($\boldsymbol{\beta} = 0$) |
+| **`X`** | Brake immediately to the Lab rest frame ($\boldsymbol{\beta} = 0$). In a multiplayer match, `X` and `V` steer gradually while held (see below) |
 | **`Arrow Keys`** / **`Q` `E`** | Rotate local camera look direction (Yaw / Pitch / Roll) |
 | **`G`** | Cycle Spacetime View: **Real Camera ($ds^2 = 0$)** $\to$ **God's Eye ($dt' = 0$)** $\to$ **Frontier (future cone)** $\to$ **Prophecy ($dt' = +\Delta$)** |
 | **`PageUp`** / **`PageDown`** | Push the Prophecy slice further into / back from the future ($\Delta$ = 0.5 .. 20 s) |
