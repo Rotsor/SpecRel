@@ -3,8 +3,14 @@
 
 pub mod game;
 pub mod link;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod p2p;
 pub mod pacing;
 pub mod protocol;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod rendezvous;
 pub mod session;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod stun;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod tcp;

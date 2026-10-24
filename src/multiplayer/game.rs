@@ -125,6 +125,8 @@ impl Match {
     pub fn status(&self) -> String {
         let other = if let Some(problem) = &self.problem {
             problem.clone()
+        } else if self.session.peer_left() && !self.session.peer_joined() {
+            "COULD NOT CONNECT".to_string()
         } else if self.session.peer_left() {
             "LEFT".to_string()
         } else if !self.session.peer_joined() {

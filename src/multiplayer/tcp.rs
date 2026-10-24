@@ -5,11 +5,9 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use super::link::{Link, LinkState};
+use super::link::{push_frame, split_frames, Link, LinkState};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Larger frames are treated as a corrupt stream.
-const MAX_FRAME: usize = 64 << 20;
 
 /// A [`Link`] over TCP. The host accepts its first peer lazily, while being polled by
 /// `send`/`recv`; until then its state is `Connecting`.
@@ -134,26 +132,10 @@ impl TcpLink {
             }
             break;
         }
-        failed |= !self.split_frames();
+        failed |= !split_frames(&mut self.input, &mut self.frames);
         if failed {
             self.close();
         }
-    }
-
-    /// Moves whole frames from `input` to `frames`; false on a corrupt length.
-    fn split_frames(&mut self) -> bool {
-        let mut start = 0;
-        while let Some(header) = self.input.get(start..start + 4) {
-            let len = u32::from_le_bytes(header.try_into().unwrap()) as usize;
-            if len > MAX_FRAME {
-                return false;
-            }
-            let Some(frame) = self.input.get(start + 4..start + 4 + len) else { break };
-            self.frames.push_back(frame.to_vec());
-            start += 4 + len;
-        }
-        self.input.drain(..start);
-        true
     }
 
     fn close(&mut self) {
@@ -175,9 +157,7 @@ impl Link for TcpLink {
         if self.state() != LinkState::Open {
             return;
         }
-        let len = u32::try_from(frame.len()).expect("frame too large");
-        self.out.extend_from_slice(&len.to_le_bytes());
-        self.out.extend_from_slice(frame);
+        push_frame(&mut self.out, frame);
         self.flush();
     }
 

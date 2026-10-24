@@ -26,6 +26,36 @@ pub trait Link {
     fn state(&self) -> LinkState;
 }
 
+/// Larger frames in a length-prefixed stream are treated as corruption.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_FRAME: usize = 64 << 20;
+
+/// Appends `frame` to a byte stream as a `u32` LE length followed by the bytes.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn push_frame(out: &mut Vec<u8>, frame: &[u8]) {
+    let len = u32::try_from(frame.len()).expect("frame too large");
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(frame);
+}
+
+/// Moves the whole frames at the start of the length-prefixed stream `input` to `frames`.
+/// Returns false on a corrupt length.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn split_frames(input: &mut Vec<u8>, frames: &mut VecDeque<Vec<u8>>) -> bool {
+    let mut start = 0;
+    while let Some(header) = input.get(start..start + 4) {
+        let len = u32::from_le_bytes(header.try_into().unwrap()) as usize;
+        if len > MAX_FRAME {
+            return false;
+        }
+        let Some(frame) = input.get(start + 4..start + 4 + len) else { break };
+        frames.push_back(frame.to_vec());
+        start += 4 + len;
+    }
+    input.drain(..start);
+    true
+}
+
 struct LocalShared {
     /// Frames waiting to be received by end 0 and end 1.
     inbox: [VecDeque<Vec<u8>>; 2],

@@ -61,7 +61,8 @@ Switch scenes at any time with keys **`1`–`5`** or **`N` / `B`**:
 Two players each fly a ship over the billiards table, and both see the same causally simulated world, each through their own past light cone (see [`docs/MULTIPLAYER.md`](docs/MULTIPLAYER.md)). An event is decided only once it has left **both** players' future light cones. Your past cone can be drawn only while you stay out of the future cone of the last event you know of the other player. Fly away fast and come back, and you have aged less but covered more lab time than a player who stayed put (the twin paradox, played for real). The game then holds you with **WAITING FOR THE OTHER PLAYER** until the other player catches up in your common centre-of-momentum frame. The other ship is drawn as a clock cube, so you can read their proper time. Shots, flashes and collisions are shared, and both players' replicas of the world agree bit for bit.
 
 * **Desktop:** `cargo run --release -- --host [PORT]` (player 1; port 7777 by default) and `cargo run --release -- --join HOST:PORT` (player 2).
-* **Browser:** open `index.html?mp=0` and `index.html?mp=1` in two tabs of the same browser.
+* **Desktop, peer to peer through NATs:** both players run `cargo run --release -- --p2p`, then paste each other's code (each player's public address comes from STUN). To skip the pasting, someone with a public IP runs `cargo run --release -- --rendezvous`, and both players run `--p2p ROOM@SERVER` with the same room name.
+* **Browser:** open `index.html?mp=0` and `index.html?mp=1` in two tabs of the same browser, or play on two computers peer to peer over WebRTC: one player opens `index.html?p2p=host`, the other opens `index.html?p2p=join`, and they swap the invite and reply codes.
 
 ---
 
@@ -155,7 +156,7 @@ If you are reading the code to learn how Special Relativity is implemented geome
 6. [`src/shaders/render.wgsl`](src/shaders/render.wgsl) — High-performance WGSL compute shader executing full 4D BVH traversal, intersection, procedural clock dials, and lighting on the GPU.
 7. [`src/scene.rs`](src/scene.rs) — The 5 Special Relativity demo scenes with multi-iteration periodic worldtubes (`for_periodic_copies`) and physics verification tests.
    - [`src/dynamic/`](src/dynamic/mod.rs) — Causal Dynamic Mode: bodies with `f64` histories extended exactly up to the camera's future light cone (`DynWorld`, the frontier rule `is_decided`), and the billiards scene.
-   - [`src/multiplayer/`](src/multiplayer/mod.rs) — Two-player matches: wire protocol, links (TCP, in-process, browser queue), handshake/replay (`Session`), CM-frame pacing (`Pacer`) and the App-facing `Match`.
+   - [`src/multiplayer/`](src/multiplayer/mod.rs) — Two-player matches: wire protocol, links (TCP, UDP peer to peer with NAT hole punching, in-process, browser queue), STUN and rendezvous, handshake/replay (`Session`), CM-frame pacing (`Pacer`) and the App-facing `Match`.
 8. [`src/hud.rs`](src/hud.rs) — Software 5x7 bitmap font renderer for HUD, GPU HUD overlay buffer, and in-scene digital clock readouts.
 9. [`src/app.rs`](src/app.rs) — Frontend-independent app state shared by desktop and web: scene selection, observer camera, relativistic flight controls (`Action` / `HeldInput`), time controls and per-frame dynamics.
 10. [`src/main.rs`](src/main.rs) — Native desktop window loop (`minifb`): key bindings and GPU/CPU backend switching.

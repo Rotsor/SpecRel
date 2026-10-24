@@ -93,16 +93,25 @@ fn held_input(window: &Window) -> HeldInput {
     }
 }
 
-/// `--host [PORT]` (player 1) or `--join HOST:PORT` (player 2): the link to the other player of
-/// a two-player match, if one was asked for. Exits on a bad address.
+/// `Some(value)` if `flag` is present, where `value` is the argument after it unless that is
+/// another flag.
+#[cfg(not(target_arch = "wasm32"))]
+fn flag_value(args: &[String], flag: &str) -> Option<Option<String>> {
+    let i = args.iter().position(|a| a == flag)?;
+    Some(args.get(i + 1).filter(|v| !v.starts_with("--")).cloned())
+}
+
+/// `--host [PORT]` (player 1) or `--join HOST:PORT` (player 2) over TCP, or `--p2p [ROOM@SERVER]`
+/// over UDP with NAT hole punching: the link to the other player of a two-player match, if one
+/// was asked for. Exits on a bad address.
 #[cfg(not(target_arch = "wasm32"))]
 fn multiplayer_link(args: &[String]) -> Option<(dynamic::PlayerId, Box<dyn multiplayer::link::Link>)> {
     use multiplayer::tcp::TcpLink;
     const DEFAULT_PORT: u16 = 7777;
-    let value_after = |flag: &str| {
-        let i = args.iter().position(|a| a == flag)?;
-        Some(args.get(i + 1).filter(|v| !v.starts_with("--")).cloned())
-    };
+    let value_after = |flag: &str| flag_value(args, flag);
+    if let Some(via) = value_after("--p2p") {
+        return Some(p2p_link(args, via));
+    }
     let link = if let Some(port) = value_after("--host") {
         let port = port.map_or(Ok(DEFAULT_PORT), |p| p.parse()).unwrap_or_else(|_| {
             eprintln!("--host takes a port number");
@@ -126,12 +135,114 @@ fn multiplayer_link(args: &[String]) -> Option<(dynamic::PlayerId, Box<dyn multi
     }
 }
 
+/// Sets up a peer-to-peer match: binds a UDP socket (`--udp-port`, default any), swaps
+/// addresses with the other player, through the rendezvous server in `via` (`ROOM@HOST:PORT`)
+/// or by pasting codes (public address from STUN, `--stun HOST:PORT` to override), and starts
+/// punching. Exits if that fails.
+#[cfg(not(target_arch = "wasm32"))]
+fn p2p_link(args: &[String], via: Option<String>) -> (dynamic::PlayerId, Box<dyn multiplayer::link::Link>) {
+    use multiplayer::p2p::{P2pEndpoint, PeerInfo};
+    use std::io::{BufRead, Write};
+    use std::net::{SocketAddr, ToSocketAddrs};
+    use std::time::Duration;
+
+    let fail = |what: &str, e: &dyn std::fmt::Display| -> ! {
+        eprintln!("{what}: {e}");
+        std::process::exit(1)
+    };
+    let port = match flag_value(args, "--udp-port") {
+        Some(p) => p.and_then(|p| p.parse().ok()).unwrap_or_else(|| {
+            eprintln!("--udp-port takes a port number");
+            std::process::exit(2)
+        }),
+        None => 0,
+    };
+    let mut endpoint = P2pEndpoint::bind(port).unwrap_or_else(|e| fail("Could not open a UDP socket", &e));
+
+    let peer = if let Some(via) = via {
+        let Some((room, server)) = via.rsplit_once('@') else {
+            eprintln!("--p2p takes ROOM@HOST:PORT (or nothing, to swap codes by hand)");
+            std::process::exit(2)
+        };
+        let server = if server.contains(':') {
+            server.to_string()
+        } else {
+            format!("{server}:{}", multiplayer::rendezvous::DEFAULT_PORT)
+        };
+        let server = (server.to_socket_addrs().ok().into_iter().flatten())
+            .find_map(|a| match a {
+                SocketAddr::V4(a) => Some(a),
+                SocketAddr::V6(_) => None,
+            })
+            .unwrap_or_else(|| fail("Could not resolve the rendezvous server", &server));
+        println!("Waiting for the other player in room \"{room}\" at {server}...");
+        endpoint
+            .rendezvous(server, room, Duration::from_secs(600))
+            .unwrap_or_else(|e| fail("Could not meet the other player", &e))
+    } else {
+        let stun = flag_value(args, "--stun").flatten();
+        let servers: Vec<&str> = match &stun {
+            Some(s) => vec![s.as_str()],
+            None => multiplayer::stun::DEFAULT_SERVERS.to_vec(),
+        };
+        println!("Asking STUN for this machine's public address...");
+        match endpoint.discover(&servers, Duration::from_secs(3)) {
+            Ok(addr) => println!("Public address: {addr}"),
+            Err(e) => println!("No public address ({e}); only players on this network can connect"),
+        }
+        println!("\nYour code (send it to the other player):\n\n    {}\n", endpoint.code());
+        let own_nonce = endpoint.info().nonce;
+        endpoint.keep_mapping_while(|| {
+            let stdin = std::io::stdin();
+            let mut lines = stdin.lock().lines();
+            loop {
+                print!("Paste the other player's code and press Enter: ");
+                let _ = std::io::stdout().flush();
+                let Some(Ok(line)) = lines.next() else { std::process::exit(1) };
+                match PeerInfo::from_code(&line) {
+                    Some(peer) if peer.nonce == own_nonce => {
+                        println!("That is your own code; paste the other player's.")
+                    }
+                    Some(peer) => break peer,
+                    None if line.trim().is_empty() => {}
+                    None => println!("That is not a valid code."),
+                }
+            }
+        })
+    };
+
+    let (player, link) = endpoint.connect(peer).unwrap_or_else(|e| fail("Could not start the match", &e));
+    println!("Punching through to the other player; you are player {}.", player + 1);
+    (player, Box::new(link))
+}
+
+/// `--rendezvous [PORT]`: run a rendezvous server for `--p2p ROOM@HOST:PORT` until killed.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_rendezvous(port: Option<String>) -> ! {
+    use multiplayer::rendezvous::{RendezvousServer, DEFAULT_PORT};
+    let port: u16 = port.map_or(Ok(DEFAULT_PORT), |p| p.parse()).unwrap_or_else(|_| {
+        eprintln!("--rendezvous takes a port number");
+        std::process::exit(2)
+    });
+    let result = RendezvousServer::bind(([0, 0, 0, 0], port).into()).and_then(|mut server| {
+        println!("Rendezvous server on UDP port {port}; players run: --p2p ROOM@<this-host>:{port}");
+        server.serve(None)
+    });
+    if let Err(e) = result {
+        eprintln!("Rendezvous server failed: {e}");
+    }
+    std::process::exit(1)
+}
+
 #[cfg(target_arch = "wasm32")]
 fn main() {}
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(port) = flag_value(&args, "--rendezvous") {
+        run_rendezvous(port);
+    }
 
     println!("Building {} demo scenes and 4D BVHs...", DemoScene::ALL.len());
     let build_start = Instant::now();

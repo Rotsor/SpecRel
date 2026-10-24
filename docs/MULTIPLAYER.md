@@ -81,6 +81,10 @@ src/multiplayer/protocol.rs Message + compact binary encoding
 src/multiplayer/pacing.rs   CM-frame lead, stop/resume rule (Pacer)
 src/multiplayer/link.rs     Link trait; LocalLink (in-process pair); QueueLink (frontend-driven)
 src/multiplayer/tcp.rs      native TcpLink (--host / --join), u32-length-prefixed frames
+src/multiplayer/p2p.rs      native UdpLink (--p2p): NAT hole punching, reliable ordered frames
+                            over UDP; P2pEndpoint, peer codes
+src/multiplayer/stun.rs     minimal STUN Binding client (public address discovery)
+src/multiplayer/rendezvous.rs  UDP rendezvous server (--rendezvous) and its client
 src/multiplayer/session.rs  Session: Hello handshake, sequencing, log replay, events
 src/app.rs                  App::new_multiplayer; applies remote events; paces the local ship
 src/main.rs, src/web.rs, web/index.html   transports, CLI/URL, "waiting" banner
@@ -98,7 +102,7 @@ Every frame is `seq: u32 LE` followed by one encoded `Message`:
 | `Flash` | emission event (`f32` ×4) |
 | `Bye` | sender quits |
 
-Links are reliable and ordered once open (TCP, BroadcastChannel, WebSocket), but frames sent
+Links are reliable and ordered once open (TCP, reliable UDP, BroadcastChannel, WebRTC), but frames sent
 before the peer was listening are lost. A session therefore keeps a log of everything it has sent
 until the peer's `Hello` arrives. It then replays the whole log, and the receiver drops sequence
 numbers it has already seen. When the peer leaves (`Bye`, or the link closes), its ship stops
@@ -106,18 +110,70 @@ being an input source: its track ends and its cone is removed from the frontier.
 
 ### Transports
 
-* **Native:** `cargo run --release -- --host 7777` and `cargo run --release -- --join 127.0.0.1:7777`.
+* **Native, TCP:** `cargo run --release -- --host 7777` and `cargo run --release -- --join 127.0.0.1:7777`.
+  The host needs a reachable port.
+* **Native, peer to peer:** `cargo run --release -- --p2p` on both machines (see below).
 * **Web:** `index.html?mp=0` and `index.html?mp=1` in two tabs of the same browser, connected
-  through a `BroadcastChannel`. JS ferries opaque frames to and from WASM
+  through a `BroadcastChannel`; or `index.html?p2p=host` and `index.html?p2p=join` on two
+  computers, connected through a WebRTC data channel. JS ferries opaque frames to and from WASM
   (`web_net_*` exports).
 
 The host is player 0 (the usual spawn point). The joiner is player 1, mirrored to the far side of
-the table and facing it. In multiplayer, scene switching and reset are disabled.
+the table and facing it. In a native peer-to-peer match, the player with the smaller random nonce
+is player 0. In multiplayer, scene switching and reset are disabled.
+
+### Peer to peer and NAT punch-through
+
+Most players are behind a NAT that drops unsolicited incoming packets, so neither of them can be
+a TCP host. Both peer-to-peer modes therefore use *hole punching*. Each side learns the
+addresses it can be reached at. The two sides swap those addresses, then send packets to each
+other at the same time. Each outgoing packet opens a mapping in the sender's own NAT, so the
+other side's packets are let in as replies.
+
+**Native (`--p2p`, `src/multiplayer/p2p.rs`).** Everything goes through one UDP socket
+(`--udp-port`, default any), so the mapping that STUN reports is the one the peer will reach.
+
+1. *Candidates:* the LAN address and loopback, plus the public address from a STUN Binding
+   request (`stun.l.google.com:19302`, `stun.cloudflare.com:3478`, or `--stun HOST:PORT`).
+2. *Exchange*, in one of two ways:
+   * By hand: each player prints a code (`SR4D-…`, base32 of a random `u64` nonce and the
+     candidates) and pastes the other player's. While the program waits for the paste, it pings
+     STUN every 10 s so the NAT keeps the public mapping.
+   * Through a rendezvous server: `--rendezvous [PORT]` (UDP 7778 by default) on any host with a
+     public IP. Both players run `--p2p ROOM@HOST[:PORT]`. The server answers each player with
+     the other's nonce, the public address the server saw that player's packets come from, and
+     that player's LAN candidates. It carries no game traffic.
+3. *Punching:* both sides send `Punch` packets to every candidate of the other every 100 ms.
+   The first packet from the peer locks the link onto its source address, and the link becomes
+   `Open`. The punch gives up after 3 minutes.
+4. *Reliable stream:* the frames form the same `u32`-length-prefixed stream as TCP, cut into
+   segments of at most 1200 bytes. Each segment is numbered, acknowledged (cumulatively, plus a
+   64-segment selective bitmap) and retransmitted after an adaptive timeout (Jacobson/Karn RTT
+   estimate, exponential backoff). At most 256 segments are in flight. An idle link sends a
+   keepalive every 250 ms, and 10 s of silence closes it. When the link is dropped, it waits up
+   to 0.5 s for its last frames (the session's `Bye`) to be acknowledged.
+
+Every packet carries `b"SR4P"`, a kind byte, and the sender's and receiver's nonces. Stray
+datagrams, late STUN answers and our own punches bounced back from our own address are therefore
+ignored.
+
+**Web (`?p2p=host` / `?p2p=join`).** The browser's ICE agent does the gathering and the punching.
+The players carry the SDP offer and answer by hand. The host's page shows an invite code
+(`SR4W…`: deflate-raw of the SDP with every ICE candidate already gathered, in base64url). The
+joiner pastes it and gets a reply code, and the host pastes that. The data channel is reliable
+and ordered, and both sides pre-negotiate it as id 0.
+
+**Limits.** Hole punching needs at least one side's NAT to keep the same public port for
+every destination ("endpoint-independent mapping"), which most home routers do. If both players
+are behind symmetric NATs (some carrier-grade and corporate NATs), no direct path exists. The
+punch then times out (native: **COULD NOT CONNECT**; web: a message in the panel). That case
+would need a TURN-style relay, which is not implemented. Native peer-to-peer is IPv4 only, and
+native and web players cannot play each other.
 
 ## 4. Not done yet
 
 * Ship–ship collisions. Ships pass through each other: a collision needs both tracks at the same
   lab time, which forces lockstep at contact range.
 * More than two players (the world supports N ships; session and pacing are 2-player).
-* Cross-machine web play (needs a WebSocket relay) and native↔web play.
+* A relay for players who are both behind symmetric NATs, and native↔web play (native WebRTC).
 * Coordinated lab-time rebase for very long sessions.

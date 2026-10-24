@@ -189,6 +189,62 @@
       color: var(--cyan);
       font-size: 12px;
     }
+    .mp-sep {
+      color: var(--muted);
+      margin: 0 4px;
+    }
+    #p2p-panel {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      width: min(520px, calc(100% - 32px));
+      max-height: calc(100% - 32px);
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 16px;
+      background: rgba(16, 22, 38, 0.94);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      z-index: 6;
+    }
+    #p2p-title {
+      color: var(--accent);
+      font-weight: 700;
+      letter-spacing: 1px;
+      order: 0;
+    }
+    .p2p-step {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .p2p-step label {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .p2p-step textarea {
+      width: 100%;
+      box-sizing: border-box;
+      resize: vertical;
+      background: var(--bg);
+      color: var(--cyan);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 6px;
+      font: 11px/1.4 ui-monospace, Consolas, monospace;
+      word-break: break-all;
+    }
+    .p2p-step button {
+      align-self: flex-start;
+    }
+    #p2p-status {
+      font-size: 12px;
+      color: var(--accent);
+      order: 3;
+    }
   </style>
 </head>
 <body>
@@ -206,6 +262,20 @@
       <div id="loading-text">Building 5 Special Relativity 4D Worldtube Scenes &amp; SAH BVHs...</div>
     </div>
     <div id="mp-banner" hidden></div>
+    <div id="p2p-panel" hidden>
+      <div id="p2p-title"></div>
+      <div class="p2p-step" id="p2p-in-step">
+        <label for="p2p-in" id="p2p-in-label"></label>
+        <textarea id="p2p-in" rows="3" spellcheck="false" placeholder="Paste the code here"></textarea>
+        <button id="p2p-connect">Connect</button>
+      </div>
+      <div class="p2p-step" id="p2p-out-step">
+        <label for="p2p-out" id="p2p-out-label"></label>
+        <textarea id="p2p-out" rows="3" spellcheck="false" readonly></textarea>
+        <button id="p2p-copy">Copy</button>
+      </div>
+      <div id="p2p-status"></div>
+    </div>
   </div>
 
   <div class="controls-bar">
@@ -215,9 +285,12 @@
         <button id="mp-start">Start 2-player match</button>
         <a class="mp-link" href="?mp=0">Player 1</a>
         <a class="mp-link" href="?mp=1" target="_blank">Player 2</a>
+        <span class="mp-sep">·</span>
+        <a class="mp-link" href="?p2p=host">Host online</a>
+        <a class="mp-link" href="?p2p=join">Join online</a>
       </span>
       <span id="mp-label" hidden></span>
-      <span class="hint" id="mp-hint">Opens two tabs of this browser; each player controls a ship</span>
+      <span class="hint" id="mp-hint">Two tabs of this browser, or two computers peer to peer; each player controls a ship</span>
     </div>
     <div class="btn-row" id="scene-row">
       <span class="row-label">Scenes:</span>
@@ -448,39 +521,47 @@
       return new Uint8Array(wasm.memory.buffer, ptr, len);
     }
 
-    // Two-player match: `?mp=0` / `?mp=1` picks our side; anything else is single player.
-    const mpParam = new URLSearchParams(location.search).get("mp");
-    const mpPlayer = mpParam === "0" || mpParam === "1" ? Number(mpParam) : -1;
+    // Two-player match: `?mp=0` / `?mp=1` picks our side of a match between two tabs of this
+    // browser; `?p2p=host` / `?p2p=join` plays against another computer over WebRTC (the host is
+    // player 1). Anything else is single player.
+    const params = new URLSearchParams(location.search);
+    const mpParam = params.get("mp");
+    const p2pRole = ["host", "join"].includes(params.get("p2p")) ? params.get("p2p") : null;
+    const mpPlayer = p2pRole
+      ? (p2pRole === "host" ? 0 : 1)
+      : (mpParam === "0" || mpParam === "1" ? Number(mpParam) : -1);
 
-    // Ferry opaque frames between WASM's QueueLink and a BroadcastChannel (two tabs, same origin).
+    // Ferry opaque frames between WASM's QueueLink and the transport: a BroadcastChannel (two
+    // tabs, same origin) or a WebRTC data channel (peer to peer).
     function setupMultiplayer(wasm) {
       document.getElementById("mp-single").hidden = true;
       document.getElementById("mp-hint").hidden = true;
       const label = document.getElementById("mp-label");
       label.hidden = false;
-      label.textContent = `2-PLAYER MATCH: YOU ARE PLAYER ${mpPlayer + 1}`;
+      const kind = p2pRole ? "ONLINE MATCH" : "2-PLAYER MATCH";
+      label.textContent = `${kind}: YOU ARE PLAYER ${mpPlayer + 1}`;
       // The app pins multiplayer to Dynamic Mode and ignores scene switching and reset.
       document.getElementById("scene-row").hidden = true;
       document.querySelectorAll('button[data-key="18"]').forEach((b) => (b.disabled = true));
 
-      const channel = new BroadcastChannel("specrel-mp");
-      // Frames lost before the other tab opens are fine: the session replays its log on Hello.
-      wasm.web_net_set_state(1);
-      channel.onmessage = (e) => {
-        const msg = e.data;
-        if (!msg || msg.from === mpPlayer || !(msg.frame instanceof ArrayBuffer)) return;
-        const bytes = new Uint8Array(msg.frame);
-        // The inbox call may grow WASM memory, so create the view over it afterwards.
-        const ptr = wasm.web_net_inbox_ptr(bytes.length);
-        new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
-        wasm.web_net_push_incoming(bytes.length);
+      const link = {
+        deliver(bytes) {
+          // The inbox call may grow WASM memory, so create the view over it afterwards.
+          const ptr = wasm.web_net_inbox_ptr(bytes.length);
+          new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
+          wasm.web_net_push_incoming(bytes.length);
+        },
+        // 0 connecting, 1 open, 2 closed.
+        setState(state) {
+          wasm.web_net_set_state(state);
+        },
       };
+      const transport = p2pRole ? setupWebRtc(p2pRole, link) : setupBroadcast(link);
       const flush = () => {
         for (;;) {
           const len = wasm.web_net_take_outgoing();
           if (len < 0) break;
-          const frame = wasmBytes(wasm, wasm.web_net_outgoing_ptr(), len).slice().buffer;
-          channel.postMessage({ from: mpPlayer, frame });
+          transport.send(wasmBytes(wasm, wasm.web_net_outgoing_ptr(), len).slice().buffer);
         }
       };
       let closed = false;
@@ -489,10 +570,171 @@
         closed = true;
         wasm.web_leave();
         flush();
-        wasm.web_net_set_state(2);
-        channel.close();
+        link.setState(2);
+        transport.close();
       });
       return { flush };
+    }
+
+    function setupBroadcast(link) {
+      const channel = new BroadcastChannel("specrel-mp");
+      // Frames lost before the other tab opens are fine: the session replays its log on Hello.
+      link.setState(1);
+      channel.onmessage = (e) => {
+        const msg = e.data;
+        if (!msg || msg.from === mpPlayer || !(msg.frame instanceof ArrayBuffer)) return;
+        link.deliver(new Uint8Array(msg.frame));
+      };
+      return {
+        send: (frame) => channel.postMessage({ from: mpPlayer, frame }),
+        close: () => channel.close(),
+      };
+    }
+
+    // ---- Peer to peer over WebRTC ----
+    //
+    // The browser does the NAT traversal (ICE with STUN). We only need to carry one offer and
+    // one answer between the players, which they paste to each other as codes: "SR4W", a
+    // format letter (Z: deflate-raw, J: plain JSON), then base64url of `{t: type, s: sdp}`.
+    // The SDP includes every ICE candidate gathered, so no further signalling is needed.
+
+    const ICE_SERVERS = [{ urls: ["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"] }];
+    const ICE_GATHER_TIMEOUT_MS = 5000;
+
+    function toBase64Url(bytes) {
+      let s = "";
+      for (const b of bytes) s += String.fromCharCode(b);
+      return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    }
+
+    function fromBase64Url(text) {
+      const s = atob(text.replace(/-/g, "+").replace(/_/g, "/"));
+      return Uint8Array.from(s, (c) => c.charCodeAt(0));
+    }
+
+    async function pipeBytes(bytes, stream) {
+      const out = new Response(new Blob([bytes]).stream().pipeThrough(stream));
+      return new Uint8Array(await out.arrayBuffer());
+    }
+
+    async function packCode(desc) {
+      let bytes = new TextEncoder().encode(JSON.stringify({ t: desc.type, s: desc.sdp }));
+      let format = "J";
+      if (typeof CompressionStream === "function") {
+        bytes = await pipeBytes(bytes, new CompressionStream("deflate-raw"));
+        format = "Z";
+      }
+      return `SR4W${format}${toBase64Url(bytes)}`;
+    }
+
+    async function unpackCode(text) {
+      text = text.replace(/\s+/g, "");
+      if (!text.startsWith("SR4W")) throw new Error("That is not a SpecRel online-match code.");
+      let bytes = fromBase64Url(text.slice(5));
+      if (text[4] === "Z") bytes = await pipeBytes(bytes, new DecompressionStream("deflate-raw"));
+      const { t, s } = JSON.parse(new TextDecoder().decode(bytes));
+      return { type: t, sdp: s };
+    }
+
+    // Host: make an invite, then accept the reply. Join: accept the invite, then make a reply.
+    function setupWebRtc(role, link) {
+      const $ = (id) => document.getElementById(id);
+      const panel = $("p2p-panel");
+      const out = $("p2p-out");
+      const input = $("p2p-in");
+      const status = (text) => ($("p2p-status").textContent = text);
+      panel.hidden = false;
+      const host = role === "host";
+      $("p2p-title").textContent = host ? "Host an online match" : "Join an online match";
+      $("p2p-out-label").textContent = host
+        ? "1. Send this invite code to the other player"
+        : "2. Send this reply code back to the host";
+      $("p2p-in-label").textContent = host
+        ? "2. Paste the other player's reply code"
+        : "1. Paste the host's invite code";
+      $("p2p-in-step").style.order = host ? 2 : 1;
+      $("p2p-out-step").style.order = host ? 1 : 2;
+      $("p2p-out-step").hidden = !host;
+
+      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      // Negotiated on both sides with the same id, so neither waits for `ondatachannel`.
+      const dc = pc.createDataChannel("specrel", { negotiated: true, id: 0, ordered: true });
+      dc.binaryType = "arraybuffer";
+      dc.onopen = () => {
+        link.setState(1);
+        panel.hidden = true;
+      };
+      dc.onclose = () => link.setState(2);
+      dc.onmessage = (e) => link.deliver(new Uint8Array(e.data));
+      pc.onconnectionstatechange = () => {
+        const state = pc.connectionState;
+        if (state === "connecting") status("Connecting...");
+        if (state === "failed") {
+          status("Could not connect: no direct path between the two networks.");
+          panel.hidden = false;
+          link.setState(2);
+        }
+      };
+
+      // Waits until every ICE candidate is in the local description (or a few seconds pass).
+      const gathered = () => new Promise((resolve) => {
+        if (pc.iceGatheringState === "complete") return resolve();
+        pc.addEventListener("icegatheringstatechange", () => {
+          if (pc.iceGatheringState === "complete") resolve();
+        });
+        setTimeout(resolve, ICE_GATHER_TIMEOUT_MS);
+      });
+      const showLocal = async () => {
+        status("Finding network addresses...");
+        await gathered();
+        out.value = await packCode(pc.localDescription);
+        $("p2p-out-step").hidden = false;
+        status(host ? "Waiting for the reply code." : "Waiting for the host to paste the reply code.");
+      };
+
+      const fail = (e) => status(e instanceof Error ? e.message : String(e));
+      if (host) {
+        pc.createOffer().then((offer) => pc.setLocalDescription(offer)).then(showLocal).catch(fail);
+      }
+      $("p2p-connect").addEventListener("click", async () => {
+        try {
+          const desc = await unpackCode(input.value);
+          const expected = host ? "answer" : "offer";
+          if (desc.type !== expected) {
+            throw new Error(host ? "That is an invite code; paste the reply code." : "That is a reply code; paste the invite code.");
+          }
+          await pc.setRemoteDescription(desc);
+          $("p2p-connect").disabled = true;
+          input.readOnly = true;
+          if (!host) {
+            await pc.setLocalDescription(await pc.createAnswer());
+            await showLocal();
+          } else {
+            status("Connecting...");
+          }
+        } catch (e) {
+          fail(e);
+        }
+      });
+      $("p2p-copy").addEventListener("click", async () => {
+        out.select();
+        try {
+          await navigator.clipboard.writeText(out.value);
+          $("p2p-copy").textContent = "Copied";
+        } catch {
+          document.execCommand("copy");
+        }
+      });
+
+      return {
+        send(frame) {
+          if (dc.readyState === "open") dc.send(frame);
+        },
+        close() {
+          dc.close();
+          pc.close();
+        },
+      };
     }
 
     // Single player: one click opens both sides of a match (this tab and a new one).
@@ -688,6 +930,8 @@
 
         // Input wiring (keyboard, buttons, mouse/touch drag)
         window.addEventListener("keydown", (e) => {
+          // Typing a P2P code is not flying.
+          if (e.target instanceof Element && e.target.closest("textarea, input")) return;
           const holdCode = HELD_KEY_MAP[e.code];
           if (holdCode !== undefined) {
             e.preventDefault();
