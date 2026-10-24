@@ -62,7 +62,7 @@ Two players each fly a ship over the billiards table, and both see the same caus
 
 * **Desktop:** `cargo run --release -- --host [PORT]` (player 1; port 7777 by default) and `cargo run --release -- --join HOST:PORT` (player 2).
 * **Desktop, peer to peer through NATs:** both players run `cargo run --release -- --p2p`, then paste each other's code (each player's public address comes from STUN). To skip the pasting, someone with a public IP runs `cargo run --release -- --rendezvous`, and both players run `--p2p ROOM@SERVER` with the same room name.
-* **Browser:** open `index.html?mp=0` and `index.html?mp=1` in two tabs of the same browser, or play on two computers peer to peer over WebRTC: one player opens `index.html?p2p=host`, the other opens `index.html?p2p=join`, and they swap the invite and reply codes. To skip the codes, run the signalling server `node server/signal.mjs --static web` and have both players open it with the same room: `?p2p=host&room=NAME` and `?p2p=join&room=NAME` (see [`docs/MULTIPLAYER.md`](docs/MULTIPLAYER.md)).
+* **Browser:** open `index.html?mp=0` and `index.html?mp=1` in two tabs of the same browser, or play on two computers peer to peer over WebRTC: one player opens `index.html?p2p=host`, the other opens `index.html?p2p=join`, and they swap the invite and reply codes. To skip the codes, run the lobby server `node server/signal.mjs --static web`: one player presses **Create online lobby** and sends the link it shows, and the match starts (paused until then) when the other player opens it. A TURN relay on the same server covers networks with no direct path. See [`docs/HOSTING.md`](docs/HOSTING.md) to host it on a VPS and [`docs/MULTIPLAYER.md`](docs/MULTIPLAYER.md) for how it works.
 
 ---
 
