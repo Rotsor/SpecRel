@@ -8,10 +8,14 @@
 //!    memory into browser WebGPU (`navigator.gpu`).
 //! 3. Step the relativistic observer camera, Lorentz boosts, proper time, and HUD each frame,
 //!    supporting both zero-readback WebGPU compute rendering and CPU reference rendering.
+//! 4. Play a two-player match (`web_init(_, player)`): JS ferries opaque frames between the
+//!    match's [`QueueLink`] and a `BroadcastChannel` through the `web_net_*` exports.
 
 use crate::app::{Action, App, HeldInput};
 use crate::gpu::{build_tables_data, GpuUniforms, PackedSceneGpuData, RENDER_WGSL};
+use crate::dynamic::PlayerId;
 use crate::hud::{draw_hud, draw_hud_overlay, HUD_BASE_WIDTH, HUD_OVERLAY_HEIGHT};
+use crate::multiplayer::link::{LinkState, QueueLink, QueueLinkHandle};
 use crate::renderer::render_frame;
 use crate::scene::{DemoScene, Scene4D};
 use std::cell::UnsafeCell;
@@ -139,6 +143,12 @@ struct WebState {
     hud_overlay: Vec<u32>,
     cpu_fb: Vec<u32>,
     cpu_rgba: Vec<u32>,
+    /// The frontend's side of the match link (multiplayer only).
+    net: Option<QueueLinkHandle>,
+    /// Incoming frame bytes written by JS before `web_net_push_incoming`.
+    net_inbox: Vec<u8>,
+    /// The last frame popped by `web_net_take_outgoing`, for JS to read.
+    net_outgoing: Vec<u8>,
 }
 
 struct GlobalState(UnsafeCell<Option<WebState>>);
@@ -154,8 +164,10 @@ fn with_state<R>(f: impl FnOnce(&mut WebState) -> R) -> R {
     f(state)
 }
 
+/// Build the scenes and the app. `mp_player` is -1 for single player, or 0/1 to play that side
+/// of a two-player match whose frames JS moves through the `web_net_*` exports.
 #[no_mangle]
-pub extern "C" fn web_init(gpu_available: u32) {
+pub extern "C" fn web_init(gpu_available: u32, mp_player: i32) {
     let scenes: Vec<Scene4D> = DemoScene::ALL
         .iter()
         .map(|&demo| Scene4D::build(demo))
@@ -167,7 +179,15 @@ pub extern "C" fn web_init(gpu_available: u32) {
     let tables = build_tables_data();
 
     let has_gpu = gpu_available != 0;
-    let app = App::new(scenes, WIDTH, HEIGHT);
+    let (app, net) = match mp_player {
+        0 | 1 => {
+            let (link, handle) = QueueLink::new();
+            let app =
+                App::new_multiplayer(scenes, WIDTH, HEIGHT, mp_player as PlayerId, Box::new(link));
+            (app, Some(handle))
+        }
+        _ => (App::new(scenes, WIDTH, HEIGHT), None),
+    };
     let packed_generation = app.scene_generation;
     let uniforms = GpuUniforms::build(
         &app.camera,
@@ -193,6 +213,9 @@ pub extern "C" fn web_init(gpu_available: u32) {
         hud_overlay: vec![0u32; HUD_BASE_WIDTH * HUD_OVERLAY_HEIGHT],
         cpu_fb: vec![0u32; WIDTH * HEIGHT],
         cpu_rgba: vec![0u32; WIDTH * HEIGHT],
+        net,
+        net_inbox: Vec::new(),
+        net_outgoing: Vec::new(),
     };
 
     unsafe {
@@ -508,4 +531,83 @@ pub extern "C" fn web_cpu_rgba_ptr() -> *const u8 {
 #[no_mangle]
 pub extern "C" fn web_cpu_rgba_byte_len() -> usize {
     with_state(|s| bytemuck::cast_slice::<u32, u8>(&s.cpu_rgba).len())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Multiplayer: frame ferrying, link state and the "waiting" banner
+// ---------------------------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn web_is_multiplayer() -> u32 {
+    with_state(|s| u32::from(s.app.multiplayer.is_some()))
+}
+
+/// A buffer of `len` bytes for JS to fill with one incoming frame before calling
+/// `web_net_push_incoming(len)`. May grow WASM memory: re-create views after calling.
+#[no_mangle]
+pub extern "C" fn web_net_inbox_ptr(len: usize) -> *mut u8 {
+    with_state(|s| {
+        s.net_inbox.resize(len, 0);
+        s.net_inbox.as_mut_ptr()
+    })
+}
+
+/// Hand the first `len` bytes of the inbox buffer to the match as one frame from the peer.
+#[no_mangle]
+pub extern "C" fn web_net_push_incoming(len: usize) {
+    with_state(|s| {
+        if let Some(net) = &s.net {
+            let len = len.min(s.net_inbox.len());
+            net.push_incoming(s.net_inbox[..len].to_vec());
+        }
+    })
+}
+
+/// Pop the next frame to send to the peer into the outgoing buffer (read it via
+/// `web_net_outgoing_ptr`). Returns its length, or -1 when there is none.
+#[no_mangle]
+pub extern "C" fn web_net_take_outgoing() -> i32 {
+    with_state(|s| match s.net.as_ref().and_then(QueueLinkHandle::take_outgoing) {
+        Some(frame) => {
+            s.net_outgoing = frame;
+            s.net_outgoing.len() as i32
+        }
+        None => -1,
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn web_net_outgoing_ptr() -> *const u8 {
+    with_state(|s| s.net_outgoing.as_ptr())
+}
+
+/// Transport state from JS: 0 connecting, 1 open, 2 closed.
+#[no_mangle]
+pub extern "C" fn web_net_set_state(state: u32) {
+    with_state(|s| {
+        if let Some(net) = &s.net {
+            net.set_state(match state {
+                0 => LinkState::Connecting,
+                1 => LinkState::Open,
+                _ => LinkState::Closed,
+            });
+        }
+    })
+}
+
+/// Tell the other player we are leaving (JS then drains and posts the outgoing frames).
+#[no_mangle]
+pub extern "C" fn web_leave() {
+    with_state(|s| s.app.leave_match());
+}
+
+/// The banner to show across the screen (UTF-8), if any; `web_banner_len` is 0 when none.
+#[no_mangle]
+pub extern "C" fn web_banner_ptr() -> *const u8 {
+    with_state(|s| s.app.banner().unwrap_or("").as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn web_banner_len() -> usize {
+    with_state(|s| s.app.banner().map_or(0, str::len))
 }

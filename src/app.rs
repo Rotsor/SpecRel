@@ -3,15 +3,17 @@
 //! translate their own key events into [`Action`]s and [`HeldInput`], and keep only what is
 //! genuinely theirs (rendering backend, resolution, HUD visibility, presentation).
 
-use crate::dynamic::billiards::{Ammo, FIRE_SPEED, SHIP_MASS, SHIP_RADIUS};
+use crate::dynamic::billiards::{self, Ammo, FIRE_SPEED, SHIP_MASS, SHIP_RADIUS};
 use crate::dynamic::body::{BodyState, Impulse};
 use crate::dynamic::collide::P4;
-use crate::dynamic::DynWorld;
+use crate::dynamic::{DynWorld, PlayerId, ShipSample};
 use crate::minkowski::{Vec3, Vec4};
 use crate::renderer::{
     Camera4D, FrameDynamics, Frontier, RenderConfig, RenderMode, ShadowMode, ViewMode,
     PROPHECY_DELTA_DEFAULT,
 };
+use crate::multiplayer::game::{self, Match};
+use crate::multiplayer::link::Link;
 use crate::scene::Scene4D;
 
 pub const TIME_SCALES: [f32; 10] = [-4.0, -2.0, -1.0, -0.5, -0.25, 0.25, 0.5, 1.0, 2.0, 4.0];
@@ -100,6 +102,9 @@ pub struct App {
     pub scene_generation: u64,
     world_grew: bool,
     rebuild_timer: f32,
+    /// The two-player match this app plays in, if any (see `docs/MULTIPLAYER.md`). It pins the
+    /// app to the Dynamic Mode scene.
+    pub multiplayer: Option<Match>,
 }
 
 impl App {
@@ -126,9 +131,47 @@ impl App {
             scene_generation: 0,
             world_grew: false,
             rebuild_timer: 0.0,
+            multiplayer: None,
         };
         app.enter_scene(0);
         app
+    }
+
+    /// Play `local`'s side of a two-player match over `link`, in the Dynamic Mode scene (which
+    /// `scenes` must include).
+    pub fn new_multiplayer(
+        scenes: Vec<Scene4D>,
+        width: usize,
+        height: usize,
+        local: PlayerId,
+        link: Box<dyn Link>,
+    ) -> Self {
+        let idx = scenes
+            .iter()
+            .position(|s| s.demo.is_dynamic())
+            .expect("multiplayer needs a Dynamic Mode scene");
+        let mut app = Self::new(scenes, width, height);
+        app.multiplayer = Some(Match::new(local, link));
+        app.enter_scene(idx);
+        app
+    }
+
+    /// Multiplayer: this player is held back until the other one catches up. Only looking
+    /// around (and view settings) work meanwhile.
+    pub fn is_waiting(&self) -> bool {
+        self.multiplayer.as_ref().is_some_and(Match::is_waiting)
+    }
+
+    /// A message to show across the screen, if the player cannot play right now.
+    pub fn banner(&self) -> Option<&'static str> {
+        self.multiplayer.as_ref().and_then(Match::banner)
+    }
+
+    /// Tell the other player we are leaving (call before quitting).
+    pub fn leave_match(&mut self) {
+        if let Some(m) = self.multiplayer.as_mut() {
+            m.leave();
+        }
     }
 
     pub fn scene(&self) -> &Scene4D {
@@ -154,7 +197,13 @@ impl App {
 
     pub fn apply(&mut self, action: Action) {
         let n = self.scenes.len();
+        let multiplayer = self.multiplayer.is_some();
         match action {
+            // Both players' worlds must start alike, so a match never leaves its scene.
+            Action::SelectScene(_) | Action::NextScene | Action::PrevScene | Action::Reset
+                if multiplayer => {}
+            // A waiting player's ship is frozen.
+            Action::Brake | Action::MatchVelocity | Action::Fire if self.is_waiting() => {}
             Action::SelectScene(idx) => {
                 if idx < n {
                     self.enter_scene(idx);
@@ -192,7 +241,12 @@ impl App {
                     self.camera.tetrad.boost_to(Vec4::four_velocity_from_beta(beta));
                 }
             }
-            Action::EmitFlash => self.dynamics.emit_flash(self.camera.position),
+            Action::EmitFlash => {
+                self.dynamics.emit_flash(self.camera.position);
+                if let Some(m) = self.multiplayer.as_mut() {
+                    m.send_flash(self.camera.position);
+                }
+            }
             Action::ProphecyDeltaUp => self.cfg.step_prophecy_delta(1.0),
             Action::ProphecyDeltaDown => self.cfg.step_prophecy_delta(-1.0),
             Action::Fire => self.fire(),
@@ -211,6 +265,11 @@ impl App {
     pub fn step(&mut self, dt_wall: f32, input: &HeldInput) {
         let axis = |pos: bool, neg: bool| (pos as i32 - neg as i32) as f32;
 
+        // 0. Multiplayer: what the other player did since the last frame.
+        if let (Some(m), Some(world)) = (self.multiplayer.as_mut(), self.world.as_mut()) {
+            self.world_grew |= m.receive(world, &mut self.dynamics);
+        }
+
         // 1. Local camera orientation in observer's rest frame
         let rot_speed = 1.6 * dt_wall;
         self.look(
@@ -218,6 +277,7 @@ impl App {
             rot_speed * axis(input.pitch_up, input.pitch_down),
             rot_speed * axis(input.roll_right, input.roll_left),
         );
+        let looked = self.camera;
 
         // 2. Proper acceleration thrusters (Lorentz boost in observer's local rest frame)
         let boost_rate = 1.25 * dt_wall; // Rapidity per second
@@ -255,6 +315,17 @@ impl App {
             time_changed = true;
         }
 
+        // 5. Multiplayer: never move into the other player's future light cone. If this frame's
+        // thrust and motion would, undo them and wait for the other player to catch up.
+        if let Some(m) = self.multiplayer.as_mut() {
+            let sample = |c: &Camera4D| {
+                ShipSample::new(Frontier { origin: c.position, proper_time: c.proper_time }, c.tetrad.e[0])
+            };
+            if !m.may_advance(&sample(&looked), &sample(&self.camera)) {
+                self.camera = looked;
+            }
+        }
+
         if self.is_dynamic() {
             self.step_world(dt_wall);
         } else {
@@ -274,7 +345,9 @@ impl App {
     /// Dynamic Mode: move the causal frontier to the camera and finalize what it uncovered,
     /// snapshotting the geometry at most every [`DYNAMIC_REBUILD_INTERVAL`].
     fn step_world(&mut self, dt_wall: f32) {
-        if self.camera.position.t > DYNAMIC_REBASE_AFTER_T {
+        // A match never rebases: the two replicas would do it at different moments, and their
+        // `f64` rounding would part ways (docs/MULTIPLAYER.md §2).
+        if self.multiplayer.is_none() && self.camera.position.t > DYNAMIC_REBASE_AFTER_T {
             let shift = -DYNAMIC_REBASE_AFTER_T;
             self.camera.position.t += shift;
             self.dynamics.shift_time(shift);
@@ -292,6 +365,9 @@ impl App {
         let world = self.world.as_mut().expect("dynamic scene has a world");
         self.world_grew |= world.advance(frontier, self.camera.tetrad.e[0]);
         self.dynamics.frontier_lag = world.frontier_lag(self.camera.tetrad.e[0]);
+        if let Some(m) = self.multiplayer.as_mut() {
+            m.send_track(*world.ships[m.local() as usize].latest());
+        }
 
         // Collisions with the ship push back on it. The camera is the ship's center: it feels a
         // kick once news of the contact has crossed the hull, like any other body.
@@ -330,6 +406,9 @@ impl App {
         let vel = [u.x / u.t, u.y / u.t, u.z / u.t].map(|c| c as f64);
         if world.fire(frontier, vel, self.ammo) {
             self.world_grew = true;
+            if let Some(m) = self.multiplayer.as_mut() {
+                m.send_fire(frontier, vel, self.ammo);
+            }
         }
     }
 
@@ -351,7 +430,9 @@ impl App {
     /// The HUD's second line: the scene description, plus the ammo in Dynamic Mode.
     pub fn scene_description(&self) -> String {
         let desc = self.scene().demo.description();
-        if self.is_dynamic() {
+        if let Some(m) = &self.multiplayer {
+            format!("[ENTER] FIRE {} | [\\] AMMO | {}", self.ammo.name(), m.status())
+        } else if self.is_dynamic() {
             format!("[ENTER] FIRE {} | [\\] AMMO | {desc}", self.ammo.name())
         } else {
             desc.to_string()
@@ -370,13 +451,22 @@ impl App {
     fn enter_scene(&mut self, idx: usize) {
         self.scene_idx = idx;
         let demo = self.scene().demo;
-        self.camera = Camera4D::new(demo.initial_camera_pos(), FOV_Y_DEG);
+        let player = self.multiplayer.as_ref().map(Match::local);
+        self.camera = match player {
+            Some(p) => {
+                let mut camera = Camera4D::new(billiards::spawn_event(p), FOV_Y_DEG);
+                camera.tetrad.rotate_local(billiards::spawn_yaw(p), 0.0, 0.0);
+                camera
+            }
+            None => Camera4D::new(demo.initial_camera_pos(), FOV_Y_DEG),
+        };
         self.paused = false;
         self.dynamics.flashes.clear();
         self.kicks_in_flight.clear();
 
-        self.world = demo.is_dynamic().then(|| {
-            DynWorld::new(demo, self.camera_frontier(), self.camera.tetrad.e[0])
+        self.world = demo.is_dynamic().then(|| match player {
+            Some(p) => DynWorld::new_match(demo, &game::spawns(), p),
+            None => DynWorld::new(demo, self.camera_frontier(), self.camera.tetrad.e[0]),
         });
         self.dynamics.frontier = self.world.as_ref().map(|w| w.frontier);
         let u = self.camera.tetrad.e[0];
@@ -536,5 +626,100 @@ mod tests {
         let world = app.world.as_ref().unwrap();
         assert_eq!(world.frontier.origin, app.camera.position);
         assert!((app.dynamics.flashes[0].at.t - (t - 0.1)).abs() < 1e-3);
+    }
+
+    /// Two players' apps connected in-process: player 0 and player 1.
+    fn match_apps() -> (App, App) {
+        let (a, b) = crate::multiplayer::link::LocalLink::pair();
+        let scenes = || {
+            vec![Scene4D::build(DemoScene::TwinParadox), Scene4D::build(DemoScene::RelativisticBilliards)]
+        };
+        (
+            App::new_multiplayer(scenes(), 64, 40, 0, Box::new(a)),
+            App::new_multiplayer(scenes(), 64, 40, 1, Box::new(b)),
+        )
+    }
+
+    /// `O_b` lies in the open future light cone of `O_a`, beyond `slack`.
+    fn in_future_cone(a: Vec4, b: Vec4, slack: f32) -> bool {
+        let d = b - a;
+        d.t > d.spatial().length() + slack
+    }
+
+    /// The twin paradox, played: player 1 flies out at ~0.9c and back while player 0 stays put.
+    /// The traveller covers more lab time per second of their own, runs into the stay-at-home
+    /// player's future cone and has to wait; neither ever enters the other's cone, and the
+    /// traveller comes home younger.
+    #[test]
+    fn the_travelling_twin_waits_for_the_stay_at_home_twin() {
+        let (mut home, mut away) = match_apps();
+        assert_eq!(home.scene().demo, DemoScene::RelativisticBilliards);
+        let (mut waited, mut waits_now) = (0, false);
+        let dt = 0.05;
+        for frame in 0..1200 {
+            let secs = frame as f32 * dt;
+            let thrust = |from: f32, to: f32| secs >= from && secs < to;
+            let held = HeldInput {
+                thrust_forward: thrust(0.0, 1.2) || thrust(13.6, 14.8),
+                thrust_back: thrust(9.2, 11.6),
+                ..Default::default()
+            };
+            home.step(dt, &HeldInput::default());
+            away.step(dt, &held);
+            let (h, a) = (home.camera.position, away.camera.position);
+            // One frame of slack: a ship level with the other in CM time may step once.
+            assert!(!in_future_cone(h, a, 0.1), "frame {frame}: traveller inside home's cone");
+            assert!(!in_future_cone(a, h, 0.1), "frame {frame}: home inside traveller's cone");
+            assert!(!home.is_waiting(), "frame {frame}: the stay-at-home twin never waits");
+            waits_now = away.is_waiting();
+            waited += waits_now as usize;
+            if waits_now {
+                assert_eq!(away.banner(), Some(game::WAITING_BANNER));
+            }
+        }
+        println!(
+            "traveller waited {waited} frames; tau home {:.2}, away {:.2}",
+            home.camera.proper_time, away.camera.proper_time
+        );
+        assert!(waited > 20, "the traveller should have had to wait");
+        assert!(!waits_now, "and resumed once the stay-at-home twin caught up");
+        assert!(away.camera.proper_time < home.camera.proper_time - 1.0, "the traveller is younger");
+        assert!(away.scene_description().contains("PLAYER 2 OF 2"));
+    }
+
+    /// Shots, flashes and the worlds they shape are shared: both replicas agree.
+    #[test]
+    fn a_match_shares_shots_and_flashes() {
+        let (mut p0, mut p1) = match_apps();
+        p0.apply(Action::SelectScene(0)); // ignored in a match
+        assert!(p0.is_dynamic());
+        for frame in 0..600 {
+            if frame % 50 == 10 {
+                p0.apply(Action::Fire);
+                p1.apply(Action::CycleAmmo);
+                p1.apply(Action::Fire);
+            }
+            if frame == 30 {
+                p1.apply(Action::EmitFlash);
+            }
+            let ahead = HeldInput { thrust_forward: frame < 20, ..Default::default() };
+            p0.step(0.05, &ahead);
+            p1.step(0.05, &ahead);
+        }
+        assert_eq!(p0.dynamics.flashes.len(), 1, "player 1's flash reached player 0");
+        let (w0, w1) = (p0.world.as_ref().unwrap(), p1.world.as_ref().unwrap());
+        let shots = |w: &DynWorld, p: PlayerId| w.ships[p as usize].shots;
+        assert!(shots(w0, 0) >= 10 && shots(w0, 1) == shots(w1, 1) && shots(w1, 0) == shots(w0, 0));
+        let mut compared = 0;
+        for x in &w0.bodies {
+            let y = w1.bodies.iter().find(|y| y.uid == x.uid).expect("same bodies in both worlds");
+            for s in &x.history {
+                if let Some(t) = y.at(s.step) {
+                    assert_eq!(s, t, "body {:x} differs at step {}", x.uid, s.step);
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 3000, "compared {compared}");
     }
 }

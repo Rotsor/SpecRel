@@ -56,6 +56,13 @@ Switch scenes at any time with keys **`1`–`5`** or **`N` / `B`**:
 6. **`[6]` Relativistic Billiards** — the first *causally simulated* scene (see [`docs/DYNAMIC_MODE_PLAN.md`](docs/DYNAMIC_MODE_PLAN.md)). Nothing is precomputed: every puck's history is simulated only up to your **future light cone**, the boundary of what you can no longer influence, so far pucks are known far into the lab-frame future and near ones barely past "now". Everything you normally see is already decided; switch to **Frontier** or **Prophecy** (`G`) to watch the world being written, and **Decision Age** (`M`) to see when each event became fixed. The camera is the ship here, so rewinding and coordinate scrubbing are disabled.
    * **Play:** fire (`Enter`) elastic pucks, sticky pucks or spores (cycle with `\`) along your view direction at 0.6c in your rest frame, or fly into the pucks — the ship is a heavy puck too, and getting rammed kicks your camera. Collisions conserve 4-momentum exactly, and they are **causal**: a puck only changes its motion once news of the contact has crossed all of it, so pucks briefly squish into each other and a push can't run down a line of touching pucks faster than light (there are no rigid bodies in SR). Sticky pucks stick and glow, heavier than before — the kinetic energy lost in the collision became **rest mass**; spores carry a clock face and pop into two fragments when their own clock runs out, so fast spores travel γ times further first.
 
+### Two-player causal multiplayer
+
+Two players each fly a ship over the billiards table, and both see the same causally simulated world, each through their own past light cone (see [`docs/MULTIPLAYER.md`](docs/MULTIPLAYER.md)). An event is decided only once it has left **both** players' future light cones. Your past cone can be drawn only while you stay out of the future cone of the last event you know of the other player. Fly away fast and come back, and you have aged less but covered more lab time than a player who stayed put (the twin paradox, played for real). The game then holds you with **WAITING FOR THE OTHER PLAYER** until the other player catches up in your common centre-of-momentum frame. The other ship is drawn as a clock cube, so you can read their proper time. Shots, flashes and collisions are shared, and both players' replicas of the world agree bit for bit.
+
+* **Desktop:** `cargo run --release -- --host [PORT]` (player 1; port 7777 by default) and `cargo run --release -- --join HOST:PORT` (player 2).
+* **Browser:** open `index.html?mp=0` and `index.html?mp=1` in two tabs of the same browser.
+
 ---
 
 ## Running
@@ -148,6 +155,7 @@ If you are reading the code to learn how Special Relativity is implemented geome
 6. [`src/shaders/render.wgsl`](src/shaders/render.wgsl) — High-performance WGSL compute shader executing full 4D BVH traversal, intersection, procedural clock dials, and lighting on the GPU.
 7. [`src/scene.rs`](src/scene.rs) — The 5 Special Relativity demo scenes with multi-iteration periodic worldtubes (`for_periodic_copies`) and physics verification tests.
    - [`src/dynamic/`](src/dynamic/mod.rs) — Causal Dynamic Mode: bodies with `f64` histories extended exactly up to the camera's future light cone (`DynWorld`, the frontier rule `is_decided`), and the billiards scene.
+   - [`src/multiplayer/`](src/multiplayer/mod.rs) — Two-player matches: wire protocol, links (TCP, in-process, browser queue), handshake/replay (`Session`), CM-frame pacing (`Pacer`) and the App-facing `Match`.
 8. [`src/hud.rs`](src/hud.rs) — Software 5x7 bitmap font renderer for HUD, GPU HUD overlay buffer, and in-scene digital clock readouts.
 9. [`src/app.rs`](src/app.rs) — Frontend-independent app state shared by desktop and web: scene selection, observer camera, relativistic flight controls (`Action` / `HeldInput`), time controls and per-frame dynamics.
 10. [`src/main.rs`](src/main.rs) — Native desktop window loop (`minifb`): key bindings and GPU/CPU backend switching.

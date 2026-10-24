@@ -4,8 +4,9 @@
 
 use super::body::{distance, Body, BodyState, Kind};
 use super::collide::V3;
+use super::ship::PlayerId;
 use crate::mesh4d::Mesh3D;
-use crate::minkowski::Vec3;
+use crate::minkowski::{Vec3, Vec4};
 
 pub const HALF_X: f64 = 9.0;
 pub const Z_MIN: f64 = 0.0;
@@ -13,7 +14,7 @@ pub const Z_MAX: f64 = 13.0;
 pub const TABLE_Y: f32 = -2.2;
 pub const PUCK_RADIUS: f64 = 0.35;
 pub const PUCK_MASS: f64 = 1.0;
-/// The ship is a heavy sphere around the camera (it is not drawn: you are inside it).
+/// The ship is a heavy sphere around its camera (you never see your own: you are inside it).
 pub const SHIP_RADIUS: f64 = 0.8;
 pub const SHIP_MASS: f64 = 6.0;
 /// Launch speed of fired pucks in the ship's rest frame.
@@ -99,11 +100,12 @@ pub fn body(uid: u64, kind: Kind, mass: f64, state: BodyState, material_id: usiz
         decided_at: Vec::new(),
         born: false,
         ended: false,
-        ignore_ship: false,
+        launcher: None,
         pending: Vec::new(),
         touching: Vec::new(),
-        touching_ship: false,
+        touching_ships: Vec::new(),
         material_changes: Vec::new(),
+        mass_changes: vec![(state.step, mass)],
     }
 }
 
@@ -132,9 +134,9 @@ pub fn pucks() -> Vec<Body> {
     bodies
 }
 
-/// A body fired from the ship.
-pub fn projectile(seq: u64, ammo: Ammo, state: BodyState) -> Body {
-    let uid = mix(0xF1BE, seq);
+/// Shot number `seq` fired by `player`'s ship.
+pub fn projectile(player: PlayerId, seq: u64, ammo: Ammo, state: BodyState) -> Body {
+    let uid = mix(0xF1BE, (player as u64) << 32 | seq);
     let mut b = match ammo {
         Ammo::Puck => body(uid, Kind::Puck, PUCK_MASS, state, MATERIAL_MOVING),
         Ammo::Sticky => body(uid, Kind::Sticky, PUCK_MASS, state, MATERIAL_STICKY),
@@ -144,7 +146,7 @@ pub fn projectile(seq: u64, ammo: Ammo, state: BodyState) -> Body {
         }
     };
     b.born = true;
-    b.ignore_ship = true;
+    b.launcher = Some(player);
     b
 }
 
@@ -225,4 +227,24 @@ pub fn rails() -> Vec<(Mesh3D, Vec3)> {
         (side, Vec3::new(rail_x, y, mid_z)),
         (end, Vec3::new(0.0, y, Z_MAX as f32 + h)),
     ]
+}
+
+/// Where `player` spawns, at `t = 0`: player 0 at the open near end of the table, the others
+/// mirrored to the far end.
+pub fn spawn_event(player: PlayerId) -> Vec4 {
+    let near = crate::scene::DemoScene::RelativisticBilliards.initial_camera_pos();
+    if player == 0 {
+        near
+    } else {
+        Vec4::new(near.t, near.x, near.y, (Z_MIN + Z_MAX) as f32 - near.z)
+    }
+}
+
+/// The spawn heading (yaw from `+z`): everyone starts facing the table.
+pub fn spawn_yaw(player: PlayerId) -> f32 {
+    if player == 0 {
+        0.0
+    } else {
+        std::f32::consts::PI
+    }
 }

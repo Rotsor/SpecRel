@@ -13,11 +13,12 @@
 pub mod billiards;
 pub mod body;
 pub mod collide;
+pub mod ship;
 
 use crate::bvh4d::Bvh4D;
 use crate::mesh4d::{
     build_worldtube_cap, build_worldtube_simplices, build_worldtube_simplices_with_decided,
-    sample_inertial_worldline, Mesh3D,
+    sample_inertial_worldline, Mesh3D, DECIDED_AT_STATIC,
 };
 use crate::minkowski::{Vec3, Vec4};
 use crate::renderer::{analytic_decision_age, Frontier};
@@ -25,6 +26,7 @@ use crate::scene::{DemoScene, Scene4D};
 use billiards::{Ammo, SHIP_MASS, SHIP_RADIUS};
 use body::{distance, is_decided, Body, BodyState, Impulse, Kind, STEP_DT};
 use collide::{P4, V3};
+pub use ship::{PlayerId, Ship, ShipSample};
 
 /// How far behind the camera (in lab time) histories are kept: beyond the renderers' maximum
 /// ray length, nothing older can be seen.
@@ -36,49 +38,33 @@ const MAX_SEGMENT_DT: f64 = 50.0;
 
 const MATERIAL_RAIL: usize = 6;
 
-/// One recorded event of the ship (camera) worldline.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ShipSample {
-    pub t: f64,
-    pub pos: V3,
-    pub vel: V3,
-}
-
-impl ShipSample {
-    fn new(frontier: Frontier, u: Vec4) -> Self {
-        let o = frontier.origin;
-        Self {
-            t: o.t as f64,
-            pos: [o.x as f64, o.y as f64, o.z as f64],
-            vel: [(u.x / u.t) as f64, (u.y / u.t) as f64, (u.z / u.t) as f64],
-        }
-    }
-}
-
 /// What a body touches at a grid step.
 struct Contacts {
     /// Indices of bodies overlapping it, sorted by uid.
     bodies: Vec<usize>,
-    /// The ship's state, if overlapping.
-    ship: Option<ShipSample>,
-    /// The ship is known to be clear of the body (ends a projectile's launch grace).
-    ship_clear: bool,
+    /// The ships overlapping it, and their states.
+    ships: Vec<(PlayerId, ShipSample)>,
+    /// The ship that launched it is known to be clear of it (ends the launch grace).
+    launcher_clear: bool,
 }
 
 pub struct DynWorld {
     pub demo: DemoScene,
     pub bodies: Vec<Body>,
-    /// The ship's (camera's) recorded worldline, one sample per [`DynWorld::advance`], pruned
-    /// behind the camera. Bodies near the ship wait for it to be recorded.
-    pub ship: Vec<ShipSample>,
-    /// The frontier the histories were last extended to.
+    /// Every player's ship, indexed by [`PlayerId`]. Their latest events bound the decided
+    /// region: a step is finalized only once it is outside every live ship's future cone, and
+    /// bodies near a ship wait for its track.
+    pub ships: Vec<Ship>,
+    /// Whose camera this replica of the world is rendered for: its ship is not drawn, its
+    /// clock stamps `decided_at`, and only its collision kicks are collected.
+    pub viewer: PlayerId,
+    /// The viewer's frontier, as the histories were last extended.
     pub frontier: Frontier,
-    /// Collision impulses delivered to the ship. The camera is the ship's center, so `App`
-    /// applies each once its news has crossed the hull ([`Impulse::has_reached`]).
+    /// Collision impulses delivered to the viewer's ship. The camera is the ship's center, so
+    /// `App` applies each once its news has crossed the hull ([`Impulse::has_reached`]).
     pub ship_kicks: Vec<Impulse>,
     /// Lab time of grid step 0.
     t_origin: f64,
-    fired: u64,
 }
 
 impl DynWorld {
@@ -91,17 +77,27 @@ impl DynWorld {
         Self::new(demo, frontier, Vec4::new(1.0, 0.0, 0.0, 0.0))
     }
 
-    /// Start the world with the observer at `frontier`, moving with 4-velocity `u`. Everything
-    /// outside `I+(O)` is already decided: histories are filled from [`HISTORY_WINDOW`] in the
-    /// past up to the frontier, stamped with the analytic decision time as if the observer had
-    /// always coasted with `u`. (The scene is laid out so nothing collides in that past.)
+    /// A single-player world with the observer at `frontier`, moving with 4-velocity `u`.
     pub fn new(demo: DemoScene, frontier: Frontier, u: Vec4) -> Self {
+        Self::new_match(demo, &[ShipSample::new(frontier, u)], 0)
+    }
+
+    /// Start the world with one ship per player at the given events, rendered for `viewer`.
+    /// Everything outside the ships' future cones is already decided: histories are filled
+    /// from [`HISTORY_WINDOW`] in the past up to the frontier, stamped with the analytic
+    /// decision time as if the viewer had always coasted. (The scene is laid out so nothing
+    /// collides in that past.) Every replica of a match builds identical histories.
+    pub fn new_match(demo: DemoScene, spawns: &[ShipSample], viewer: PlayerId) -> Self {
         let mut bodies = match demo {
             DemoScene::RelativisticBilliards => billiards::pucks(),
             _ => panic!("{demo:?} is not a dynamic scene"),
         };
+        let me = spawns[viewer as usize];
+        let [ut, ux, uy, uz] = me.four_velocity().map(|c| c as f32);
+        let (frontier, u) = (me.frontier(), Vec4::new(ut, ux, uy, uz));
         let t_origin = 0.0;
-        let first_step = ((frontier.origin.t as f64 - HISTORY_WINDOW - t_origin) / STEP_DT).floor() as i64;
+        let t_first = spawns.iter().map(|s| s.t).fold(f64::INFINITY, f64::min) - HISTORY_WINDOW;
+        let first_step = ((t_first - t_origin) / STEP_DT).floor() as i64;
         for body in &mut bodies {
             // Bodies are specified at step 0; walk back to the start of the window.
             let mut s = body.history[0];
@@ -111,16 +107,17 @@ impl DynWorld {
             body.history = vec![s];
             body.decided_at = vec![decision_time(&s, frontier, u)];
         }
+        let ships = spawns.iter().enumerate().map(|(p, &s)| Ship::new(p as PlayerId, s)).collect();
         let mut world = Self {
             demo,
             bodies,
-            ship: vec![ShipSample::new(frontier, u)],
+            ships,
+            viewer,
             frontier,
             ship_kicks: Vec::new(),
             t_origin,
-            fired: 0,
         };
-        world.extend(frontier, |s| decision_time(s, frontier, u));
+        world.extend_with(|s| decision_time(s, frontier, u));
         world
     }
 
@@ -128,42 +125,75 @@ impl DynWorld {
         self.t_origin + step as f64 * STEP_DT
     }
 
-    /// Move the frontier to the ship's new event (moving with 4-velocity `u`) and finalize
-    /// every step that just became decided. Returns whether anything changed.
+    /// Move the viewer's frontier to its ship's new event (moving with 4-velocity `u`) and
+    /// finalize every step that just became decided. Returns whether anything changed.
     pub fn advance(&mut self, frontier: Frontier, u: Vec4) -> bool {
-        let sample = ShipSample::new(frontier, u);
-        match self.ship.last_mut() {
-            Some(last) if last.t == sample.t => *last = sample, // paused: no new event
-            _ => self.ship.push(sample),
-        }
-        self.extend(frontier, |_| frontier.proper_time)
+        self.record(self.viewer, ShipSample::new(frontier, u));
+        self.extend()
     }
 
-    /// Fire a body of `ammo` from the ship at `at`, with lab 3-velocity `vel`. It leaves the
-    /// ship's center, so its whole worldline lies in the firing event's causal future; its
-    /// first grid state is fixed by this input alone. Returns `false` if the table is full.
+    /// Record `player`'s next ship event. Nothing is finalized until [`DynWorld::extend`].
+    pub fn record(&mut self, player: PlayerId, sample: ShipSample) {
+        self.ships[player as usize].record(sample);
+    }
+
+    /// `player` left the match: their ship ends where it was last seen.
+    pub fn leave(&mut self, player: PlayerId) {
+        self.ships[player as usize].left = true;
+    }
+
+    /// Finalize every step that the ships' latest events have decided. Returns whether
+    /// anything changed.
+    pub fn extend(&mut self) -> bool {
+        let tau = self.ships[self.viewer as usize].latest().tau as f32;
+        self.extend_with(|_| tau)
+    }
+
+    /// Whether the table has room for another projectile.
+    pub fn can_fire(&self) -> bool {
+        self.bodies.iter().filter(|b| !b.ended).count() < billiards::MAX_BODIES
+    }
+
+    /// The viewer fires a body of `ammo` at `at`, if the table has room: see
+    /// [`DynWorld::launch`]. Returns whether it was fired.
     pub fn fire(&mut self, at: Frontier, vel: V3, ammo: Ammo) -> bool {
-        let live = self.bodies.iter().filter(|b| !b.ended).count();
-        if live >= billiards::MAX_BODIES {
-            return false;
+        let fire = self.can_fire();
+        if fire {
+            self.launch(self.viewer, at, vel, ammo);
         }
+        fire
+    }
+
+    /// `player`'s ship fires a body of `ammo` at `at`, with lab 3-velocity `vel`. It leaves the
+    /// ship's center, so its whole worldline lies in the firing event's causal future; its
+    /// first grid state is fixed by this input alone. Always launches: whether there was room
+    /// is the shooter's call (live-body counts differ between replicas at any given moment).
+    pub fn launch(&mut self, player: PlayerId, at: Frontier, vel: V3, ammo: Ammo) {
         let o = at.origin;
         let step = ((o.t as f64 - self.t_origin) / STEP_DT).ceil() as i64;
         let t = self.step_time(step);
         let dt = t - o.t as f64;
         let pos = [o.x as f64 + vel[0] * dt, o.y as f64 + vel[1] * dt, o.z as f64 + vel[2] * dt];
         let state = BodyState { step, t, pos, vel, tau: dt / collide::gamma(vel) };
-        let mut b = billiards::projectile(self.fired, ammo, state);
-        b.decided_at = vec![at.proper_time];
+        let ship = &mut self.ships[player as usize];
+        let mut b = billiards::projectile(player, ship.shots, ammo, state);
+        ship.shots += 1;
+        b.decided_at = vec![self.frontier.proper_time];
         self.bodies.push(b);
-        self.fired += 1;
-        true
+    }
+
+    /// `true` if the whole body at `state` is outside every live ship's future cone.
+    fn is_decided(&self, state: &BodyState, radius: f64) -> bool {
+        self.ships
+            .iter()
+            .filter(|s| s.is_live())
+            .all(|s| is_decided(state, radius, s.latest().event()))
     }
 
     /// Scheduler: keep passing over the bodies, advancing each as far as it can, until a pass
     /// makes no progress. Then prune what has fallen behind the history window.
-    fn extend(&mut self, frontier: Frontier, stamp: impl Fn(&BodyState) -> f32) -> bool {
-        self.frontier = frontier;
+    fn extend_with(&mut self, stamp: impl Fn(&BodyState) -> f32) -> bool {
+        self.frontier = self.ships[self.viewer as usize].latest().frontier();
         let mut changed = false;
         loop {
             let mut progress = false;
@@ -218,14 +248,21 @@ impl DynWorld {
                 received.push(Impulse { t: s.t, pos: at, dp });
             }
         }
+        // Ships are far heavier than pucks, and each player's replica applies the kicks to its
+        // own ship; here only the viewer's are collected.
         let mut kick = None;
-        if let Some(ship) = contacts.ship.filter(|_| !me.touching_ship) {
+        for &(player, ship) in &contacts.ships {
+            if me.touching_ships.contains(&player) {
+                continue;
+            }
             let sep = sub3(ship.pos, s.pos);
             if let Some((v, _)) = collide::elastic(me.mass, s.vel, SHIP_MASS, ship.vel, sep) {
                 let at = touching_point(s.pos, r, ship.pos, SHIP_RADIUS);
                 let dp = collide::sub(collide::momentum(me.mass, v), collide::momentum(me.mass, s.vel));
                 received.push(Impulse { t: s.t, pos: at, dp });
-                kick = Some(Impulse { t: s.t, pos: at, dp: dp.map(|c| -c) });
+                if player == self.viewer {
+                    kick = Some(Impulse { t: s.t, pos: at, dp: dp.map(|c| -c) });
+                }
             }
         }
 
@@ -244,7 +281,7 @@ impl DynWorld {
             mass = m;
             next.vel = v;
         }
-        if !is_decided(&next, r, self.frontier.origin) {
+        if !self.is_decided(&next, r) {
             return false;
         }
 
@@ -254,15 +291,18 @@ impl DynWorld {
         if mass > body.mass * (1.0 + 1e-9) && body.material_at(next.step) != billiards::MATERIAL_HEATED {
             body.material_changes.push((next.step, billiards::MATERIAL_HEATED));
         }
+        if mass != body.mass {
+            body.mass_changes.push((next.step, mass));
+        }
         body.mass = mass;
         body.pending = pending;
         body.touching = touching;
-        body.touching_ship = contacts.ship.is_some();
+        body.touching_ships = contacts.ships.iter().map(|&(p, _)| p).collect();
         body.history.push(next);
         body.decided_at.push(stamp);
         body.ended = billiards::out_of_play(&next);
-        if contacts.ship_clear {
-            body.ignore_ship = false;
+        if contacts.launcher_clear {
+            body.launcher = None;
         }
         self.ship_kicks.extend(kick);
         true
@@ -270,7 +310,7 @@ impl DynWorld {
 
     /// Everything body `i` touches at step `k`, or `None` if something that might be touching
     /// it is not known yet: a body still behind step `k` that could reach contact range at
-    /// light speed, or the ship beyond its recorded track.
+    /// light speed, or a ship beyond its recorded track.
     fn contacts(&self, i: usize, k: i64) -> Option<Contacts> {
         let me = &self.bodies[i];
         let s = me.at(k).expect("body has step k");
@@ -299,36 +339,26 @@ impl DynWorld {
         touching.sort_by_key(|&j| self.bodies[j].uid);
 
         let reach = me.radius + SHIP_RADIUS;
-        let last = *self.ship.last().expect("ship track is never empty");
-        let (ship, ship_clear) = if last.t >= s.t {
-            let at = self.ship_at(s.t);
-            let d = distance(s.pos, at.pos);
-            if me.ignore_ship {
-                (None, d > reach)
-            } else {
-                ((d < reach).then_some(at), false)
+        let (mut ships, mut launcher_clear) = (Vec::new(), false);
+        for ship in &self.ships {
+            let launcher = me.launcher == Some(ship.player);
+            if ship.is_known_at(s.t) {
+                let at = ship.at(s.t);
+                let d = distance(s.pos, at.pos);
+                if launcher {
+                    launcher_clear = d > reach;
+                } else if d < reach {
+                    ships.push((ship.player, at));
+                }
+            } else if ship.is_live() && !launcher {
+                // Unknown yet: wait if it could be within reach by now.
+                let last = ship.latest();
+                if distance(s.pos, last.pos) < reach + (s.t - last.t) {
+                    return None;
+                }
             }
-        } else if !me.ignore_ship && distance(s.pos, last.pos) < reach + (s.t - last.t) {
-            return None;
-        } else {
-            (None, false)
-        };
-        Some(Contacts { bodies: touching, ship, ship_clear })
-    }
-
-    /// The ship's state at lab time `t` (within the recorded track), interpolated linearly.
-    fn ship_at(&self, t: f64) -> ShipSample {
-        let i = self.ship.partition_point(|s| s.t <= t);
-        if i == 0 {
-            return self.ship[0];
         }
-        let a = self.ship[i - 1];
-        let Some(&b) = self.ship.get(i) else {
-            return a;
-        };
-        let f = if b.t > a.t { (t - a.t) / (b.t - a.t) } else { 0.0 };
-        let lerp = |x: V3, y: V3| [0, 1, 2].map(|c| x[c] + (y[c] - x[c]) * f);
-        ShipSample { t, pos: lerp(a.pos, b.pos), vel: lerp(a.vel, b.vel) }
+        Some(Contacts { bodies: touching, ships, launcher_clear })
     }
 
     /// A spore whose clock ran out at step `k` splits there; the two fragments fly from step
@@ -342,7 +372,7 @@ impl DynWorld {
         let mut fragments = billiards::fragments(parent.uid, generation, parts, &s);
         for f in &mut fragments {
             let first = f.history[0].drift(f.history[0].vel, t_next);
-            if !is_decided(&first, f.radius, self.frontier.origin) {
+            if !self.is_decided(&first, f.radius) {
                 return false;
             }
             f.history = vec![first];
@@ -353,8 +383,11 @@ impl DynWorld {
         true
     }
 
+    /// Drop what is older than [`HISTORY_WINDOW`] behind the *earliest* live ship: a ship that
+    /// lags behind holds back bodies near it, and they still need their neighbors' states.
     fn prune(&mut self) {
-        let horizon = self.frontier.origin.t as f64 - HISTORY_WINDOW;
+        let earliest = self.ships.iter().filter(|s| s.is_live()).map(|s| s.latest().t);
+        let horizon = earliest.fold(self.frontier.origin.t as f64, f64::min) - HISTORY_WINDOW;
         self.bodies.retain(|b| !(b.ended && b.latest().t < horizon));
         for body in &mut self.bodies {
             let stale = body.history.partition_point(|s| s.t < horizon);
@@ -365,8 +398,9 @@ impl DynWorld {
             body.history.drain(..stale);
             body.decided_at.drain(..stale);
         }
-        let stale = self.ship.partition_point(|s| s.t < horizon);
-        self.ship.drain(..stale.min(self.ship.len() - 1));
+        for ship in &mut self.ships {
+            ship.prune(horizon);
+        }
     }
 
     /// How far (in the camera's proper time, for a camera moving with 4-velocity `u`) the live
@@ -396,7 +430,7 @@ impl DynWorld {
                 imp.t += dt;
             }
         }
-        for s in &mut self.ship {
+        for s in self.ships.iter_mut().flat_map(|ship| &mut ship.track) {
             s.t += dt;
         }
         for kick in &mut self.ship_kicks {
@@ -451,6 +485,16 @@ impl DynWorld {
             }
         }
 
+        // The other players' ships, up to their last known events.
+        let ship_mesh = Ship::mesh();
+        for ship in self.ships.iter().filter(|s| s.player != self.viewer) {
+            let samples: Vec<_> =
+                ship.render_indices(MAX_SEGMENT_DT).iter().map(|&i| ship.track[i].sample()).collect();
+            let m = ship.material();
+            simplices.extend(build_worldtube_simplices(&ship_mesh, &samples, m));
+            simplices.extend(build_worldtube_cap(&ship_mesh, samples.last().unwrap(), DECIDED_AT_STATIC, m));
+        }
+
         Scene4D {
             demo: self.demo,
             bvh: Bvh4D::build(simplices),
@@ -484,9 +528,9 @@ fn contact_impulse(me: &Body, s: &BodyState, other: &Body, o: &BodyState) -> Opt
     }
     let me_first = me.uid < other.uid;
     let ((ma, va), (mb, vb), sep) = if me_first {
-        ((me.mass, s.vel), (other.mass, o.vel), sep)
+        ((me.mass, s.vel), (other.mass_at(s.step), o.vel), sep)
     } else {
-        ((other.mass, o.vel), (me.mass, s.vel), sep.map(|c| -c))
+        ((other.mass_at(s.step), o.vel), (me.mass, s.vel), sep.map(|c| -c))
     };
     let (dpa, dpb) = if me.is_sticky() || other.is_sticky() {
         collide::stick(ma, va, mb, vb)
@@ -585,14 +629,14 @@ mod tests {
     /// Every finalized step is decided (except a projectile's launch state, which the input
     /// that fired it already fixed), stamped no later than now, with non-decreasing stamps and
     /// no gaps in the grid.
-    fn assert_causal(world: &DynWorld) {
+    pub(super) fn assert_causal(world: &DynWorld) {
         let o = world.frontier;
         for body in &world.bodies {
             assert_eq!(body.history.len(), body.decided_at.len());
             for (i, (s, &d)) in body.history.iter().zip(&body.decided_at).enumerate() {
                 let launch = body.born && i == 0;
                 assert!(
-                    launch || is_decided(s, body.radius, o.origin),
+                    launch || world.is_decided(s, body.radius),
                     "body {:x} step {} undecided",
                     body.uid,
                     s.step
@@ -877,8 +921,8 @@ mod tests {
         puck.decided_at = vec![0.0];
         world.bodies.push(puck);
         // The parked ship's worldline over the puck's approach.
-        let parked = ShipSample { t: t - 1.0, pos: [o.x as f64, o.y as f64, o.z as f64], vel: [0.0; 3] };
-        world.ship.insert(0, parked);
+        let parked = ShipSample { t: t - 1.0, pos: [o.x as f64, o.y as f64, o.z as f64], vel: [0.0; 3], tau: 0.0 };
+        world.ships[0].track.insert(0, parked);
         run_parked(&mut world, 10.0);
 
         assert_eq!(world.ship_kicks.len(), 1, "exactly one collision");
@@ -952,6 +996,151 @@ mod tests {
         println!("bodies: same {} other {}", same.bodies.len(), other.bodies.len());
         assert!(compared > 1000, "compared only {compared} states");
         assert!(differing_inside > 0, "the later input should have changed something inside I+(O)");
+    }
+}
+
+/// Two-player matches: each player runs a replica of the world fed with both ships' inputs,
+/// the other player's arriving late.
+#[cfg(test)]
+mod match_tests {
+    use super::tests::assert_causal;
+    use super::*;
+
+    /// One player's inputs, in the order their frontend produces them.
+    #[derive(Clone, Copy)]
+    enum Input {
+        Sample(ShipSample),
+        Fire(Frontier, V3, Ammo),
+    }
+
+    fn spawns() -> Vec<ShipSample> {
+        (0..2).map(|p| ShipSample::at_rest(billiards::spawn_event(p))).collect()
+    }
+
+    /// `n` frames of `dtau` for `player`: drift toward the table at `speed` along z (no
+    /// thrusting, so `f32` camera rounding doesn't matter), firing `ammo` at the rack every
+    /// `fire_every` frames.
+    fn inputs(player: PlayerId, n: usize, dtau: f32, speed: f32, fire_every: usize, ammo: Ammo) -> Vec<Input> {
+        let spawn = billiards::spawn_event(player);
+        let u = Vec4::four_velocity_from_beta(Vec3::new(0.0, 0.0, speed));
+        let mut out = Vec::new();
+        for i in 1..=n {
+            let tau = i as f32 * dtau;
+            let f = Frontier { origin: spawn + u * tau, proper_time: tau };
+            let sample = ShipSample::new(f, u);
+            out.push(Input::Sample(sample));
+            if i % fire_every == 0 {
+                let rack = [0.0, billiards::TABLE_Y as f64 + billiards::PUCK_RADIUS, 9.0];
+                let d = sub3(rack, sample.pos);
+                let l = collide::dot3(d, d).sqrt();
+                out.push(Input::Fire(f, d.map(|c| c / l * 0.6), ammo));
+            }
+        }
+        out
+    }
+
+    fn apply(world: &mut DynWorld, player: PlayerId, input: Input) {
+        match input {
+            Input::Sample(s) => world.record(player, s),
+            Input::Fire(at, vel, ammo) => world.launch(player, at, vel, ammo),
+        }
+    }
+
+    /// Run the viewer's replica: per frame, its own next input and the other player's input
+    /// from `delay` frames ago, extending after each frame.
+    fn replica(viewer: PlayerId, streams: &[Vec<Input>; 2], delay: usize) -> DynWorld {
+        let mut world = DynWorld::new_match(DemoScene::RelativisticBilliards, &spawns(), viewer);
+        let other = 1 - viewer;
+        let (mine, theirs) = (&streams[viewer as usize], &streams[other as usize]);
+        for i in 0..mine.len().max(theirs.len()) + delay {
+            if let Some(&input) = mine.get(i) {
+                apply(&mut world, viewer, input);
+            }
+            if let Some(&input) = i.checked_sub(delay).and_then(|j| theirs.get(j)) {
+                apply(&mut world, other, input);
+            }
+            world.extend();
+            if i % 97 == 0 {
+                assert_causal(&world);
+            }
+        }
+        world
+    }
+
+    fn streams() -> [Vec<Input>; 2] {
+        [
+            inputs(0, 700, 0.05, 0.3, 90, Ammo::Puck),
+            inputs(1, 650, 0.05, -0.2, 70, Ammo::Sticky),
+        ]
+    }
+
+    /// Both replicas finalize bit-identical histories, however late each hears of the other.
+    /// (This caught contacts reading the other body's *current* rest mass rather than its
+    /// mass at the contact step: whether a sticky hit had already landed depended on timing.)
+    #[test]
+    fn replicas_agree_whatever_the_latency() {
+        let streams = streams();
+        let a = replica(0, &streams, 3);
+        let b = replica(1, &streams, 41);
+        let mut compared = 0;
+        for x in &a.bodies {
+            let y = b.bodies.iter().find(|y| y.uid == x.uid).expect("same bodies in both replicas");
+            for s in &x.history {
+                if let Some(t) = y.at(s.step) {
+                    assert_eq!(s, t, "body {:x} differs at step {}", x.uid, s.step);
+                    compared += 1;
+                }
+            }
+        }
+        let fired = a.bodies.iter().filter(|b| b.born).count();
+        let heated = a.bodies.iter().filter(|b| !b.material_changes.is_empty()).count();
+        println!("compared {compared} states; {fired} born bodies, {heated} heated");
+        assert!(compared > 5000);
+        assert!(fired >= 10 && heated > 0, "the shots should have hit something");
+        assert_eq!(a.bodies.len(), b.bodies.len());
+    }
+
+    /// A player who never moves holds back everything near them: nothing is finalized inside
+    /// their future cone, however far the other player gets.
+    #[test]
+    fn an_idle_player_holds_back_the_world_near_them() {
+        let mut world = DynWorld::new_match(DemoScene::RelativisticBilliards, &spawns(), 0);
+        for input in inputs(0, 400, 0.05, 0.0, usize::MAX, Ammo::Puck) {
+            apply(&mut world, 0, input);
+            world.extend();
+        }
+        assert_causal(&world);
+        let idle = spawns()[1].event();
+        let near = world.bodies.iter().filter(|b| distance(b.latest().pos, spawns()[1].pos) < 8.0);
+        for body in near {
+            assert!(body.latest().t < idle.t as f64 + 8.0, "body {:x} ran ahead", body.uid);
+        }
+        // Once they leave, the world catches up with the remaining player.
+        world.leave(1);
+        world.extend();
+        let lag = world.frontier_lag(Vec4::new(1.0, 0.0, 0.0, 0.0));
+        assert!(lag < 3.0, "lag {lag}");
+    }
+
+    /// Each player sees the other's ship as a clock cube, up to its last known event, and
+    /// not their own.
+    #[test]
+    fn other_ships_are_drawn_up_to_their_last_known_event() {
+        let streams = streams();
+        let world = replica(0, &streams, 5);
+        let scene = world.build_scene();
+        let has = |m: usize| scene.bvh.simplices.iter().any(|s| s.material_id == m);
+        assert!(has(world.ships[1].material()), "the other ship is drawn");
+        assert!(!has(world.ships[0].material()), "your own ship is not");
+        let tip = world.ships[1].latest().t as f32;
+        let latest = scene
+            .bvh
+            .simplices
+            .iter()
+            .filter(|s| s.material_id == world.ships[1].material())
+            .map(|s| s.v0.t)
+            .fold(f32::MIN, f32::max);
+        assert!(latest <= tip + 1.0 && latest >= tip - 1.0, "ship drawn to {latest}, known to {tip}");
     }
 }
 

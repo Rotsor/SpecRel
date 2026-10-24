@@ -159,6 +159,36 @@
       color: var(--muted);
       margin-left: auto;
     }
+    [hidden] {
+      display: none !important;
+    }
+    #mp-banner {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      max-width: calc(100% - 32px);
+      padding: 14px 24px;
+      background: rgba(4, 6, 11, 0.72);
+      border: 1px solid var(--accent);
+      border-radius: 6px;
+      color: var(--accent);
+      font-size: clamp(14px, 3vw, 28px);
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-align: center;
+      pointer-events: none;
+      z-index: 5;
+    }
+    #mp-label {
+      font-size: 12px;
+      color: var(--accent);
+      font-weight: 700;
+    }
+    a.mp-link {
+      color: var(--cyan);
+      font-size: 12px;
+    }
   </style>
 </head>
 <body>
@@ -175,10 +205,21 @@
       <div class="spinner"></div>
       <div id="loading-text">Building 5 Special Relativity 4D Worldtube Scenes &amp; SAH BVHs...</div>
     </div>
+    <div id="mp-banner" hidden></div>
   </div>
 
   <div class="controls-bar">
-    <div class="btn-row">
+    <div class="btn-row" id="mp-row">
+      <span class="row-label">2-Player:</span>
+      <span id="mp-single">
+        <button id="mp-start">Start 2-player match</button>
+        <a class="mp-link" href="?mp=0">Player 1</a>
+        <a class="mp-link" href="?mp=1" target="_blank">Player 2</a>
+      </span>
+      <span id="mp-label" hidden></span>
+      <span class="hint" id="mp-hint">Opens two tabs of this browser; each player controls a ship</span>
+    </div>
+    <div class="btn-row" id="scene-row">
       <span class="row-label">Scenes:</span>
       <button data-key="1" id="scene-btn-0"><kbd>[1]</kbd>Twin Paradox</button>
       <button data-key="2" id="scene-btn-1"><kbd>[2]</kbd>Barn &amp; Pole</button>
@@ -407,12 +448,68 @@
       return new Uint8Array(wasm.memory.buffer, ptr, len);
     }
 
+    // Two-player match: `?mp=0` / `?mp=1` picks our side; anything else is single player.
+    const mpParam = new URLSearchParams(location.search).get("mp");
+    const mpPlayer = mpParam === "0" || mpParam === "1" ? Number(mpParam) : -1;
+
+    // Ferry opaque frames between WASM's QueueLink and a BroadcastChannel (two tabs, same origin).
+    function setupMultiplayer(wasm) {
+      document.getElementById("mp-single").hidden = true;
+      document.getElementById("mp-hint").hidden = true;
+      const label = document.getElementById("mp-label");
+      label.hidden = false;
+      label.textContent = `2-PLAYER MATCH: YOU ARE PLAYER ${mpPlayer + 1}`;
+      // The app pins multiplayer to Dynamic Mode and ignores scene switching and reset.
+      document.getElementById("scene-row").hidden = true;
+      document.querySelectorAll('button[data-key="18"]').forEach((b) => (b.disabled = true));
+
+      const channel = new BroadcastChannel("specrel-mp");
+      // Frames lost before the other tab opens are fine: the session replays its log on Hello.
+      wasm.web_net_set_state(1);
+      channel.onmessage = (e) => {
+        const msg = e.data;
+        if (!msg || msg.from === mpPlayer || !(msg.frame instanceof ArrayBuffer)) return;
+        const bytes = new Uint8Array(msg.frame);
+        // The inbox call may grow WASM memory, so create the view over it afterwards.
+        const ptr = wasm.web_net_inbox_ptr(bytes.length);
+        new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
+        wasm.web_net_push_incoming(bytes.length);
+      };
+      const flush = () => {
+        for (;;) {
+          const len = wasm.web_net_take_outgoing();
+          if (len < 0) break;
+          const frame = wasmBytes(wasm, wasm.web_net_outgoing_ptr(), len).slice().buffer;
+          channel.postMessage({ from: mpPlayer, frame });
+        }
+      };
+      let closed = false;
+      window.addEventListener("pagehide", () => {
+        if (closed) return;
+        closed = true;
+        wasm.web_leave();
+        flush();
+        wasm.web_net_set_state(2);
+        channel.close();
+      });
+      return { flush };
+    }
+
+    // Single player: one click opens both sides of a match (this tab and a new one).
+    document.getElementById("mp-start").addEventListener("click", () => {
+      window.open("?mp=1", "_blank");
+      location.search = "?mp=0";
+    });
+
     async function main() {
       try {
         const [wasm, gpu] = await Promise.all([loadWasm(), initWebGPU(canvas)]);
         const gpuAvailable = gpu !== null;
 
-        wasm.web_init(gpuAvailable ? 1 : 0);
+        wasm.web_init(gpuAvailable ? 1 : 0, mpPlayer);
+        const net = wasm.web_is_multiplayer() !== 0 ? setupMultiplayer(wasm) : null;
+        const mpBanner = document.getElementById("mp-banner");
+        let bannerText = "";
 
         let gpuResources = null;
         let ctx2d = null;
@@ -704,6 +801,18 @@
           lastTime = now;
 
           wasm.web_step(dt);
+          if (net) {
+            net.flush();
+            const len = wasm.web_banner_len();
+            const text = len > 0
+              ? new TextDecoder("utf-8").decode(wasmBytes(wasm, wasm.web_banner_ptr(), len))
+              : "";
+            if (text !== bannerText) {
+              bannerText = text;
+              mpBanner.textContent = text;
+              mpBanner.hidden = text === "";
+            }
+          }
           const dirtyScene = wasm.web_take_dirty_scene();
           if (dirtyScene >= 0 && gpuResources) {
             gpuResources.sceneBindGroups[dirtyScene] = gpuResources.uploadScene(dirtyScene);

@@ -61,6 +61,20 @@ pub fn fill_rect_alpha(
     }
 }
 
+/// A large message centered on a `fb_w x fb_h` framebuffer, over a darkened band (e.g.
+/// multiplayer's "waiting for the other player"). Drawn whether or not the HUD is shown.
+pub fn draw_banner(fb: &mut [u32], fb_w: usize, fb_h: usize, text: &str) {
+    let s = (fb_w / HUD_BASE_WIDTH).max(1);
+    let scale = 4 * s;
+    let (text_w, text_h) = (text.chars().count() * 6 * scale, 7 * scale);
+    let (pad_x, pad_y) = (24 * s, 16 * s);
+    let (w, h) = ((text_w + 2 * pad_x).min(fb_w), text_h + 2 * pad_y);
+    let (x0, y0) = ((fb_w - w) / 2, fb_h.saturating_sub(h) / 2);
+    fill_rect_alpha(fb, fb_w, fb_h, x0, y0, w, h);
+    let x = (fb_w.saturating_sub(text_w)) / 2;
+    draw_text_scaled(fb, fb_w, fb_h, x, y0 + pad_y, text, 0xFFE866, scale);
+}
+
 fn fill_rect_solid(
     fb: &mut [u32],
     fb_w: usize,

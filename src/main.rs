@@ -5,6 +5,7 @@ pub mod gpu;
 pub mod hud;
 pub mod mesh4d;
 pub mod minkowski;
+pub mod multiplayer;
 pub mod renderer;
 pub mod scene;
 #[cfg(target_arch = "wasm32")]
@@ -15,7 +16,7 @@ use app::{Action, App, HeldInput};
 #[cfg(not(target_arch = "wasm32"))]
 use gpu::GpuRenderer;
 #[cfg(not(target_arch = "wasm32"))]
-use hud::draw_hud;
+use hud::{draw_banner, draw_hud};
 #[cfg(not(target_arch = "wasm32"))]
 use minifb::{Key, KeyRepeat, Window, WindowOptions};
 #[cfg(not(target_arch = "wasm32"))]
@@ -92,6 +93,39 @@ fn held_input(window: &Window) -> HeldInput {
     }
 }
 
+/// `--host [PORT]` (player 1) or `--join HOST:PORT` (player 2): the link to the other player of
+/// a two-player match, if one was asked for. Exits on a bad address.
+#[cfg(not(target_arch = "wasm32"))]
+fn multiplayer_link(args: &[String]) -> Option<(dynamic::PlayerId, Box<dyn multiplayer::link::Link>)> {
+    use multiplayer::tcp::TcpLink;
+    const DEFAULT_PORT: u16 = 7777;
+    let value_after = |flag: &str| {
+        let i = args.iter().position(|a| a == flag)?;
+        Some(args.get(i + 1).filter(|v| !v.starts_with("--")).cloned())
+    };
+    let link = if let Some(port) = value_after("--host") {
+        let port = port.map_or(Ok(DEFAULT_PORT), |p| p.parse()).unwrap_or_else(|_| {
+            eprintln!("--host takes a port number");
+            std::process::exit(2)
+        });
+        println!("Hosting a 2-player match on port {port}; the other player runs: --join <this-host>:{port}");
+        (0, TcpLink::host(port))
+    } else if let Some(addr) = value_after("--join") {
+        let addr = addr.unwrap_or_else(|| format!("127.0.0.1:{DEFAULT_PORT}"));
+        println!("Joining the 2-player match at {addr}...");
+        (1, TcpLink::join(&addr))
+    } else {
+        return None;
+    };
+    match link {
+        (player, Ok(link)) => Some((player, Box::new(link))),
+        (_, Err(e)) => {
+            eprintln!("Could not start the match: {e}");
+            std::process::exit(1)
+        }
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 fn main() {}
 
@@ -136,7 +170,10 @@ fn main() {
     };
     let mut use_gpu = gpu.is_some();
 
-    let mut app = App::new(scenes, WIDTH, HEIGHT);
+    let mut app = match multiplayer_link(&args) {
+        Some((player, link)) => App::new_multiplayer(scenes, WIDTH, HEIGHT, player, link),
+        None => App::new(scenes, WIDTH, HEIGHT),
+    };
     let mut framebuffer = vec![0u32; WIDTH * HEIGHT];
 
     if args.iter().any(|a| a == "--smoke-test") {
@@ -287,9 +324,13 @@ fn main() {
                 backend,
             );
         }
+        if let Some(banner) = app.banner() {
+            draw_banner(&mut framebuffer, app.cfg.width, app.cfg.height, banner);
+        }
 
         window
             .update_with_buffer(&framebuffer, app.cfg.width, app.cfg.height)
             .expect("Failed to update window buffer");
     }
+    app.leave_match();
 }

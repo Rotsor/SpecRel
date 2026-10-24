@@ -1,6 +1,7 @@
 //! Bodies with a causally finalized history, and the frontier rule that gates their growth.
 
 use super::collide::{self, V3};
+use super::ship::PlayerId;
 use crate::mesh4d::{Mesh3D, WorldlineSample};
 use crate::minkowski::{Tetrad, Vec3, Vec4};
 
@@ -117,15 +118,19 @@ pub struct Body {
     pub born: bool,
     /// The body ceased to exist after its last history step (merged, decayed or left).
     pub ended: bool,
-    /// Pass through the ship until first clear of it (a projectile leaving the launcher).
-    pub ignore_ship: bool,
+    /// The ship that fired it: passes through that ship until first clear of it.
+    pub launcher: Option<PlayerId>,
     /// Collision impulses received but not yet felt: see [`Impulse::has_reached`].
     pub pending: Vec<Impulse>,
     /// Uids of the bodies touching it at its latest step (a contact acts once, when it begins).
     pub touching: Vec<u64>,
-    pub touching_ship: bool,
+    /// Ships touching it at its latest step.
+    pub touching_ships: Vec<PlayerId>,
     /// Material switches as `(first step, material)`, e.g. glowing once a sticky hit adds mass.
     pub material_changes: Vec<(i64, usize)>,
+    /// Rest mass as `(first step, mass)`, oldest first, starting with its birth: a sticky hit
+    /// adds mass. Other bodies read it at the step of a contact, which may lie in its past.
+    pub mass_changes: Vec<(i64, f64)>,
 }
 
 /// A collision's 4-momentum change for one body, and where and when the contact happened.
@@ -164,6 +169,11 @@ impl Body {
 
     pub fn is_sticky(&self) -> bool {
         self.kind == Kind::Sticky
+    }
+
+    /// Rest mass at global grid `step`.
+    pub fn mass_at(&self, step: i64) -> f64 {
+        self.mass_changes.iter().rev().find(|&&(from, _)| from <= step).map_or(self.mass_changes[0].1, |&(_, m)| m)
     }
 
     pub fn material_at(&self, step: i64) -> usize {
