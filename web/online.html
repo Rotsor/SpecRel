@@ -133,6 +133,11 @@
 
     <h2>Other ways to play together</h2>
     <ul>
+      <li><b>With a room name:</b> if someone runs the SpecRel signalling server
+        (<code>node server/signal.mjs --static web</code>), open the game from it with
+        <code>?p2p=host&amp;room=NAME</code> and <code>?p2p=join&amp;room=NAME</code>. The browsers then swap the
+        codes through the server and nobody has to paste anything. If the game page is hosted somewhere else, add
+        <code>&amp;signal=https://your-server</code>.</li>
       <li><b>On one computer:</b> <a href="./?mp=0">player 1</a> and <a href="./?mp=1" target="_blank">player 2</a>
         in two tabs (or the <i>Start 2-player match</i> button in the game). The tabs talk to each other
         directly, with no codes.</li>

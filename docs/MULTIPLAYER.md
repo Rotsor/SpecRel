@@ -88,6 +88,7 @@ src/multiplayer/rendezvous.rs  UDP rendezvous server (--rendezvous) and its clie
 src/multiplayer/session.rs  Session: Hello handshake, sequencing, log replay, events
 src/app.rs                  App::new_multiplayer; applies remote events; paces the local ship
 src/main.rs, src/web.rs, web/index.html   transports, CLI/URL, "waiting" banner
+server/signal.mjs           HTTP signalling server for web matches (rooms, offer/answer long-poll)
 ```
 
 ### Session protocol
@@ -162,6 +163,25 @@ The players carry the SDP offer and answer by hand. The host's page shows an inv
 (`SR4W…`: deflate-raw of the SDP with every ICE candidate already gathered, in base64url). The
 joiner pastes it and gets a reply code, and the host pastes that. The data channel is reliable
 and ordered, and both sides pre-negotiate it as id 0.
+
+**Web with a signalling server (`?p2p=host&room=NAME`).** To skip the pasting, run
+`node server/signal.mjs` (no dependencies, Node 18+, HTTP port 8787 by default) on any host the
+two browsers can reach. Both players open the game with the same `room`, and with
+`&signal=https://server.example.com` when the game is not served by that same server. The host
+posts its offer to `/rooms/NAME/offer` and long-polls `/rooms/NAME/answer`. The joiner long-polls
+the offer and posts its answer. The SDP is the same one the codes carry, with every candidate in
+it, so the server sees just these two messages and no game traffic. A room takes one host and one
+joiner. It is dropped 30 s after the host fetches the answer, or after 10 minutes. With
+`--static web` the server also serves the game itself, so `signal=` is not needed:
+
+```
+node server/signal.mjs --port 8787 --static web
+# player 1: http://server:8787/?p2p=host&room=myroom
+# player 2: http://server:8787/?p2p=join&room=myroom
+```
+
+Browsers allow WebRTC only on `https://` pages and `localhost`, so on a public host put the server
+behind a TLS reverse proxy (Caddy, nginx and so on).
 
 **Limits.** Hole punching needs at least one side's NAT to keep the same public port for
 every destination ("endpoint-independent mapping"), which most home routers do. If both players

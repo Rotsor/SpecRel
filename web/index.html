@@ -603,6 +603,12 @@
     // format letter (Z: deflate-raw, J: plain JSON), then base64url of `{t: type, s: sdp}`.
     // The SDP includes every ICE candidate gathered, so no further signalling is needed.
 
+    // With `room=NAME`, the offer and answer go through the signalling server
+    // (server/signal.mjs) instead of pasted codes. `signal=URL` names the server; by default it
+    // is this page's own origin (the server can serve `web/` too).
+    const p2pRoom = params.get("room");
+    const signalBase = (params.get("signal") || location.origin).replace(/\/+$/, "");
+
     const ICE_SERVERS = [{ urls: ["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"] }];
     const ICE_GATHER_TIMEOUT_MS = 5000;
 
@@ -697,7 +703,27 @@
         status(host ? "Waiting for the reply code." : "Waiting for the host to paste the reply code.");
       };
 
+      const transport = {
+        send(frame) {
+          if (dc.readyState === "open") dc.send(frame);
+        },
+        close() {
+          dc.close();
+          pc.close();
+        },
+      };
+
       const fail = (e) => status(e instanceof Error ? e.message : String(e));
+      if (p2pRoom) {
+        $("p2p-in-step").hidden = true;
+        $("p2p-out-step").hidden = true;
+        $("p2p-title").textContent = `${host ? "Hosting" : "Joining"} room "${p2pRoom}"`;
+        signalViaServer(pc, host, gathered, status).catch((e) => {
+          fail(e);
+          link.setState(2);
+        });
+        return transport;
+      }
       if (host) {
         pc.createOffer().then((offer) => pc.setLocalDescription(offer)).then(showLocal).catch(fail);
       }
@@ -731,15 +757,52 @@
         }
       });
 
-      return {
-        send(frame) {
-          if (dc.readyState === "open") dc.send(frame);
-        },
-        close() {
-          dc.close();
-          pc.close();
-        },
+      return transport;
+    }
+
+    // Swaps the offer and answer through the signalling server's room. The host posts its
+    // offer and long-polls for the answer; the joiner long-polls for the offer and posts an answer.
+    async function signalViaServer(pc, host, gathered, status) {
+      const roomUrl = `${signalBase}/rooms/${encodeURIComponent(p2pRoom)}`;
+      const post = async (kind, desc) => {
+        const resp = await fetch(`${roomUrl}/${kind}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: desc.type, sdp: desc.sdp }),
+        });
+        if (resp.status === 409) {
+          throw new Error(host ? "Someone is already hosting this room. Pick another room name." : "This room already has two players.");
+        }
+        if (!resp.ok) throw new Error(`Signalling server error (${resp.status}).`);
       };
+      const poll = async (kind) => {
+        for (;;) {
+          const resp = await fetch(`${roomUrl}/${kind}?wait=25`);
+          if (resp.status === 200) return await resp.json();
+          if (resp.status !== 204) throw new Error(`Signalling server error (${resp.status}).`);
+        }
+      };
+      try {
+        if (host) {
+          await pc.setLocalDescription(await pc.createOffer());
+          status("Finding network addresses...");
+          await gathered();
+          await post("offer", pc.localDescription);
+          status("Waiting for the other player to join this room.");
+          await pc.setRemoteDescription(await poll("answer"));
+        } else {
+          status("Waiting for the host to open this room.");
+          await pc.setRemoteDescription(await poll("offer"));
+          await pc.setLocalDescription(await pc.createAnswer());
+          status("Finding network addresses...");
+          await gathered();
+          await post("answer", pc.localDescription);
+        }
+        status("Connecting...");
+      } catch (e) {
+        if (e instanceof TypeError) throw new Error(`Cannot reach the signalling server at ${signalBase}.`);
+        throw e;
+      }
     }
 
     // Single player: one click opens both sides of a match (this tab and a new one).
