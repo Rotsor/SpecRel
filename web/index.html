@@ -503,6 +503,15 @@
     const loadingOverlay = document.getElementById("loading-overlay");
     const loadingText = document.getElementById("loading-text");
 
+    // This build's version for the rendezvous server: a hash of the wasm, so two players meet only
+    // when they run the same build (identical worlds need identical code).
+    let buildVersion = "dev";
+    async function hashVersion(bytes) {
+      if (!crypto.subtle) return "dev";
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+      return Array.from(digest.slice(0, 8), (b) => b.toString(16).padStart(2, "0")).join("");
+    }
+
     async function loadWasm() {
       const candidates = [
         "./spec-rel.wasm",
@@ -513,6 +522,7 @@
           const resp = await fetch(url);
           if (!resp.ok) continue;
           const bytes = await resp.arrayBuffer();
+          buildVersion = await hashVersion(bytes);
           const { instance } = await WebAssembly.instantiate(bytes, {});
           return instance.exports;
         } catch (_) {}
@@ -628,13 +638,14 @@
     // format letter (Z: deflate-raw, J: plain JSON), then base64url of `{t: type, s: sdp}`.
     // The SDP includes every ICE candidate gathered, so no further signalling is needed.
 
-    // With `room=NAME`, the offer and answer go through the signalling server
-    // (server/signal.mjs) instead of pasted codes. `signal=URL` names the server; by default it
-    // is this page's own origin (the server can serve `web/` too).
+    // With `room=NAME`, the offer and answer go through the rendezvous server
+    // (rendezvous/server.mjs) instead of pasted codes. `signal=URL` names the server; by default it
+    // is this page's own origin (see docs/HOSTING.md).
     const p2pRoom = params.get("room");
     const signalBase = (params.get("signal") || location.origin).replace(/\/+$/, "");
+    const RENDEZVOUS_APP = "specrel-4d";
 
-    // STUN only, unless the signalling server's /turn also offers a TURN relay (see loadIceServers).
+    // STUN only, unless the rendezvous server also offers a TURN relay (see loadIceServers).
     let iceServers = [{ urls: ["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"] }];
     const ICE_GATHER_TIMEOUT_MS = 5000;
 
@@ -796,7 +807,7 @@
       button.textContent = "Copied";
     }
 
-    // The link a joiner opens: this page, joining `room` (through the same signalling server).
+    // The link a joiner opens: this page, joining `room` (through the same rendezvous server).
     function joinLink(room) {
       const url = new URL(location.pathname, location.origin);
       url.searchParams.set("p2p", "join");
@@ -812,26 +823,33 @@
       return `${chars.slice(0, 3).join("")}-${chars.slice(3).join("")}`;
     }
 
-    // Swaps the offer and answer through the signalling server's room. The host posts its
-    // offer and long-polls for the answer; the joiner long-polls for the offer and posts an answer.
+    // Swaps the offer and answer through a room on the rendezvous server. The host puts its
+    // offer and long-polls for the answer; the joiner long-polls for the offer and puts an answer.
     async function signalViaServer(pc, host, gathered, status) {
-      const roomUrl = `${signalBase}/rooms/${encodeURIComponent(p2pRoom)}`;
-      const post = async (kind, desc) => {
-        const resp = await fetch(`${roomUrl}/${kind}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ type: desc.type, sdp: desc.sdp }),
-        });
-        if (resp.status === 409) {
+      const roomUrl = `${signalBase}/v1/${RENDEZVOUS_APP}/${buildVersion}/${encodeURIComponent(p2pRoom)}`;
+      const check = async (resp) => {
+        if (resp.ok) return;
+        const { error } = await resp.json().catch(() => ({}));
+        if (error === "version_mismatch") {
+          throw new Error("The other player is running a different build of the game. Both of you reload the page, then make a new lobby.");
+        }
+        if (error === "slot_taken") {
           throw new Error(host ? "Someone is already hosting this lobby. Create a new one." : "This lobby already has two players.");
         }
-        if (!resp.ok) throw new Error(`Signalling server error (${resp.status}).`);
+        throw new Error(`Rendezvous server error (${error || resp.status}).`);
       };
-      const poll = async (kind) => {
+      const put = async (slot, desc) => {
+        await check(await fetch(`${roomUrl}/${slot}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: desc.type, sdp: desc.sdp }),
+        }));
+      };
+      const poll = async (slot) => {
         for (;;) {
-          const resp = await fetch(`${roomUrl}/${kind}?wait=25`);
+          const resp = await fetch(`${roomUrl}/${slot}?wait=25`);
           if (resp.status === 200) return await resp.json();
-          if (resp.status !== 204) throw new Error(`Signalling server error (${resp.status}).`);
+          if (resp.status !== 204) await check(resp);
         }
       };
       try {
@@ -839,33 +857,35 @@
           await pc.setLocalDescription(await pc.createOffer());
           status("Finding network addresses...");
           await gathered();
-          await post("offer", pc.localDescription);
+          await put("offer", pc.localDescription);
           status("Waiting for the other player to open the link.");
           await pc.setRemoteDescription(await poll("answer"));
+          // The room has done its job; free its name.
+          fetch(roomUrl, { method: "DELETE" }).catch(() => {});
         } else {
           status("Waiting for the host to open this lobby.");
           await pc.setRemoteDescription(await poll("offer"));
           await pc.setLocalDescription(await pc.createAnswer());
           status("Finding network addresses...");
           await gathered();
-          await post("answer", pc.localDescription);
+          await put("answer", pc.localDescription);
         }
         status("Connecting...");
       } catch (e) {
-        if (e instanceof TypeError) throw new Error(`Cannot reach the signalling server at ${signalBase}.`);
+        if (e instanceof TypeError) throw new Error(`Cannot reach the rendezvous server at ${signalBase}.`);
         throw e;
       }
     }
 
-    // Fetches ICE servers, with TURN relay credentials, from the signalling server. The browser
+    // Fetches ICE servers, with TURN relay credentials, from the rendezvous server. The browser
     // still prefers a direct path and only falls back to the relay when none works.
     async function loadIceServers() {
       if (!p2pRole) return;
       try {
-        const resp = await fetch(`${signalBase}/turn`);
+        const resp = await fetch(`${signalBase}/v1/ice-servers`);
         if (resp.ok) iceServers = (await resp.json()).iceServers;
       } catch {
-        // No signalling server here: keep STUN only.
+        // No rendezvous server here: keep STUN only.
       }
     }
 

@@ -1,0 +1,18 @@
+# /etc/caddy/Caddyfile: HTTPS for the rendezvous server. Caddy gets the certificate itself.
+# Replace the name with your domain (or IP-1-2-3-4.sslip.io for a server without one).
+rendezvous.example.com {
+	encode gzip
+
+	handle /v1/* {
+		reverse_proxy 127.0.0.1:8787
+	}
+
+	# Optional: static files of an app that uses this server (here, the SpecRel game), so its
+	# pages and the rendezvous share an origin. Deploying the app is copying files in; nothing
+	# restarts. Leave this out if the app is hosted elsewhere.
+	handle {
+		root * /var/www/app
+		header Cache-Control no-cache
+		file_server
+	}
+}

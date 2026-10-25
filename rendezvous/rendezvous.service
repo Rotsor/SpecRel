@@ -1,0 +1,20 @@
+# /etc/systemd/system/rendezvous.service (see docs/HOSTING.md). Runs /opt/rendezvous/server.mjs
+# as a throwaway unprivileged user; it keeps no files, so it needs no account or home of its own.
+[Unit]
+Description=Rendezvous server (peer discovery and TURN credentials)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+DynamicUser=yes
+EnvironmentFile=-/etc/rendezvous.env
+ExecStart=/usr/bin/node /opt/rendezvous/server.mjs --host 127.0.0.1 --port 8787
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

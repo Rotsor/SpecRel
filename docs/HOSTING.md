@@ -1,93 +1,104 @@
-# Hosting the SpecRel 4D lobby server
+# Hosting the rendezvous server (and the SpecRel game)
 
-The lobby server lets players start a web match by sharing a link. It is three pieces on one
-Linux host:
+Online web matches need a public host for two jobs: introducing the two browsers to each other,
+and relaying traffic for the pairs that can't connect directly. Neither job has anything to do
+with SpecRel, so the host runs a generic **rendezvous server** that any app can use. An app names
+itself and its version in every request, and peers only meet when both match. Shipping a new build
+of the game, or of any other app, never needs the server to change or restart.
 
-| Piece | Port | Role |
+## What runs on the host, and why
+
+| Component | Port | Why it is needed |
 |---|---|---|
-| `server/signal.mjs` (Node, no dependencies) | 8787, localhost only | Serves the game (`web/`), runs the lobbies (swaps each pair's WebRTC offer and answer), hands out relay credentials at `/turn` |
-| Caddy | 80, 443 (TCP) | HTTPS in front of it, with an automatic Let's Encrypt certificate |
-| coturn | 3478 (UDP, TCP), 49160–49999 (UDP) | TURN relay for players with no direct path between them |
+| [`rendezvous/server.mjs`](../rendezvous/server.mjs) (Node, no dependencies) | 8787, localhost only | Before two browsers can talk directly they must swap a WebRTC offer and answer, and neither can reach the other yet. The server holds those messages in short-lived rooms, and hands out relay credentials. |
+| coturn | 3478 (UDP, TCP), 49160–49999 (UDP) | Some networks (symmetric NATs, blocked UDP) leave no direct path between two players. A TURN relay tunnels their traffic. TURN is a standard protocol that browsers speak natively, so we run the standard server instead of writing one. |
+| Caddy | 80, 443 (TCP) | Browsers only run WebGPU on HTTPS pages, and an HTTPS page can only call an HTTPS server. Caddy gets and renews the Let's Encrypt certificate by itself, and also serves the game's static files. |
 
-Game traffic goes straight between the two browsers whenever it can. The relay carries only
-the matches that can't connect directly. A match uses a few kB/s, so a small VPS (1 vCPU,
-1 GB RAM) is plenty. The steps below assume Ubuntu or Debian, a public IPv4 address and root
-access. The example files are in [`server/deploy/`](../server/deploy).
+Game traffic goes straight between the browsers whenever it can, and the relay carries only the
+matches that can't connect directly. A match uses a few kB/s, so a small VPS (1 vCPU, 1 GB RAM)
+is plenty.
+
+What the host deliberately does **not** have:
+
+- **No game code in the server.** The server stores opaque messages under names the client picks
+  (`/v1/APP/VERSION/ROOM/SLOT`). SpecRel's version is a hash of its `spec-rel.wasm`, so players on
+  different builds are told so instead of getting a broken match.
+- **No build toolchain or git checkout.** You build the game on your own machine and copy the
+  files over. Caddy serves them as they are, so an update restarts nothing.
+- **No database.** Rooms live for minutes, in memory. A restart only drops the lobbies that are
+  waiting for their second player, and those players just make a new lobby.
+- **No service account.** systemd runs the server as a throwaway user (`DynamicUser`), because it
+  never writes a file.
+
+The game itself could be hosted anywhere, for example GitHub Pages. Players then add
+`&signal=https://your-rendezvous-host` to the URL. Serving it from the same Caddy keeps one origin,
+which avoids that parameter.
+
+The steps below assume Ubuntu or Debian, a public IPv4 address and root access. The example config
+files are in [`rendezvous/`](../rendezvous).
 
 ## 1. Domain name
 
-The page needs HTTPS (WebGPU only works on secure pages), so the server needs a domain name
-whose A record points at its IP. Without one, use `IP-WITH-DASHES.sslip.io`, for example
-`203-0-113-10.sslip.io` for `203.0.113.10`: it resolves to that IP, and Let's Encrypt will issue
-a certificate for it.
+The server needs a domain name whose A record points at its IP, so that it can have a
+certificate. Without one, use `IP-WITH-DASHES.sslip.io`, for example `203-0-113-10.sslip.io` for
+`203.0.113.10`: it resolves to that IP, and Let's Encrypt will issue a certificate for it.
 
-## 2. Packages, user and code
+## 2. Packages and the server
 
 ```bash
 apt-get update
-apt-get install -y nodejs git caddy coturn build-essential curl
-useradd -r -m -d /opt/specrel -s /bin/bash specrel
-sudo -u specrel -H bash -c '
-  git clone https://github.com/Rotsor/SpecRel.git ~/SpecRel
-  curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --target wasm32-unknown-unknown'
+apt-get install -y nodejs caddy coturn rsync
+mkdir -p /opt/rendezvous /var/www/app
+curl -fsSL -o /opt/rendezvous/server.mjs \
+  https://raw.githubusercontent.com/Rotsor/SpecRel/claude/dynamic-mode/rendezvous/server.mjs
 ```
 
-Node 18 or later is needed (`node --version`).
+Node 18 or later is needed (`node --version`). You can also `scp` the file from a checkout.
 
-## 3. Build the game for the browser
+## 3. Relay (coturn)
 
-```bash
-sudo -u specrel -H bash -c '
-  cd ~/SpecRel
-  ~/.cargo/bin/cargo build --release --target wasm32-unknown-unknown
-  cp target/wasm32-unknown-unknown/release/spec-rel.wasm web/'
-```
-
-Players' browsers only replicate the same world if both load the same build, which they do
-when they load it from the same server.
-
-## 4. Relay (coturn)
-
-Generate a shared secret, which both coturn and the lobby server will use:
+Generate a shared secret, which coturn and the rendezvous server both use:
 
 ```bash
 openssl rand -hex 32
 ```
 
-Copy [`server/deploy/turnserver.conf`](../server/deploy/turnserver.conf) to
-`/etc/turnserver.conf` and fill in the public IP, the domain and the secret. Then copy
-[`server/deploy/specrel-signal.env`](../server/deploy/specrel-signal.env) to
-`/etc/specrel-signal.env` with the same secret and the public IP in `TURN_URLS`, and protect it:
+Copy [`rendezvous/turnserver.conf`](../rendezvous/turnserver.conf) to `/etc/turnserver.conf` and
+fill in the public IP, the domain and the secret. Then copy
+[`rendezvous/rendezvous.env`](../rendezvous/rendezvous.env) to `/etc/rendezvous.env` with the
+same secret and the public IP in `TURN_URLS`, and protect it:
 
 ```bash
-chmod 600 /etc/specrel-signal.env
+chmod 600 /etc/rendezvous.env
 systemctl enable --now coturn
 systemctl restart coturn
 ```
 
-Leave out this step and the env file if you don't want a relay. `/turn` then lists only public
-STUN servers, and players without a direct path get "Could not connect".
+Leave out this step and the env file if you don't want a relay. `/v1/ice-servers` then lists only
+public STUN servers, and players without a direct path get "Could not connect".
 
-## 5. Lobby server (systemd)
+## 4. Rendezvous server (systemd)
+
+Copy [`rendezvous/rendezvous.service`](../rendezvous/rendezvous.service) to
+`/etc/systemd/system/`, then:
 
 ```bash
-cp /opt/specrel/SpecRel/server/deploy/specrel-signal.service /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now specrel-signal
+systemctl enable --now rendezvous
 ```
 
-It restarts if it crashes and starts at boot. Logs: `journalctl -u specrel-signal -f`.
+It restarts if it crashes and starts at boot. Logs: `journalctl -u rendezvous -f`.
 
-## 6. HTTPS (Caddy)
+## 5. HTTPS (Caddy)
 
-Put [`server/deploy/Caddyfile`](../server/deploy/Caddyfile) in `/etc/caddy/Caddyfile` with your
-domain, then:
+Put [`rendezvous/Caddyfile`](../rendezvous/Caddyfile) in `/etc/caddy/Caddyfile` with your domain.
+It sends `/v1/*` to the rendezvous server and serves everything else from `/var/www/app`. Then:
 
 ```bash
 systemctl restart caddy
 ```
 
-## 7. Firewall
+## 6. Firewall
 
 Open TCP 22, 80 and 443, TCP and UDP 3478, and UDP 49160–49999. With `ufw`:
 
@@ -101,38 +112,57 @@ ufw enable
 
 Your hosting provider's firewall, if it has one, needs the same rules.
 
+## 7. Deploy the game
+
+On your own machine, from the SpecRel checkout:
+
+```bash
+cargo build --release --target wasm32-unknown-unknown
+rsync -v web/index.html web/online.html target/wasm32-unknown-unknown/release/spec-rel.wasm root@SERVER:/var/www/app/
+```
+
+rsync replaces each file in one step, so nobody loads half a file. Run the same two commands for
+every new build: nothing on the host restarts. Players already in a match keep playing (their
+browsers are connected to each other). Players who load the new build can't join lobbies made
+with the old one: the page tells them the other player is on a different build.
+
 ## 8. Check it
 
 ```bash
-curl https://game.example.com/health
-curl https://game.example.com/turn
+curl https://rendezvous.example.com/v1/health
+curl https://rendezvous.example.com/v1/ice-servers
 ```
 
-The first answers `{"ok":true,"rooms":0}`. The second lists the STUN servers, plus your TURN
-URLs with a username and credential if the relay is configured. Then open
-`https://game.example.com/`, press **Create online lobby**, and open the link it shows in
+The first answers `{"ok":true,"rooms":0,"bytes":0}`. The second lists the STUN servers, plus your
+TURN URLs with a username and credential if the relay is configured. Then open
+`https://rendezvous.example.com/`, press **Create online lobby**, and open the link it shows in
 another browser or on another computer. The game stays paused with **WAITING FOR A PLAYER TO
 JOIN** until the second player arrives.
 
-## Updating
+## Updating the rendezvous server
+
+Only needed when `rendezvous/server.mjs` itself changes, which is independent of game releases:
 
 ```bash
-sudo -u specrel -H bash -c '
-  cd ~/SpecRel && git pull &&
-  ~/.cargo/bin/cargo build --release --target wasm32-unknown-unknown &&
-  cp target/wasm32-unknown-unknown/release/spec-rel.wasm web/'
-systemctl restart specrel-signal
+curl -fsSL -o /opt/rendezvous/server.mjs \
+  https://raw.githubusercontent.com/Rotsor/SpecRel/claude/dynamic-mode/rendezvous/server.mjs
+systemctl restart rendezvous
 ```
 
-Players already in a match keep playing (their browsers are connected to each other), but
-both need to reload before their next match so they run the same build.
+Lobbies waiting for a second player are lost. Matches in progress are not affected.
 
 ## Running it locally
 
-For development, no proxy or relay is needed, because `localhost` counts as a secure page:
+For development, no proxy or relay is needed, because `localhost` counts as a secure page. From
+the repo root:
 
 ```bash
-node server/signal.mjs --static web
+node rendezvous/server.mjs
 ```
 
-Then open `http://localhost:8787/`.
+```bash
+python3 -m http.server 8000
+```
+
+Then open `http://localhost:8000/web/?signal=http://localhost:8787`. The page finds the wasm in
+`target/` by itself.

@@ -133,7 +133,7 @@ src/multiplayer/rendezvous.rs  UDP rendezvous server (--rendezvous) and its clie
 src/multiplayer/session.rs  Session: Hello handshake, sequencing, log replay, events
 src/app.rs                  App::new_multiplayer; applies remote events; paces the local ship
 src/main.rs, src/web.rs, web/index.html   transports, CLI/URL, "waiting" banner
-server/signal.mjs           HTTP signalling server for web matches (rooms, offer/answer long-poll)
+rendezvous/server.mjs       generic HTTP rendezvous server (rooms of write-once slots, long-poll)
 ```
 
 ### Session protocol
@@ -210,33 +210,36 @@ The players carry the SDP offer and answer by hand. The host's page shows an inv
 joiner pastes it and gets a reply code, and the host pastes that. The data channel is reliable
 and ordered, and both sides pre-negotiate it as id 0.
 
-**Web with a signalling server (`?p2p=host&room=NAME`).** To skip the pasting, run
-`node server/signal.mjs` (no dependencies, Node 18+, HTTP port 8787 by default) on any host the
-two browsers can reach. Both players open the game with the same `room`, and with
-`&signal=https://server.example.com` when the game is not served by that same server. The host
-posts its offer to `/rooms/NAME/offer` and long-polls `/rooms/NAME/answer`. The joiner long-polls
-the offer and posts its answer. The SDP is the same one the codes carry, with every candidate in
-it, so the server sees just these two messages and no game traffic. A room takes one host and one
-joiner. It is dropped 30 s after the host fetches the answer, or after 10 minutes. With
-`--static web` the server also serves the game itself, so `signal=` is not needed:
+**Web with a rendezvous server (`?p2p=host&room=NAME`).** To skip the pasting, the browsers swap
+the offer and answer through `rendezvous/server.mjs`, a generic rendezvous server that knows
+nothing about this game (no dependencies, Node 18+, HTTP port 8787 by default). Both players open
+the game with the same `room`. The server is found at the page's own origin, or at
+`&signal=https://server.example.com`. The game uses the room `/v1/specrel-4d/VERSION/NAME`, where
+VERSION is the first 16 hex digits of the SHA-256 of `spec-rel.wasm`: the host puts its offer in
+the slot `offer` and long-polls `answer`, the joiner long-polls `offer` and puts `answer`, and
+the host then deletes the room. The SDP is the same one the codes carry, with every candidate in
+it, so the server sees just these two messages and no game traffic. A player on another build
+gets a version mismatch at once (the server pins each room to the version that first used it),
+instead of a match whose worlds drift apart. Locally:
 
 ```
-node server/signal.mjs --port 8787 --static web
-# player 1: http://server:8787/?p2p=host&room=myroom
-# player 2: http://server:8787/?p2p=join&room=myroom
+node rendezvous/server.mjs                  # rendezvous on :8787
+python3 -m http.server 8000                 # the repo root, so the page finds target/…/spec-rel.wasm
+# player 1: http://localhost:8000/web/?p2p=host&room=myroom&signal=http://localhost:8787
+# player 2: http://localhost:8000/web/?p2p=join&room=myroom&signal=http://localhost:8787
 ```
 
 The **Create online lobby** button does the same with a fresh random room name (`k7m-q2xp`) and
 shows the host the joiner's link to share. A lobby stays open while its host keeps polling for an
 answer.
 
-The page needs a secure context (`https://` or `localhost`) for WebGPU, so on a public host put
-the server behind a TLS reverse proxy (Caddy, nginx and so on). See [`HOSTING.md`](HOSTING.md).
+The page needs a secure context (`https://` or `localhost`) for WebGPU, so on a public host the
+game and the server sit behind a TLS reverse proxy. See [`HOSTING.md`](HOSTING.md).
 
 **Relay.** When ICE finds no direct path (both players behind symmetric NATs, or UDP blocked),
 the data channel goes through a TURN relay instead. The page fetches its ICE servers from the
-signalling server's `/turn`, which, when `TURN_SECRET` and `TURN_URLS` are set, adds a TURN
-server with time-limited credentials (the TURN REST API scheme: username `EXPIRY:specrel`,
+rendezvous server's `/v1/ice-servers`, which, when `TURN_SECRET` and `TURN_URLS` are set, adds a TURN
+server with time-limited credentials (the TURN REST API scheme: username `EXPIRY`,
 password `base64(HMAC-SHA1(secret, username))`, valid 24 h). coturn checks them with
 `use-auth-secret`. The browser still prefers a direct path, so the relay carries only the
 matches that need it.
