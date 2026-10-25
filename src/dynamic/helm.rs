@@ -6,12 +6,12 @@
 //! * [`ControlMode::Delayed`] (option A): the pilot sits at the hull's center and every command
 //!   waits [`command_delay`] of ship time before the whole ship executes it.
 //! * [`ControlMode::Pod`] (option C): the pilot flies a small control pod inside the hull with
-//!   no lag. The hull keeps station on the pod, steering by what it learned [`pod_delay`] ago,
-//!   and a pod that outruns it bounces off the inner wall.
+//!   no lag. The hull keeps station on the pod, steering by what it learned [`pod_delay`] ago.
+//!   Nothing holds the pod back: if it outruns the hull, the hull chases it as best it can.
 
 use std::collections::VecDeque;
 
-use super::billiards::{POD_RANGE, SHIP_ACCEL, SHIP_MASS};
+use super::billiards::{SHIP_ACCEL, SHIP_MASS};
 use super::collide::P4;
 use super::ship::{Ship, ShipSample};
 use crate::minkowski::{project_to_rest_space, Tetrad, Vec4};
@@ -60,15 +60,16 @@ pub fn command_delay() -> f32 {
     0.804_719
 }
 
-/// Option C: how long the pod's push takes to cross the hull, from as far as [`POD_RANGE`]
-/// off center to the far wall: `signal_delay(SHIP_ACCEL, POD_RANGE, SHIP_RADIUS)`.
+/// Option C: how long the pod's push takes to cross the hull, from as far as
+/// [`POD_RANGE`](super::billiards::POD_RANGE) off center to the far wall:
+/// `signal_delay(SHIP_ACCEL, POD_RANGE, SHIP_RADIUS)`.
 pub fn pod_delay() -> f32 {
     0.972_955
 }
 
-/// Option C: how hard the pod may push and still (roughly) stay within [`POD_RANGE`] of the
-/// hull's center, which reacts [`pod_delay`] late at up to [`SHIP_ACCEL`]: solves
-/// `range = a_c D^2 a_h / (2 (a_h - a_c))` for `a_c`.
+/// Option C: how hard the pod may push and still (roughly) stay within
+/// [`POD_RANGE`](super::billiards::POD_RANGE) of the hull's center, which reacts [`pod_delay`]
+/// late at up to [`SHIP_ACCEL`]: solves `range = a_c D^2 a_h / (2 (a_h - a_c))` for `a_c`.
 pub fn pod_accel() -> f32 {
     0.348_844
 }
@@ -147,9 +148,6 @@ impl CommandQueue {
 const KEEP_P: f32 = 4.0;
 const KEEP_D: f32 = 4.0;
 
-/// How much of the pod's speed toward the wall survives a bounce.
-const WALL_RESTITUTION: f32 = 0.0;
-
 /// Option C: the hull's center, moving by its own causal rules.
 #[derive(Clone, Copy, Debug)]
 pub struct Hull {
@@ -188,14 +186,13 @@ impl Hull {
 
     /// Where the pilot is now (at the hull's lab time), as far as the hull can know: as it last
     /// heard of them, [`pod_delay`] ago on its own simultaneity slice, flown on as they were
-    /// then flying (keeping up their acceleration), and bouncing off the inner wall wherever
-    /// the hull's own track put it. The hull's past is its own business, so this is exact
-    /// unless the pilot changed their thrust since; without the wall, the hull would steer
-    /// by bounces it hears of too late, and the two would rattle apart.
+    /// then flying (keeping up their acceleration), which is exact unless the pilot changed
+    /// their thrust since.
     fn predict_pilot(&self, ship: &Ship) -> Hull {
         let then = ship.hull_at_tau((self.tau - pod_delay()) as f64);
         let seen = ship.pilot_on_slice(then.event(), then.u());
-        // The pilot's 4-acceleration then, from the track (capped: wall bounces are kicks).
+        // The pilot's 4-acceleration then, from the track (capped: a finite difference across
+        // the end of a thrust or a sudden steer overshoots).
         let earlier = ship.at(seen.t - ACCEL_WINDOW);
         let dtau = (seen.tau - earlier.tau) as f32;
         let mut accel = if dtau > 1e-4 { (seen.u() - earlier.u()) / dtau } else { Vec4::default() };
@@ -206,17 +203,13 @@ impl Hull {
         }
 
         let mut pilot = Self::from_sample(&seen);
-        let fly = |pilot: &mut Hull, t: f32, hull: &Hull| {
-            pilot.advance_to(t, project_to_rest_space(accel, pilot.u));
-            if let Some(u) = hull.bounced(pilot.event, pilot.u) {
-                pilot.u = u;
-            }
-        };
+        // In frame-sized steps: `advance_to` is first order.
+        let fly = |pilot: &mut Hull, t: f32| pilot.advance_to(t, project_to_rest_space(accel, pilot.u));
         let from = ship.hull.partition_point(|s| s.t <= seen.t);
         for s in &ship.hull[from..] {
-            fly(&mut pilot, s.t as f32, &Self::from_sample(s));
+            fly(&mut pilot, s.t as f32);
         }
-        fly(&mut pilot, self.event.t, self);
+        fly(&mut pilot, self.event.t);
         pilot
     }
 
@@ -245,36 +238,6 @@ impl Hull {
     pub fn offset(&self, pilot: Vec4) -> Vec4 {
         project_to_rest_space(pilot - self.event, self.u)
     }
-
-    /// The pilot (at event `pilot`, frame `tetrad`) bounces off the hull's inner wall, at
-    /// [`POD_RANGE`] from the center, if they are moving out through it. The hull is far
-    /// heavier and doesn't notice. Returns whether they bounced.
-    pub fn bounce(&self, pilot: Vec4, tetrad: &mut Tetrad) -> bool {
-        let bounced = self.bounced(pilot, tetrad.e[0]);
-        if let Some(u) = bounced {
-            tetrad.boost_to(u);
-        }
-        bounced.is_some()
-    }
-
-    /// The 4-velocity of a pilot at `pilot` moving with `up` after bouncing off the inner wall,
-    /// if they hit it.
-    fn bounced(&self, pilot: Vec4, up: Vec4) -> Option<Vec4> {
-        let r = self.offset(pilot);
-        let dist = r.minkowski_norm_sq().max(0.0).sqrt();
-        if dist <= POD_RANGE as f32 {
-            return None;
-        }
-        let n = r / dist;
-        let w = project_to_rest_space(up, self.u) / -up.minkowski_dot(self.u);
-        let out = w.minkowski_dot(n);
-        if out <= 0.0 {
-            return None;
-        }
-        let w = w - n * ((1.0 + WALL_RESTITUTION) * out);
-        let gamma = 1.0 / (1.0 - w.minkowski_norm_sq()).max(1e-6).sqrt();
-        Some((self.u + w) * gamma)
-    }
 }
 
 /// Lab time over which the hull estimates its pilot's acceleration.
@@ -302,7 +265,7 @@ pub fn kicked(u: Vec4, kick: P4) -> Vec4 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dynamic::billiards::SHIP_RADIUS;
+    use crate::dynamic::billiards::{POD_RANGE, SHIP_RADIUS};
     use crate::minkowski::Vec3;
 
     /// In the momentarily comoving frame of a hull accelerating at `a` along `+x`, a part at
@@ -372,15 +335,13 @@ mod tests {
             self.ship.hull_estimate(self.at.origin.t as f64)
         }
 
-        fn step(&mut self, dt: f32, thrust: Option<Vec3>) -> bool {
-            let bounced = self.hull().bounce(self.at.origin, &mut self.pilot);
+        fn step(&mut self, dt: f32, thrust: Option<Vec3>) {
             if let Some(dir) = thrust {
                 self.pilot.boost_local(dir * (pod_accel() * dt));
             }
             self.at.origin += self.pilot.e[0] * dt;
             self.at.proper_time += dt;
             self.ship.record(ShipSample::new(self.at, self.pilot.e[0]));
-            bounced
         }
 
         fn offset(&self) -> f32 {
@@ -395,17 +356,16 @@ mod tests {
         let mut pod = Pod::new();
         let dt = 1.0 / 60.0;
         let forward = Vec3::new(0.0, 0.0, 1.0);
-        let (mut max_offset, mut bounces) = (0.0f32, 0);
+        let mut max_offset = 0.0f32;
         for frame in 0..600 {
-            let thrust = (frame < 240).then_some(forward);
-            bounces += pod.step(dt, thrust) as usize;
+            pod.step(dt, (frame < 240).then_some(forward));
             max_offset = max_offset.max(pod.offset());
             if pod.at.proper_time < pod_delay() - 2.0 * dt {
                 assert_eq!(pod.hull().u, Vec4::new(1.0, 0.0, 0.0, 0.0), "frame {frame}: too early");
             }
         }
         assert!(pod.pilot.beta().z > 0.6, "the pod reached speed: {:?}", pod.pilot.beta());
-        println!("max offset {max_offset}, bounces {bounces}, final {}", pod.offset());
+        println!("max offset {max_offset}, final {}", pod.offset());
         assert!(max_offset < SHIP_RADIUS as f32, "the pod stayed inside the hull");
         assert!(pod.offset() < 0.02, "and ended up back at the center");
         let rel = project_to_rest_space(pod.pilot.e[0], pod.hull().u).minkowski_norm_sq().sqrt();
@@ -413,7 +373,8 @@ mod tests {
     }
 
     /// Bursts of thrust, reversals and coasting, at coarse and fine frame rates: the hull never
-    /// lets the pod far out of the wall's range and settles around it once it coasts.
+    /// lets the pod get far and settles around it once it coasts. (A hard reversal, which the
+    /// hull hears of a second late, takes the pod out through the hull for a while.)
     #[test]
     fn station_keeping_settles_after_any_burst() {
         let x = Vec3::new(1.0, 0.0, 0.0);
@@ -427,31 +388,53 @@ mod tests {
         for dt in [0.05, 1.0 / 60.0] {
             for (n, program) in programs.iter().enumerate() {
                 let mut pod = Pod::new();
-                let (mut max_offset, mut bounces) = (0.0f32, 0);
+                let mut max_offset = 0.0f32;
                 for &(secs, thrust) in program.iter() {
                     for _ in 0..(secs / dt).round() as usize {
-                        bounces += pod.step(dt, thrust) as usize;
+                        pod.step(dt, thrust);
                         max_offset = max_offset.max(pod.offset());
                     }
                 }
                 let rel = project_to_rest_space(pod.pilot.e[0], pod.hull().u).minkowski_norm_sq().sqrt();
-                println!("dt {dt:.3} program {n}: max offset {max_offset:.3}, {bounces} bounces, final {:.4} at {rel:.4}", pod.offset());
-                ok &= max_offset < 0.25;
+                println!("dt {dt:.3} program {n}: max offset {max_offset:.3}, final {:.4} at {rel:.4}", pod.offset());
+                ok &= max_offset < 0.5;
                 ok &= pod.offset() < 0.02 && rel < 0.01;
             }
         }
         assert!(ok, "the hull lost its pod");
     }
 
+    /// Nothing holds the pod back: under steady thrust its speed only ever grows, at any frame
+    /// rate, while the hull keeps up.
     #[test]
-    fn a_pod_outrunning_the_hull_bounces_off_the_wall() {
-        let mut pod = Pod::new();
-        pod.pilot.boost_to(Vec4::four_velocity_from_beta(Vec3::new(0.3, 0.0, 0.0)));
-        let mut bounced = false;
-        for _ in 0..120 {
-            bounced |= pod.step(1.0 / 60.0, None);
-            assert!(pod.offset() < POD_RANGE as f32 + 0.01);
+    fn a_thrusting_pod_is_never_slowed_by_its_hull() {
+        for dt in [1.0 / 144.0, 1.0 / 60.0, 1.0 / 30.0] {
+            let mut pod = Pod::new();
+            let (mut speed, mut max_offset) = (0.0f32, 0.0f32);
+            for _ in 0..(8.0 / dt) as usize {
+                pod.step(dt, Some(Vec3::new(0.0, 0.0, 1.0)));
+                let now = pod.pilot.beta().length();
+                assert!(now >= speed, "dt {dt}: slowed from {speed} to {now}");
+                speed = now;
+                max_offset = max_offset.max(pod.offset());
+            }
+            println!("dt {dt:.4}: speed {speed:.4}, max offset {max_offset:.3}, final {:.3}", pod.offset());
+            assert!(max_offset < SHIP_RADIUS as f32, "dt {dt}: the hull lost its pod");
         }
-        assert!(bounced);
+    }
+
+    /// A pod coasting away from the hull keeps its speed; the hull catches up with it.
+    #[test]
+    fn a_pod_outrunning_the_hull_keeps_its_speed() {
+        let mut pod = Pod::new();
+        let u = Vec4::four_velocity_from_beta(Vec3::new(0.3, 0.0, 0.0));
+        pod.pilot.boost_to(u);
+        for _ in 0..600 {
+            pod.step(1.0 / 60.0, None);
+        }
+        assert!((pod.pilot.e[0] - u).minkowski_norm_sq().abs() < 1e-10);
+        let rel = project_to_rest_space(pod.pilot.e[0], pod.hull().u).minkowski_norm_sq().sqrt();
+        println!("final offset {:.3} at {rel:.4}", pod.offset());
+        assert!(pod.offset() < 0.02 && rel < 0.01, "the hull caught up");
     }
 }

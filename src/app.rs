@@ -373,10 +373,6 @@ impl App {
                     self.commands.execute_due(self.camera.proper_time, &mut self.camera.tetrad);
                 }
                 ControlMode::Pod => {
-                    // A pod that drifted into the inner wall bounces off it first.
-                    if let Some(hull) = self.hull() {
-                        hull.bounce(self.camera.position, &mut self.camera.tetrad);
-                    }
                     if let Some(order) = order {
                         order.execute(&mut self.camera.tetrad, rapidity);
                     }

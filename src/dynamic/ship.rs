@@ -179,7 +179,7 @@ impl Ship {
 
     /// The hull's center at lab time `t`, as well as the pilot can know it now: its recorded
     /// state, or, past the recorded track, its latest state coasted on. Only for the pilot's
-    /// own decisions (bumping into the inner wall, the HUD); the world uses [`Ship::hull_at`].
+    /// own decisions (the HUD); the world uses [`Ship::hull_at`].
     pub fn hull_estimate(&self, t: f64) -> Hull {
         let at = if self.is_known_at(t) { self.hull_at(t) } else { *self.latest_hull() };
         let mut hull = Hull::from_sample(&at);

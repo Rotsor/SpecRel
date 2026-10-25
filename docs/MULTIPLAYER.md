@@ -64,9 +64,9 @@ other replica):
   executes `command_delay()` (0.80 s) of ship time after it was issued; the HUD says **SPOOLING**
   meanwhile.
 * **Control pod** (option C): the camera is a pod that accelerates at once, at `pod_accel()`
-  (0.35 c/s), and floats up to `POD_RANGE` (0.2) from the hull's centre. The hull keeps station on
-  the pod, steering by what it learned of it `pod_delay()` (0.97 s) ago and replaying that against
-  its own past (inner-wall bounces included), so it never acts on news that hasn't crossed it.
+  (0.35 c/s), and nothing holds it back; under steady thrust it floats about `POD_RANGE` (0.2) from
+  the hull's centre. The hull keeps station on the pod, steering by what it learned of it
+  `pod_delay()` (0.97 s) ago, flown on to now, so it never acts on news that hasn't crossed it.
 
 Each ship therefore has two tracks: the pilot's (the camera: frontier, shots, flashes; the only
 one sent in `Track` messages) and the hull centre's (what bodies collide with). Every replica

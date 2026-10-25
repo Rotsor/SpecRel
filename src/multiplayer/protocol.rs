@@ -10,7 +10,7 @@ use crate::minkowski::Vec4;
 use crate::renderer::Frontier;
 
 /// Bumped whenever the encoding or the meaning of a message changes.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 const TAG_HELLO: u8 = 0;
 const TAG_TRACK: u8 = 1;

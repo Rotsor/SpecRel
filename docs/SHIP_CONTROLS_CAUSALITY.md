@@ -129,6 +129,7 @@ the acceleration.
   drawn from it, not from the pod's track. This replaces `Ship::seen_from`.
 * **The pod hitting the wall:** a pod that outruns the hull hits the inner wall and gets kicked.
   That's a local, causal hull–pod contact, and it plays like hitting your own bulkhead.
+  (Dropped in the implementation: the hull follows the pod, never the other way round.)
 * **Shots and flashes** still leave from the pod, which is where the pilot is.
 * **Frontier:** the hull's motion at an event depends only on pod events in that event's causal
   past, so the "outside every player's future cone" rule needs no change.
@@ -176,14 +177,15 @@ ship back, the frame's queue changes are undone with the rest of the frame. The 
 (0.35 c/s, the formula above with `POD_RANGE` = R/2 and the corrected delay below) and floats
 inside the hull. The hull (`Hull`) steers with a critically damped controller (2 rad/s), capped at
 `SHIP_ACCEL`, toward its best knowledge of the pod (`Hull::predict_pilot`): the pod's state on
-the hull's own simultaneity slice `pod_delay()` ago, flown on with the acceleration it had then,
-and bounced off the inner wall wherever the hull's own recorded track put it. The hull's own past
-is known to all of it, so this uses nothing that hasn't crossed the hull. The wall replay
-matters: without it the hull steered by bounces it heard of a second late, overshot, and the pod
-rattled between the walls with growing amplitude. With it, bursts, reversals and coasting all
-settle (`station_keeping_settles_after_any_burst`); the pod peaks about 0.2 off centre. A pod that
-outruns the hull hits the inner wall at `POD_RANGE` and loses its outward speed relative to the
-hull (`WALL_RESTITUTION` = 0). The hull ignores the push: it is much heavier. Collisions with
+the hull's own simultaneity slice `pod_delay()` ago, flown on with the acceleration it had then.
+This uses nothing that hasn't crossed the hull. Bursts and coasting settle
+(`station_keeping_settles_after_any_burst`); under steady thrust the pod peaks about 0.23 off
+centre. The hull never constrains the pod: there is no inner wall. An earlier version had one at
+`POD_RANGE` that stopped the pod's outward motion relative to the hull. Steady thrust from rest
+always reached it just as the hull started to move (`pod_accel` is tuned to exactly that range),
+so the pilot's speed suddenly fell to the hull's. Now the hull follows the pod as best it can. A hard
+reversal, which the hull hears of a second late, can take the pod out through the hull (about
+0.5 off centre) before the hull catches up. Collisions with
 pucks don't push a pod's hull either (the puck still bounces off it), so the hull's motion depends
 on its pilot's track alone. With delayed controls, kicks still reach the camera as before.
 
