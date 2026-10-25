@@ -4,13 +4,45 @@
 stays non-zero and doesn't change while `X` is held.
 
 **Status:** not fixed yet (another change in flight would conflict). This note lists the likely
-causes, how to tell them apart, and the fix for each. In a match, `X` is no longer an instant
+causes, how to tell them apart, and the fix for each. Cause 0 matches how it was found: both
+players in two browser windows side by side, switching between them while trying to brake both. In a match, `X` is no longer an instant
 boost. It sets a steering target (`App::steer`), and `App::step` then boosts toward it by at most
 `SHIP_ACCEL · d_tau` per frame, while the key is held. Every frame in which the ship takes no
 proper-time step, or in which its step is undone, leaves the velocity exactly as it was. Two
 states do that.
 
-## 1. The player is paused (most likely; my change caused it)
+## 0. X held while switching windows (most likely)
+
+`X` only starts steering on a *fresh* press: `Action::Brake` sets `App::steer`, and the held bit
+(`HeldInput::brake`) merely keeps it going. If the key is released, `steer` is dropped, and
+holding the key again without a new press does nothing (by design; see "held again without a new
+press: still coasting" in `match_brake_is_gradual_and_stops_on_release`).
+
+With two windows, the natural way to brake both is to hold `X` and click from one window to the
+other:
+
+1. Window A loses focus: `web_blur` clears every held bit, so A's `steer` is dropped on its next
+   frame. A stops braking, and pressing in A again later works.
+2. Window B gains focus while `X` is already down. The browser sends B only auto-repeat
+   `keydown`s (`e.repeat = true`). `web_key_event` sets the held bit for those but applies the
+   `Action` only when `repeat == 0`, so B never gets `Action::Brake` and never starts steering.
+   `OBS 3-VEL` stays put for as long as `X` is held.
+
+The old instant brake was edge-triggered too (a `DISCRETE_KEY_MAP` key, repeats ignored), so it
+had the same blind spot. But a single press used to finish the job, so it rarely showed.
+
+**How to tell:** nothing in the HUD. Release `X` and press it again in the focused window: it
+brakes.
+
+**Fix options:**
+* Simplest: drive `X` from the held state alone. Whenever `input.brake` is down, steer toward
+  lab rest, whether or not a press was seen. `X` has a fixed target, so it needs no press
+  semantics (unlike `V`, which picks its target when pressed). Then drop the "held again without
+  a new press" assertion.
+* Or in `web_key_event`, treat a repeat `keydown` for a held code whose bit isn't set yet (bits
+  are cleared on blur) as a fresh press.
+
+## 1. The player is paused (my change caused it)
 
 `App::step` computes
 
@@ -64,14 +96,9 @@ combined with the bullet list above it looks like "X stopped working".
 
 ## 3. Less likely, web only
 
-* **Keyboard focus in a text field.** The `keydown` handler ignores keys while a `textarea` or
+* **Keyboard focus in a text field.** (Clicking into a window on the lobby link or the P2P box
+  rather than the canvas would do it.) The `keydown` handler ignores keys while a `textarea` or
   `input` has focus (the P2P code box, the lobby name). Then nothing responds, not only `X`.
-* **Re-focus while holding X.** `web_blur` clears every held bit. If the window regains focus
-  while `X` is still down, auto-repeat events (`repeat = 1`) set the held bit again but don't
-  re-issue `Action::Brake`, so no steering target is set. Releasing and pressing `X` again works.
-  The same rule (press, then hold) applies natively. It's intended ("held again without a new
-  press: still coasting" in `match_brake_is_gradual_and_stops_on_release`), but it's
-  surprising here.
 
 ## Checked and not the cause
 
@@ -83,6 +110,8 @@ when the ship is advancing.
 
 ## Suggested regression tests
 
+* `X` held with no `Action::Brake` this match (focus arrived mid-hold): assert the ship brakes
+  (with the first fix for cause 0).
 * Paused, then `X` held: decide the intended behaviour (cause 1) and assert it.
 * Player A coasting fast while player B is idle, *not* stepping (models a background tab): assert
   A shows the waiting banner rather than silently ignoring `X`.
