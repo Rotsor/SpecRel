@@ -317,6 +317,24 @@ fn lan_ip() -> Option<Ipv4Addr> {
     }
 }
 
+/// What a [`UdpLink`] sends and receives through: a UDP socket, or in tests a simulated network.
+pub trait Datagrams {
+    fn send_to(&self, p: &[u8], to: SocketAddr) -> io::Result<usize>;
+    /// The next waiting datagram; `WouldBlock` when there is none.
+    fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
+}
+
+/// Non-blocking once a [`UdpLink`] owns it.
+impl Datagrams for UdpSocket {
+    fn send_to(&self, p: &[u8], to: SocketAddr) -> io::Result<usize> {
+        UdpSocket::send_to(self, p, to)
+    }
+
+    fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        UdpSocket::recv_from(self, buf)
+    }
+}
+
 struct Segment {
     data: Vec<u8>,
     sent: Instant,
@@ -325,8 +343,11 @@ struct Segment {
 
 /// A [`Link`] to one peer over UDP. `Connecting` while punching, `Open` once a packet from the
 /// peer got through, `Closed` on `Bye`, silence, or a punch that never got through.
-pub struct UdpLink {
-    socket: UdpSocket,
+///
+/// The protocol itself only sees the time it is given (the `*_at` methods), so tests can run it
+/// over a simulated network on a simulated clock.
+pub struct UdpLink<S: Datagrams = UdpSocket> {
+    socket: S,
     local: u64,
     remote: u64,
     /// Where to punch until we hear from the peer.
@@ -351,17 +372,20 @@ pub struct UdpLink {
     input: Vec<u8>,
     frames: VecDeque<Vec<u8>>,
     ack_due: bool,
-    /// Outgoing packets to drop: `(rng state, percent)`.
-    #[cfg(test)]
-    loss: Option<(u64, u64)>,
 }
 
 impl UdpLink {
     /// Punches from `socket` (as `local`) to `peer`.
     pub fn new(socket: UdpSocket, local: u64, peer: PeerInfo) -> io::Result<UdpLink> {
         socket.set_nonblocking(true)?;
-        let now = Instant::now();
-        Ok(UdpLink {
+        Ok(UdpLink::with_socket(socket, local, peer, Instant::now()))
+    }
+}
+
+impl<S: Datagrams> UdpLink<S> {
+    /// Punches from `socket` (as `local`) to `peer`, starting at `now`.
+    pub fn with_socket(socket: S, local: u64, peer: PeerInfo, now: Instant) -> UdpLink<S> {
+        UdpLink {
             socket,
             local,
             remote: peer.nonce,
@@ -382,9 +406,7 @@ impl UdpLink {
             input: Vec::new(),
             frames: VecDeque::new(),
             ack_due: false,
-            #[cfg(test)]
-            loss: None,
-        })
+        }
     }
 
     /// The address the peer was reached at, once `Open`.
@@ -392,27 +414,17 @@ impl UdpLink {
         self.peer
     }
 
-    fn send_packet(&mut self, to: SocketAddr, kind: Kind, payload: &[u8]) {
-        self.last_sent = Some(Instant::now());
-        #[cfg(test)]
-        if let Some((state, percent)) = &mut self.loss {
-            *state ^= *state << 13;
-            *state ^= *state >> 7;
-            *state ^= *state << 17;
-            if *state % 100 < *percent {
-                return;
-            }
-        }
+    fn send_packet(&mut self, now: Instant, to: SocketAddr, kind: Kind, payload: &[u8]) {
+        self.last_sent = Some(now);
         // A full send buffer loses the packet like the network would; retransmission covers it.
         let _ = self.socket.send_to(&packet(kind, self.local, self.remote, payload), to);
     }
 
     /// Receives, punches or retransmits as due, and sends acknowledgements and keepalives.
-    fn poll(&mut self) {
+    pub fn poll_at(&mut self, now: Instant) {
         if self.closed {
             return;
         }
-        let now = Instant::now();
         self.receive(now);
         if self.closed {
             return;
@@ -422,7 +434,7 @@ impl UdpLink {
             None => {
                 if self.last_sent.is_none_or(|t| now - t >= PUNCH_INTERVAL) {
                     for to in self.candidates.clone() {
-                        self.send_packet(to, Kind::Punch, &[]);
+                        self.send_packet(now, to, Kind::Punch, &[]);
                     }
                 }
             }
@@ -450,6 +462,11 @@ impl UdpLink {
     fn handle(&mut self, p: &[u8], from: SocketAddr, now: Instant) {
         let Some((kind, sender, receiver, body)) = parse_packet(p) else { return };
         if sender != self.remote || receiver != self.local {
+            return;
+        }
+        // A late `Match` from the rendezvous server carries the very same nonces, but it comes
+        // from the server: following it would lock the link onto the server's address.
+        if matches!(kind, Kind::Register | Kind::Match) {
             return;
         }
         // Follow the peer if its NAT moves it to another port.
@@ -483,6 +500,11 @@ impl UdpLink {
                     })
                     .collect();
                 let mut sample = None;
+                if !acked.is_empty() {
+                    // The peer hears us again: drop the backoff, or under steady loss it stays
+                    // pinned at `MAX_RTO` and every lost segment stalls the stream for seconds.
+                    self.rto = self.base_rto();
+                }
                 for s in acked {
                     let seg = self.unacked.remove(&s).unwrap();
                     // Karn: only segments sent once give an unambiguous round trip.
@@ -511,20 +533,36 @@ impl UdpLink {
             }
         };
         self.srtt = Some(srtt);
-        self.rto = (srtt + (self.rttvar * 4).max(Duration::from_millis(10))).clamp(MIN_RTO, MAX_RTO);
+        self.rto = self.base_rto();
+    }
+
+    /// The retransmission timeout before any backoff.
+    fn base_rto(&self) -> Duration {
+        match self.srtt {
+            Some(srtt) => (srtt + (self.rttvar * 4).max(Duration::from_millis(10))).clamp(MIN_RTO, MAX_RTO),
+            None => INITIAL_RTO,
+        }
     }
 
     fn flush(&mut self, now: Instant, peer: SocketAddr) {
-        let due: Vec<u32> = (self.unacked.iter())
+        let mut due: Vec<u32> = (self.unacked.iter())
             .filter(|(_, seg)| now - seg.sent >= self.rto)
             .map(|(&s, _)| s)
             .collect();
+        // The oldest segment holds up the whole stream, so it goes whenever anything does:
+        // segments sent at different times would otherwise keep backing the timeout off before
+        // its own turn comes.
+        if let (Some(&first), Some(&head)) = (due.first(), self.unacked.keys().next()) {
+            if first != head {
+                due.insert(0, head);
+            }
+        }
         for &s in &due {
             let seg = self.unacked.get_mut(&s).unwrap();
             seg.sent = now;
             seg.retransmitted = true;
             let payload = data_payload(s, &seg.data);
-            self.send_packet(peer, Kind::Data, &payload);
+            self.send_packet(now, peer, Kind::Data, &payload);
         }
         if !due.is_empty() {
             self.rto = (self.rto * 2).min(MAX_RTO);
@@ -534,7 +572,7 @@ impl UdpLink {
             let data: Vec<u8> = self.pending.drain(..self.pending.len().min(MAX_SEGMENT)).collect();
             let seq = self.next_seq;
             self.next_seq = seq.wrapping_add(1);
-            self.send_packet(peer, Kind::Data, &data_payload(seq, &data));
+            self.send_packet(now, peer, Kind::Data, &data_payload(seq, &data));
             self.unacked.insert(seq, Segment { data, sent: now, retransmitted: false });
         }
 
@@ -549,11 +587,11 @@ impl UdpLink {
             }
             let mut payload = self.recv_next.to_le_bytes().to_vec();
             payload.extend_from_slice(&sack.to_le_bytes());
-            self.send_packet(peer, Kind::Ack, &payload);
+            self.send_packet(now, peer, Kind::Ack, &payload);
         }
 
         if self.last_sent.is_none_or(|t| now - t >= KEEPALIVE) {
-            self.send_packet(peer, Kind::Punch, &[]);
+            self.send_packet(now, peer, Kind::Punch, &[]);
         }
     }
 
@@ -561,6 +599,42 @@ impl UdpLink {
         self.closed = true;
         self.pending.clear();
         self.unacked.clear();
+    }
+
+    pub fn send_at(&mut self, frame: &[u8], now: Instant) {
+        self.poll_at(now);
+        let Some(peer) = self.peer.filter(|_| !self.closed) else { return };
+        push_frame(&mut self.pending, frame);
+        self.flush(now, peer);
+    }
+
+    pub fn recv_at(&mut self, now: Instant) -> Option<Vec<u8>> {
+        if self.frames.is_empty() {
+            self.poll_at(now);
+        }
+        self.frames.pop_front()
+    }
+
+    /// One step of closing an open link: true while frames still await acknowledgement, which
+    /// the caller gives a moment ([`LINGER`]) before [`hang_up_at`](UdpLink::hang_up_at).
+    pub fn lingering_at(&mut self, now: Instant) -> bool {
+        if self.closed || self.peer.is_none() || self.pending.is_empty() && self.unacked.is_empty() {
+            return false;
+        }
+        // Without the backoff: a backed-off timeout can outlast the whole linger.
+        self.rto = self.base_rto();
+        self.poll_at(now);
+        true
+    }
+
+    /// Says goodbye at the link level and closes.
+    pub fn hang_up_at(&mut self, now: Instant) {
+        if let Some(peer) = self.peer.filter(|_| !self.closed) {
+            for _ in 0..3 {
+                self.send_packet(now, peer, Kind::Bye, &[]);
+            }
+        }
+        self.close();
     }
 }
 
@@ -571,19 +645,13 @@ fn data_payload(seq: u32, data: &[u8]) -> Vec<u8> {
     p
 }
 
-impl Link for UdpLink {
+impl<S: Datagrams> Link for UdpLink<S> {
     fn send(&mut self, frame: &[u8]) {
-        self.poll();
-        let Some(peer) = self.peer.filter(|_| !self.closed) else { return };
-        push_frame(&mut self.pending, frame);
-        self.flush(Instant::now(), peer);
+        self.send_at(frame, Instant::now());
     }
 
     fn recv(&mut self) -> Option<Vec<u8>> {
-        if self.frames.is_empty() {
-            self.poll();
-        }
-        self.frames.pop_front()
+        self.recv_at(Instant::now())
     }
 
     fn state(&self) -> LinkState {
@@ -595,25 +663,23 @@ impl Link for UdpLink {
     }
 }
 
-impl Drop for UdpLink {
+impl<S: Datagrams> Drop for UdpLink<S> {
     /// Gives the last frames (usually the session's `Bye`) a moment to be acknowledged, then
     /// says goodbye at the link level too.
     fn drop(&mut self) {
-        let Some(peer) = self.peer.filter(|_| !self.closed) else { return };
         let deadline = Instant::now() + LINGER;
-        while !(self.pending.is_empty() && self.unacked.is_empty()) && !self.closed && Instant::now() < deadline {
-            self.poll();
+        while Instant::now() < deadline && self.lingering_at(Instant::now()) {
             std::thread::sleep(Duration::from_millis(2));
         }
-        for _ in 0..3 {
-            self.send_packet(peer, Kind::Bye, &[]);
-        }
+        self.hang_up_at(Instant::now());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[test]
     fn code_round_trip() {
@@ -647,28 +713,24 @@ mod tests {
     }
 
     /// Two endpoints on loopback, each knowing only the other's code.
-    fn pair(loss: u64) -> (PlayerId, UdpLink, PlayerId, UdpLink) {
+    fn pair() -> (PlayerId, UdpLink, PlayerId, UdpLink) {
         let a = P2pEndpoint::bind(0).unwrap();
         let b = P2pEndpoint::bind(0).unwrap();
         let mut a_info = PeerInfo::from_code(&a.code()).unwrap();
         // A dead candidate first, like an unreachable public address.
         a_info.candidates.insert(0, "127.0.0.1:9".parse().unwrap());
         let b_info = PeerInfo::from_code(&b.code()).unwrap();
-        let (pa, mut la) = a.connect(b_info).unwrap();
-        let (pb, mut lb) = b.connect(a_info).unwrap();
-        if loss > 0 {
-            la.loss = Some((0x9E37_79B9_7F4A_7C15, loss));
-            lb.loss = Some((0x2545_F491_4F6C_DD1D, loss));
-        }
+        let (pa, la) = a.connect(b_info).unwrap();
+        let (pb, lb) = b.connect(a_info).unwrap();
         (pa, la, pb, lb)
     }
 
     fn pump(a: &mut UdpLink, b: &mut UdpLink, mut done: impl FnMut(&mut UdpLink, &mut UdpLink) -> bool) {
         let start = Instant::now();
         while !done(a, b) {
-            assert!(start.elapsed() < Duration::from_secs(30), "timed out");
-            a.poll();
-            b.poll();
+            assert!(start.elapsed() < Duration::from_secs(10), "timed out");
+            a.poll_at(Instant::now());
+            b.poll_at(Instant::now());
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -677,17 +739,20 @@ mod tests {
         (0..len).map(|j| (i * 31 + j) as u8).collect()
     }
 
-    fn exchange(loss: u64) {
-        let (pa, mut a, pb, mut b) = pair(loss);
+    /// Real sockets: punching past a dead candidate, a short exchange, and the goodbye. Small
+    /// enough not to overflow the socket buffers; the protocol gets its workout on the
+    /// simulated network below.
+    #[test]
+    fn punch_and_exchange() {
+        let (pa, mut a, pb, mut b) = pair();
         assert_eq!(pa + pb, 1, "one player 0 and one player 1");
         assert_eq!(a.state(), LinkState::Connecting);
         a.send(b"dropped while connecting");
         pump(&mut a, &mut b, |a, b| a.state() == LinkState::Open && b.state() == LinkState::Open);
 
-        let big = frame(7, 300_000);
+        let big = frame(7, 20_000);
         a.send(&big);
-        b.send(&big);
-        for i in 0..1000 {
+        for i in 0..100 {
             a.send(&frame(i, i % 50));
             b.send(&frame(i + 1, i % 70));
         }
@@ -695,13 +760,12 @@ mod tests {
         pump(&mut a, &mut b, |a, b| {
             got_a.extend(std::iter::from_fn(|| a.recv()));
             got_b.extend(std::iter::from_fn(|| b.recv()));
-            got_a.len() == 1001 && got_b.len() == 1001
+            got_a.len() == 100 && got_b.len() == 101
         });
         assert_eq!(got_b[0], big);
-        assert_eq!(got_a[0], big);
-        for i in 0..1000 {
+        for i in 0..100 {
             assert_eq!(got_b[i + 1], frame(i, i % 50));
-            assert_eq!(got_a[i + 1], frame(i + 1, i % 70));
+            assert_eq!(got_a[i], frame(i + 1, i % 70));
         }
 
         // The last frame survives the drop, then the peer sees the link close. The drop lingers
@@ -711,7 +775,7 @@ mod tests {
         let start = Instant::now();
         let mut last = Vec::new();
         while b.state() != LinkState::Closed {
-            assert!(start.elapsed() < Duration::from_secs(15), "never closed");
+            assert!(start.elapsed() < Duration::from_secs(10), "never closed");
             last.extend(std::iter::from_fn(|| b.recv()));
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -720,14 +784,177 @@ mod tests {
         dropper.join().unwrap();
     }
 
-    #[test]
-    fn punch_and_exchange() {
-        exchange(0);
+    /// A simulated network: a clock that moves only when told to, and datagrams that take
+    /// `latency` plus up to `jitter` (so they overtake each other), are lost at `loss` percent,
+    /// and are dropped while `buffer` bytes are already on their way to the same receiver (like
+    /// a full router queue or socket buffer). All randomness comes from the seed, so a run
+    /// always plays out the same way.
+    struct SimNet {
+        now: Instant,
+        latency: Duration,
+        jitter: Duration,
+        loss: u64,
+        buffer: usize,
+        rng: u64,
+        /// `(arrival, from, to, packet)`.
+        in_flight: Vec<(Instant, SocketAddr, SocketAddr, Vec<u8>)>,
     }
 
+    impl SimNet {
+        fn random(&mut self) -> u64 {
+            self.rng ^= self.rng << 13;
+            self.rng ^= self.rng >> 7;
+            self.rng ^= self.rng << 17;
+            self.rng
+        }
+    }
+
+    struct SimSocket {
+        net: Rc<RefCell<SimNet>>,
+        addr: SocketAddr,
+    }
+
+    impl Datagrams for SimSocket {
+        fn send_to(&self, p: &[u8], to: SocketAddr) -> io::Result<usize> {
+            let mut net = self.net.borrow_mut();
+            let queued: usize = net.in_flight.iter().filter(|f| f.2 == to).map(|f| f.3.len()).sum();
+            let jitter = net.jitter.mul_f64((net.random() % 1000) as f64 / 1000.0);
+            if net.random() % 100 >= net.loss && queued + p.len() <= net.buffer {
+                let arrival = net.now + net.latency + jitter;
+                net.in_flight.push((arrival, self.addr, to, p.to_vec()));
+            }
+            Ok(p.len())
+        }
+
+        fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            let mut net = self.net.borrow_mut();
+            let now = net.now;
+            let next = (net.in_flight.iter().enumerate())
+                .filter(|(_, f)| f.2 == self.addr && f.0 <= now)
+                .min_by_key(|(_, f)| f.0)
+                .map(|(i, _)| i);
+            let Some(i) = next else { return Err(ErrorKind::WouldBlock.into()) };
+            let (_, from, _, p) = net.in_flight.remove(i);
+            buf[..p.len()].copy_from_slice(&p);
+            Ok((p.len(), from))
+        }
+    }
+
+    type SimLink = UdpLink<SimSocket>;
+
+    /// Two links punching to each other (past a dead candidate) on a 20 ms network with 10 ms
+    /// of jitter and 64 KiB of buffer per receiver.
+    fn sim_pair(seed: u64, loss: u64) -> (Rc<RefCell<SimNet>>, SimLink, SimLink) {
+        let net = Rc::new(RefCell::new(SimNet {
+            now: Instant::now(),
+            latency: Duration::from_millis(20),
+            jitter: Duration::from_millis(10),
+            loss,
+            buffer: 64 << 10,
+            rng: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+            in_flight: Vec::new(),
+        }));
+        let [a_addr, b_addr, dead]: [SocketAddrV4; 3] =
+            ["10.0.0.1:1000", "10.0.0.2:2000", "10.0.0.3:9"].map(|a| a.parse().unwrap());
+        let now = net.borrow().now;
+        let link = |addr: SocketAddrV4, local, remote, other| {
+            let socket = SimSocket { net: net.clone(), addr: SocketAddr::V4(addr) };
+            UdpLink::with_socket(socket, local, PeerInfo { nonce: remote, candidates: vec![dead, other] }, now)
+        };
+        let (a, b) = (link(a_addr, 1, 2, b_addr), link(b_addr, 2, 1, a_addr));
+        (net, a, b)
+    }
+
+    /// Polls both links every simulated millisecond until `done`; returns the simulated time
+    /// that took.
+    fn run_sim(
+        net: &RefCell<SimNet>,
+        a: &mut SimLink,
+        b: &mut SimLink,
+        limit: Duration,
+        mut done: impl FnMut(&mut SimLink, &mut SimLink, Instant) -> bool,
+    ) -> Duration {
+        let start = net.borrow().now;
+        loop {
+            let now = net.borrow().now;
+            if done(a, b, now) {
+                return now - start;
+            }
+            assert!(now - start < limit, "not done after {limit:?} of simulated time");
+            a.poll_at(now);
+            b.poll_at(now);
+            net.borrow_mut().now += Duration::from_millis(1);
+        }
+    }
+
+    /// A 300 kB frame and 1000 small ones each way, then a last frame and the goodbye. Returns
+    /// the simulated time the exchange took, and whether the last frame made it before the
+    /// link closed.
+    fn sim_exchange(seed: u64, loss: u64) -> (Duration, bool) {
+        let (net, mut a, mut b) = sim_pair(seed, loss);
+        let open = |l: &SimLink| l.state() == LinkState::Open;
+        run_sim(&net, &mut a, &mut b, Duration::from_secs(5), |a, b, _| open(a) && open(b));
+
+        let now = net.borrow().now;
+        let big = frame(7, 300_000);
+        a.send_at(&big, now);
+        b.send_at(&big, now);
+        for i in 0..1000 {
+            a.send_at(&frame(i, i % 50), now);
+            b.send_at(&frame(i + 1, i % 70), now);
+        }
+        let (mut got_a, mut got_b) = (Vec::new(), Vec::new());
+        let took = run_sim(&net, &mut a, &mut b, Duration::from_secs(60), |a, b, now| {
+            got_a.extend(std::iter::from_fn(|| a.recv_at(now)));
+            got_b.extend(std::iter::from_fn(|| b.recv_at(now)));
+            got_a.len() == 1001 && got_b.len() == 1001
+        });
+        assert_eq!(got_b[0], big);
+        assert_eq!(got_a[0], big);
+        for i in 0..1000 {
+            assert_eq!(got_b[i + 1], frame(i, i % 50));
+            assert_eq!(got_a[i + 1], frame(i + 1, i % 70));
+        }
+
+        // `a` closes the way dropping it does, on the simulated clock: it lingers for the last
+        // frame's acknowledgement, then hangs up.
+        let start = net.borrow().now;
+        a.send_at(b"bye", start);
+        let mut last = Vec::new();
+        run_sim(&net, &mut a, &mut b, Duration::from_secs(20), |a, b, now| {
+            if now - start >= LINGER || !a.lingering_at(now) {
+                a.hang_up_at(now);
+            }
+            last.extend(std::iter::from_fn(|| b.recv_at(now)));
+            b.state() == LinkState::Closed
+        });
+        assert!(last.is_empty() || last == [b"bye"], "seed {seed}, {loss}% loss: {last:?}");
+        (took, !last.is_empty())
+    }
+
+    /// Frames arrive whole and in order over a network that delays, reorders and overflows
+    /// (which loses whatever does not fit). Recovering from that takes a few round trips, not
+    /// seconds of backed-off timeouts.
+    #[test]
+    fn exchange_over_a_congested_network() {
+        for seed in 0..10 {
+            let (took, said_bye) = sim_exchange(seed, 0);
+            assert!(took < Duration::from_secs(1), "seed {seed}: took {took:?}");
+            assert!(said_bye, "seed {seed}: the last frame was lost");
+        }
+    }
+
+    /// The same on top of random packet loss. Lingering for the last frame is best effort: at
+    /// 20% loss, about one close in 200 gives up on it before it gets through.
     #[test]
     fn exchange_with_packet_loss() {
-        exchange(20);
+        for seed in 0..10 {
+            for (loss, limit) in [(5, 2), (20, 4)] {
+                let (took, said_bye) = sim_exchange(seed, loss);
+                assert!(took < Duration::from_secs(limit), "seed {seed}, {loss}% loss: took {took:?}");
+                assert!(said_bye || loss > 5, "seed {seed}, {loss}% loss: the last frame was lost");
+            }
+        }
     }
 
     #[test]
@@ -746,6 +973,26 @@ mod tests {
         let (_, mut link) = a.connect(fake).unwrap();
         let start = Instant::now();
         while start.elapsed() < Duration::from_millis(300) {
+            assert_eq!(link.recv(), None);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(link.state(), LinkState::Connecting);
+    }
+
+    /// A late `Match` from the rendezvous server names us and the peer, but must not open the
+    /// link to the server's address.
+    #[test]
+    fn ignores_late_rendezvous_matches() {
+        let a = P2pEndpoint::bind(0).unwrap();
+        let to = SocketAddrV4::new(Ipv4Addr::LOCALHOST, a.socket().local_addr().unwrap().port());
+        let (local, remote) = (a.info().nonce, a.info().nonce ^ 1);
+        let peer = PeerInfo { nonce: remote, candidates: vec!["127.0.0.1:9".parse().unwrap()] };
+        let mut body = Vec::new();
+        put_addrs(&mut body, &peer.candidates);
+        let (_, mut link) = a.connect(peer).unwrap();
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        server.send_to(&packet(Kind::Match, remote, local, &body), to).unwrap();
+        for _ in 0..20 {
             assert_eq!(link.recv(), None);
             std::thread::sleep(Duration::from_millis(5));
         }

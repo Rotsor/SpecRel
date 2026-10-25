@@ -120,6 +120,9 @@ pub struct App {
     pub scene_generation: u64,
     world_grew: bool,
     rebuild_timer: f32,
+    /// Wall-clock interval between geometry snapshots of a growing dynamic world;
+    /// [`DYNAMIC_REBUILD_INTERVAL`] unless nothing renders (e.g. headless tests).
+    pub rebuild_interval: f32,
     /// The two-player match this app plays in, if any (see `docs/MULTIPLAYER.md`). It pins the
     /// app to the Dynamic Mode scene.
     pub multiplayer: Option<Match>,
@@ -150,6 +153,7 @@ impl App {
             scene_generation: 0,
             world_grew: false,
             rebuild_timer: 0.0,
+            rebuild_interval: DYNAMIC_REBUILD_INTERVAL,
             multiplayer: None,
         };
         app.enter_scene(0);
@@ -435,7 +439,7 @@ impl App {
     }
 
     /// Dynamic Mode: move the causal frontier to the camera and finalize what it uncovered,
-    /// snapshotting the geometry at most every [`DYNAMIC_REBUILD_INTERVAL`].
+    /// snapshotting the geometry at most every [`rebuild_interval`](App::rebuild_interval).
     fn step_world(&mut self, dt_wall: f32) {
         // A match never rebases: the two replicas would do it at different moments, and their
         // `f64` rounding would part ways (docs/MULTIPLAYER.md §2).
@@ -466,7 +470,7 @@ impl App {
         }
 
         self.rebuild_timer += dt_wall;
-        if self.world_grew && self.rebuild_timer >= DYNAMIC_REBUILD_INTERVAL {
+        if self.world_grew && self.rebuild_timer >= self.rebuild_interval {
             self.rebuild_dynamic_scene();
         }
     }
@@ -726,16 +730,18 @@ mod tests {
         assert!((app.dynamics.flashes[0].at.t - (t - 0.1)).abs() < 1e-3);
     }
 
-    /// Two players' apps connected in-process: player 0 and player 1.
+    /// Two players' apps connected in-process: player 0 and player 1. Nothing renders them,
+    /// so they skip the geometry snapshots, which would otherwise take nearly all the time.
     fn match_apps() -> (App, App) {
         let (a, b) = crate::multiplayer::link::LocalLink::pair();
-        let scenes = || {
-            vec![Scene4D::build(DemoScene::TwinParadox), Scene4D::build(DemoScene::RelativisticBilliards)]
+        let app = |p, link| {
+            let scenes =
+                vec![Scene4D::build(DemoScene::TwinParadox), Scene4D::build(DemoScene::RelativisticBilliards)];
+            let mut app = App::new_multiplayer(scenes, 64, 40, p, Box::new(link));
+            app.rebuild_interval = f32::INFINITY;
+            app
         };
-        (
-            App::new_multiplayer(scenes(), 64, 40, 0, Box::new(a)),
-            App::new_multiplayer(scenes(), 64, 40, 1, Box::new(b)),
-        )
+        (app(0, a), app(1, b))
     }
 
     /// `O_b` lies in the open future light cone of `O_a`, beyond `slack`.

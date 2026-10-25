@@ -116,18 +116,20 @@ pub(crate) fn meet(
     let register = packet(Kind::Register, me.nonce, 0, &body);
 
     let start = Instant::now();
+    let deadline = start + timeout;
     let mut buf = [0u8; 2048];
     let mut next_register = start;
     let result = loop {
         let now = Instant::now();
-        if now - start >= timeout {
+        if now >= deadline {
             break Err(io::Error::new(ErrorKind::TimedOut, "nobody else joined the room"));
         }
         if now >= next_register {
             socket.send_to(&register, server)?;
             next_register = now + REGISTER_INTERVAL;
         }
-        socket.set_read_timeout(Some((next_register - now).max(Duration::from_millis(1))))?;
+        let wake = next_register.min(deadline);
+        socket.set_read_timeout(Some((wake - now).max(Duration::from_millis(1))))?;
         match socket.recv_from(&mut buf) {
             Ok((n, from)) if from == SocketAddr::V4(server) => {
                 if let Some((Kind::Match, peer, to, body)) = parse_packet(&buf[..n]) {
@@ -160,8 +162,9 @@ mod tests {
     fn two_players_meet_and_connect() {
         let mut server = RendezvousServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let SocketAddr::V4(server_addr) = server.local_addr().unwrap() else { panic!() };
+        // Not joined: the server outlives the test, which only checks it never failed.
         let serving = std::thread::spawn(move || {
-            server.serve(Some(Instant::now() + Duration::from_secs(10))).unwrap();
+            server.serve(Some(Instant::now() + Duration::from_secs(60))).unwrap();
         });
 
         let a = P2pEndpoint::bind(0).unwrap();
@@ -195,6 +198,9 @@ mod tests {
         }
         assert_eq!(got.as_deref(), Some(&b"hello"[..]));
         assert_eq!(la.state(), LinkState::Open);
-        serving.join().unwrap();
+        for link in [&la, &lb] {
+            assert_ne!(link.peer_addr(), Some(SocketAddr::V4(server_addr)), "locked onto the server");
+        }
+        assert!(!serving.is_finished(), "the server stopped");
     }
 }
