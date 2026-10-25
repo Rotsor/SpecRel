@@ -52,6 +52,12 @@ struct Uniforms {
     num_flashes: u32,
     frontier_tau: f32,
     prophecy_delta: f32,
+    // Apexes of the cones drawn as undetermined haze (`FrameDynamics::haze_origins`).
+    num_haze: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    haze_origin: array<vec4<f32>, 5>,
     flash_at: array<vec4<f32>, 16>,         // emission event (t, x, y, z)
     flash_col_width: array<vec4<f32>, 16>,  // (color * intensity, shell width)
 };
@@ -828,8 +834,11 @@ fn decision_age_color(age: f32) -> vec3<f32> {
 // Mirrors `renderer::apply_undecided_haze`.
 fn apply_undecided_haze(base: vec3<f32>, event: vec4<f32>) -> vec3<f32> {
     let shell = 0.18;
-    let d = event - u.frontier_origin;
-    let inside = d.x - length(d.yzw);
+    var inside = -1.0e30;
+    for (var i = 0u; i < u.num_haze; i++) {
+        let d = event - u.haze_origin[i];
+        inside = max(inside, d.x - length(d.yzw));
+    }
     if inside <= -shell {
         return base;
     }
@@ -948,7 +957,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if t.found {
         let hit = make_hit_record(t);
         color = shade_hit(ray_dir, hit);
-        if u.slice_mode == SLICE_PROPHECY {
+        if u.num_haze > 0u {
             color = apply_undecided_haze(color, hit.event);
         }
     } else {

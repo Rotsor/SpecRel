@@ -65,6 +65,13 @@ hull as non-rigid. It responds to thrust after the light-travel time from the ce
 far the hull and the centre can drift apart in that time. The other player's ship is still *drawn* rigidly around its
 centre. That only affects what the drawing looks like; nothing in the game depends on it.
 
+**God's eye shows what is still open.** In single player the God's-eye slice (`dt' = 0` in the
+camera frame) lies wholly outside the camera's future cone, so all of it is decided. In a match
+the slice can reach into `I⁺(O_remote)` when the other player lags behind in the camera's frame.
+Those parts are drawn in the same violet haze as the Prophecy slice: the renderers haze every
+event inside the future cone of the latest known event of any other live ship
+(`FrameDynamics::remote_origins`), plus, on the Prophecy slice, the camera's own.
+
 A player with `Δt ≤ 0` never needs to stop, so at least one player can always move. Both can be
 stopped only briefly, when their information about each other is stale; heartbeats resolve that.
 **Latency figures.** In a match the HUD's time-controls line shows, once the other player has

@@ -418,6 +418,7 @@ impl App {
         let world = self.world.as_mut().expect("dynamic scene has a world");
         self.world_grew |= world.advance(frontier, self.camera.tetrad.e[0]);
         self.dynamics.frontier_lag = world.frontier_lag(self.camera.tetrad.e[0]);
+        self.dynamics.remote_origins = world.remote_origins();
         if let Some(m) = self.multiplayer.as_mut() {
             m.send_track(*world.ships[m.local() as usize].latest());
         }
@@ -525,6 +526,8 @@ impl App {
         self.dynamics.frontier = self.world.as_ref().map(|w| w.frontier);
         let u = self.camera.tetrad.e[0];
         self.dynamics.frontier_lag = self.world.as_ref().map_or(0.0, |w| w.frontier_lag(u));
+        self.dynamics.remote_origins =
+            self.world.as_ref().map_or(Vec::new(), DynWorld::remote_origins);
         if self.is_dynamic() {
             self.time_scale_idx = self.time_scale_idx.max(FIRST_FORWARD_TIME_SCALE_IDX);
             self.rebuild_dynamic_scene();
