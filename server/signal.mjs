@@ -9,14 +9,21 @@
 //   GET  /rooms/:room/offer?wait=S   joiner fetches it, long-polling up to S seconds
 //   POST /rooms/:room/answer         joiner stores its answer
 //   GET  /rooms/:room/answer?wait=S  host fetches it, long-polling
+//   GET  /turn                       ICE servers for the browser, with TURN relay credentials
 //   GET  /health                     liveness check
 //
 // A timed-out long poll answers 204. Posting an offer to a room that already has one, or an
 // answer to a room without an offer or with an answer already, answers 409. Rooms are dropped
-// ROOM_TTL_MS after creation, or shortly after the host has fetched the answer.
+// ROOM_TTL_MS after creation or after the host last polled for the answer (so a lobby lives as
+// long as its host keeps waiting), or shortly after the host has fetched the answer.
 //
 // With `--static DIR` the server also serves DIR (e.g. `web/`), so the game and the signalling
 // share one origin and the page needs no `signal=` parameter.
+//
+// With TURN_SECRET and TURN_URLS set (e.g. `turn:relay.example.com:3478?transport=udp,...`),
+// /turn hands out time-limited credentials for a TURN server such as coturn running with
+// `use-auth-secret` and the same `static-auth-secret`. Players whose NATs allow no direct path
+// then talk through that relay. Without them, /turn lists only the public STUN servers.
 //
 // Usage: node server/signal.mjs [--port 8787] [--host 0.0.0.0] [--static web]
 // Zero dependencies; Node 18 or later.
@@ -24,6 +31,7 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 
 const args = process.argv.slice(2);
 const opt = (name, fallback) => {
@@ -40,6 +48,22 @@ const MAX_WAIT_S = 30;
 const MAX_BODY = 64 * 1024;
 const MAX_ROOMS = 10000;
 const ROOM_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+const STUN_URLS = ["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"];
+const TURN_SECRET = process.env.TURN_SECRET || null;
+const TURN_URLS = (process.env.TURN_URLS || "").split(",").map((u) => u.trim()).filter(Boolean);
+const TURN_TTL_S = 24 * 60 * 60;
+
+// TURN REST API credentials: the username is the expiry time, the password its HMAC.
+function iceServers() {
+  const servers = [{ urls: STUN_URLS }];
+  if (TURN_SECRET && TURN_URLS.length) {
+    const username = `${Math.floor(Date.now() / 1000) + TURN_TTL_S}:specrel`;
+    const credential = crypto.createHmac("sha1", TURN_SECRET).update(username).digest("base64");
+    servers.push({ urls: TURN_URLS, username, credential });
+  }
+  return servers;
+}
 
 // room name -> { offer, answer, waiters: {offer: Set, answer: Set}, expires }
 const rooms = new Map();
@@ -144,6 +168,8 @@ async function handleRoom(req, res, name, kind, url) {
     }
   };
   if (room && room[kind]) return finish(room[kind]);
+  // A host still waiting for a joiner keeps its lobby open.
+  if (room && kind === "answer") room.expires = Math.max(room.expires, Date.now() + ROOM_TTL_MS);
   const wait = Math.min(MAX_WAIT_S, Math.max(0, Number(url.searchParams.get("wait")) || 0));
   if (wait === 0) return send(res, 204);
   // Waiting for an offer may create the room (the joiner can arrive first); waiting for an
@@ -200,6 +226,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
   try {
     if (req.method === "OPTIONS") return send(res, 204);
+    if (url.pathname === "/turn") return send(res, 200, { iceServers: iceServers() });
     if (url.pathname === "/health") return send(res, 200, { ok: true, rooms: rooms.size });
     const m = url.pathname.match(/^\/rooms\/([^/]+)\/(offer|answer)$/);
     if (m) {
@@ -215,5 +242,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  log(`SpecRel signalling server on http://${HOST}:${PORT}` + (STATIC_DIR ? `, serving ${path.resolve(STATIC_DIR)}` : ""));
+  log(`SpecRel signalling server on http://${HOST}:${PORT}` + (STATIC_DIR ? `, serving ${path.resolve(STATIC_DIR)}` : "") + (TURN_SECRET && TURN_URLS.length ? `, TURN relay ${TURN_URLS.join(" ")}` : ""));
 });

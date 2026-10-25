@@ -67,8 +67,11 @@ centre. That only affects what the drawing looks like; nothing in the game depen
 
 A player with `Δt ≤ 0` never needs to stop, so at least one player can always move. Both can be
 stopped only briefly, when their information about each other is stale; heartbeats resolve that.
-Before the other player has connected, they are taken to be at their spawn event, at rest. This
-makes the join screen an ordinary wait.
+Until the other player has joined (their `Hello` has arrived), the match is paused: the ship
+cannot move or fire, so the world does not advance either, and the HUD shows **WAITING FOR A
+PLAYER TO JOIN**. Their ship is then taken to be at its spawn event, at rest, until their first
+track arrives. If the connection fails before they join, the local player is released and flies
+alone.
 
 ## 2. Determinism
 
@@ -201,14 +204,26 @@ node server/signal.mjs --port 8787 --static web
 # player 2: http://server:8787/?p2p=join&room=myroom
 ```
 
-Browsers allow WebRTC only on `https://` pages and `localhost`, so on a public host put the server
-behind a TLS reverse proxy (Caddy, nginx and so on).
+The **Create online lobby** button does the same with a fresh random room name (`k7m-q2xp`) and
+shows the host the joiner's link to share. A lobby stays open while its host keeps polling for an
+answer.
+
+The page needs a secure context (`https://` or `localhost`) for WebGPU, so on a public host put
+the server behind a TLS reverse proxy (Caddy, nginx and so on). See [`HOSTING.md`](HOSTING.md).
+
+**Relay.** When ICE finds no direct path (both players behind symmetric NATs, or UDP blocked),
+the data channel goes through a TURN relay instead. The page fetches its ICE servers from the
+signalling server's `/turn`, which, when `TURN_SECRET` and `TURN_URLS` are set, adds a TURN
+server with time-limited credentials (the TURN REST API scheme: username `EXPIRY:specrel`,
+password `base64(HMAC-SHA1(secret, username))`, valid 24 h). coturn checks them with
+`use-auth-secret`. The browser still prefers a direct path, so the relay carries only the
+matches that need it.
 
 **Limits.** Hole punching needs at least one side's NAT to keep the same public port for
 every destination ("endpoint-independent mapping"), which most home routers do. If both players
 are behind symmetric NATs (some carrier-grade and corporate NATs), no direct path exists. The
-punch then times out (native: **COULD NOT CONNECT**; web: a message in the panel). That case
-would need a TURN-style relay, which is not implemented. Native peer-to-peer is IPv4 only, and
+punch then times out (native: **COULD NOT CONNECT**; web: a message in the panel), unless a web
+match has a TURN relay (below). Native matches have no relay. Native peer-to-peer is IPv4 only, and
 native and web players cannot play each other.
 
 ## 4. Not done yet
@@ -216,5 +231,6 @@ native and web players cannot play each other.
 * Ship–ship collisions. Ships pass through each other: a collision needs both tracks at the same
   lab time, which forces lockstep at contact range.
 * More than two players (the world supports N ships; session and pacing are 2-player).
-* A relay for players who are both behind symmetric NATs, and native↔web play (native WebRTC).
+* A relay for native peer-to-peer players behind symmetric NATs (web matches have one), and
+  native↔web play (native WebRTC).
 * Coordinated lab-time rebase for very long sessions.

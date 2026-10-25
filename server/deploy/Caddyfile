@@ -1,0 +1,6 @@
+# /etc/caddy/Caddyfile: HTTPS in front of the lobby server. Caddy gets the certificate itself.
+# Replace the name with your domain (or IP-1-2-3-4.sslip.io for a server without one).
+game.example.com {
+	encode gzip
+	reverse_proxy 127.0.0.1:8787
+}

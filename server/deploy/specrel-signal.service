@@ -1,0 +1,20 @@
+# Install as /etc/systemd/system/specrel-signal.service (see docs/HOSTING.md).
+[Unit]
+Description=SpecRel 4D signalling server (lobby for web matches)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=specrel
+EnvironmentFile=-/etc/specrel-signal.env
+WorkingDirectory=/opt/specrel/SpecRel
+ExecStart=/usr/bin/node server/signal.mjs --host 127.0.0.1 --port 8787 --static web
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
