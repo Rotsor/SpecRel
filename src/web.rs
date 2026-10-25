@@ -295,6 +295,7 @@ pub extern "C" fn web_blur() {
 #[no_mangle]
 pub extern "C" fn web_step(dt_secs: f32) {
     with_state(|s| {
+        s.app.tick_wall_clock(dt_secs as f64);
         let dt_wall = dt_secs.clamp(0.001, 0.1);
         s.fps_smooth = s.fps_smooth * 0.9 + (1.0 / dt_wall) * 0.1;
 
@@ -322,6 +323,7 @@ pub extern "C" fn web_step(dt_secs: f32) {
         };
         let demo = app.scene().demo;
         let desc = app.scene_description();
+        let net = app.net_metrics();
 
         if s.gpu_available && s.use_gpu {
             if s.show_hud {
@@ -329,6 +331,7 @@ pub extern "C" fn web_step(dt_secs: f32) {
                     &mut s.hud_overlay,
                     demo,
                     &desc,
+                    net.as_deref(),
                     &app.camera,
                     &app.cfg,
                     app.paused,
@@ -351,6 +354,7 @@ pub extern "C" fn web_step(dt_secs: f32) {
                         &mut s.hud_overlay,
                         demo,
                         &desc,
+                        net.as_deref(),
                         &app.camera,
                         &app.cfg,
                         app.paused,
@@ -366,6 +370,7 @@ pub extern "C" fn web_step(dt_secs: f32) {
                         &mut s.cpu_fb,
                         demo,
                         &desc,
+                        net.as_deref(),
                         &app.camera,
                         &app.cfg,
                         app.paused,

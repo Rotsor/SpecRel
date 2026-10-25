@@ -17,19 +17,50 @@ pub struct Lead {
 }
 
 pub fn lead(local: &ShipSample, remote: &ShipSample) -> Lead {
+    let (u, d) = (cm_velocity(local, remote), offset(local, remote));
+    let dt = dot(u, d);
+    Lead { dt, dist: (dt * dt - dot(d, d)).max(0.0).sqrt() }
+}
+
+/// How the two ships' latest events relate, as the HUD reports it in a match.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Separation {
+    /// The invariant interval `|Δx|² − Δt²` between the two events: positive when they are
+    /// spacelike, negative when one is in the other's cone.
+    pub interval2: f64,
+    /// The CM-frame distance between the two ships at the same CM time: the remote coasted
+    /// inertially (forward or back) to the CM time of the local event.
+    pub dist: f64,
+}
+
+pub fn separation(local: &ShipSample, remote: &ShipSample) -> Separation {
+    let (u, d, b) = (cm_velocity(local, remote), offset(local, remote), remote.four_velocity());
+    let lambda = dot(u, d) / dot(u, b);
+    let level = [0, 1, 2, 3].map(|i| d[i] - lambda * b[i]); // purely spatial in the CM frame
+    Separation { interval2: -dot(d, d), dist: (-dot(level, level)).max(0.0).sqrt() }
+}
+
+/// The two ships' centre-of-momentum 4-velocity (they have equal mass).
+fn cm_velocity(local: &ShipSample, remote: &ShipSample) -> [f64; 4] {
     let (a, b) = (local.four_velocity(), remote.four_velocity());
-    let s = [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]];
-    let norm = (s[0] * s[0] - s[1] * s[1] - s[2] * s[2] - s[3] * s[3]).sqrt();
-    let u = s.map(|c| c / norm);
-    let d = [
+    let s = [0, 1, 2, 3].map(|i| a[i] + b[i]);
+    let norm = dot(s, s).sqrt();
+    s.map(|c| c / norm)
+}
+
+/// `O_local - O_remote` as `(t, x, y, z)`.
+fn offset(local: &ShipSample, remote: &ShipSample) -> [f64; 4] {
+    [
         local.t - remote.t,
         local.pos[0] - remote.pos[0],
         local.pos[1] - remote.pos[1],
         local.pos[2] - remote.pos[2],
-    ];
-    let dt = u[0] * d[0] - u[1] * d[1] - u[2] * d[2] - u[3] * d[3];
-    let interval = -d[0] * d[0] + d[1] * d[1] + d[2] * d[2] + d[3] * d[3];
-    Lead { dt, dist: (dt * dt + interval).max(0.0).sqrt() }
+    ]
+}
+
+/// The Minkowski product with signature `(+, -, -, -)`.
+fn dot(a: [f64; 4], b: [f64; 4]) -> f64 {
+    a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3]
 }
 
 /// Whether `local` is ahead in CM time and within [`CONE_MARGIN`] of the remote's future cone.
@@ -135,6 +166,22 @@ mod tests {
         let (ab, ba) = (lead(&a, &b), lead(&b, &a));
         assert_eq!(ab.dt, -ba.dt);
         assert!(close(ab.dist, ba.dist));
+    }
+
+    #[test]
+    fn separation_levels_the_ships_in_the_cm_frame() {
+        // Both at rest, 3 apart, local 2 s ahead: spacelike (9 - 4), 3 apart at equal time.
+        let s = separation(&rest(2.0, 0.0), &rest(0.0, 3.0));
+        assert!(close(s.interval2, 5.0) && close(s.dist, 3.0), "{s:?}");
+        // Equal and opposite velocities, so the lab is the CM frame. The remote, heard of 1 s
+        // earlier, has since coasted to y = -0.6. Invariant under boosts.
+        let (a, b) = (at(1.0, [0.0, 0.6, 0.0], [0.0, 0.6, 0.0]), at(0.0, [2.0, 0.0, 0.0], [0.0, -0.6, 0.0]));
+        let s = separation(&a, &b);
+        assert!(close(s.interval2, 4.36 - 1.0) && close(s.dist, 5.44f64.sqrt()), "{s:?}");
+        for beta in [-0.7, 0.4] {
+            let m = separation(&boost(&a, beta), &boost(&b, beta));
+            assert!(close(s.dist, m.dist) && close(s.interval2, m.interval2), "{s:?} vs {m:?}");
+        }
     }
 
     #[test]

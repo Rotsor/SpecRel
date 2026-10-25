@@ -373,8 +373,10 @@ fn main() {
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
-        let dt_wall = now.duration_since(last_frame).as_secs_f32().clamp(0.001, 0.1);
+        let elapsed = now.duration_since(last_frame).as_secs_f64();
+        let dt_wall = (elapsed as f32).clamp(0.001, 0.1);
         last_frame = now;
+        app.tick_wall_clock(elapsed);
         fps_smooth = fps_smooth * 0.9 + (1.0 / dt_wall) * 0.1;
 
         for &(key, action) in KEY_ACTIONS {
@@ -429,6 +431,7 @@ fn main() {
                 &mut framebuffer,
                 app.scene().demo,
                 &app.scene_description(),
+                app.net_metrics().as_deref(),
                 &app.camera,
                 &app.cfg,
                 app.paused,

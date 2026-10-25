@@ -74,6 +74,20 @@ track arrives. If the connection fails before they join, the local player is rel
 alone.
 
 ## 2. Determinism
+**Latency figures.** In a match the HUD's time-controls line shows, once the other player has
+joined:
+
+* `NET RTT`: the wall-clock round trip, from a `Ping` (sent every 0.5 s) to its `Pong`, smoothed.
+  Both sides' frame times are included, since messages are read once per frame.
+* `CM LEAD`: the CM time `Δt` by which my latest event leads the other ship's latest known one
+  (what the pacer compares against).
+* `INTERVAL`: the invariant interval between those two events, as a distance. The pacer keeps it
+  spacelike, except that a ship within one step of the other may poke one step into its cone;
+  it then shows `TIMELIKE` and a proper time.
+* `CM DIST`: the distance between the two ships in the CM frame at equal CM time (the other ship
+  coasted inertially to my event's CM time).
+* `WAITING`: the share of the last ~5 s of wall time this player spent waiting.
+
 
 Both replicas must agree bit for bit. Billiards is chaotic, so any drift would eventually show one
 player a collision that the other never sees. Each body's next state is already a pure function of
@@ -133,6 +147,7 @@ until the peer's `Hello` arrives. It then replays the whole log, and the receive
 numbers it has already seen. When the peer leaves (`Bye`, or the link closes), its ship stops
 being an input source: its track ends and its cone is removed from the frontier.
 
+| `Ping` / `Pong` | the sender's wall clock (`f64` seconds); `Pong` echoes a `Ping`'s, timing the round trip |
 ### Transports
 
 * **Native, TCP:** `cargo run --release -- --host 7777` and `cargo run --release -- --join 127.0.0.1:7777`.

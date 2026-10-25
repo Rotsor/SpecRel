@@ -9,13 +9,15 @@ use crate::minkowski::Vec4;
 use crate::renderer::Frontier;
 
 /// Bumped whenever the encoding or the meaning of a message changes.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 const TAG_HELLO: u8 = 0;
 const TAG_TRACK: u8 = 1;
 const TAG_FIRE: u8 = 2;
 const TAG_FLASH: u8 = 3;
 const TAG_BYE: u8 = 4;
+const TAG_PING: u8 = 5;
+const TAG_PONG: u8 = 6;
 
 /// One message from a peer.
 #[derive(Clone, Debug)]
@@ -30,6 +32,10 @@ pub enum Message {
     Flash { at: Vec4 },
     /// The sender quits.
     Bye,
+    /// A round-trip probe, stamped with the sender's wall clock (seconds). Answered with `Pong`.
+    Ping { sent: f64 },
+    /// The answer to a `Ping`, echoing its stamp.
+    Pong { sent: f64 },
 }
 
 // `Frontier` has no `PartialEq`, so compare its fields here.
@@ -44,6 +50,7 @@ impl PartialEq for Message {
             }
             (Flash { at: a }, Flash { at: b }) => a == b,
             (Bye, Bye) => true,
+            (Ping { sent: a }, Ping { sent: b }) | (Pong { sent: a }, Pong { sent: b }) => a == b,
             _ => false,
         }
     }
@@ -98,6 +105,14 @@ impl Message {
                 put_vec4(out, *at);
             }
             Self::Bye => out.push(TAG_BYE),
+            Self::Ping { sent } => {
+                out.push(TAG_PING);
+                put_f64s(out, &[*sent]);
+            }
+            Self::Pong { sent } => {
+                out.push(TAG_PONG);
+                put_f64s(out, &[*sent]);
+            }
         }
     }
 
@@ -128,6 +143,8 @@ impl Message {
             }
             TAG_FLASH => Self::Flash { at: r.vec4()? },
             TAG_BYE => Self::Bye,
+            TAG_PING => Self::Ping { sent: r.f64()? },
+            TAG_PONG => Self::Pong { sent: r.f64()? },
             t => return Err(DecodeError::UnknownTag(t)),
         };
         if !r.0.is_empty() {
@@ -217,6 +234,8 @@ mod tests {
             Message::Fire { at, vel: [-0.0; 3], ammo: Ammo::Spore },
             Message::Flash { at: Vec4::new(1.0e9, -0.0, f32::MIN_POSITIVE, -2.5) },
             Message::Bye,
+            Message::Ping { sent: 12.5 },
+            Message::Pong { sent: -0.0 },
         ]
     }
 

@@ -21,6 +21,10 @@ pub enum Event {
     Track { sample: ShipSample, waiting: bool },
     Fire { at: Frontier, vel: [f64; 3], ammo: Ammo },
     Flash(Vec4),
+    /// The peer probes the round trip; answer with `Message::Pong { sent }`.
+    Ping { sent: f64 },
+    /// The peer answered our `Ping` stamped `sent`.
+    Pong { sent: f64 },
     /// The peer quit or the link closed. Emitted once; nothing follows it.
     Left,
     /// The peer speaks another protocol version. Followed by `Left`.
@@ -153,6 +157,8 @@ impl Session {
             Message::Track { sample, waiting } => events.push(Event::Track { sample, waiting }),
             Message::Fire { at, vel, ammo } => events.push(Event::Fire { at, vel, ammo }),
             Message::Flash { at } => events.push(Event::Flash(at)),
+            Message::Ping { sent } => events.push(Event::Ping { sent }),
+            Message::Pong { sent } => events.push(Event::Pong { sent }),
             Message::Bye => self.peer_gone(events),
         }
     }
