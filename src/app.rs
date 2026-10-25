@@ -460,7 +460,7 @@ impl App {
         self.dynamics.frontier_lag = world.frontier_lag(self.camera.tetrad.e[0]);
         self.dynamics.remote_origins = world.remote_origins();
         if let Some(m) = self.multiplayer.as_mut() {
-            m.send_track(*world.ships[m.local() as usize].latest());
+            m.send_track(*world.ships[m.local() as usize].latest(), &self.commands);
         }
 
         // A laser hit on a hull lights it up (each player sees the flash when its light
@@ -911,6 +911,41 @@ mod tests {
         assert_eq!(mine.hull[..n], seen.hull[..], "both replicas computed the same hull");
         let (pilot, hull) = (seen.latest(), seen.latest_hull());
         assert!((pilot.pos[2] - hull.pos[2]).abs() > 0.02, "pilot and hull apart");
+    }
+
+    /// The other player's hull is drawn on past its pilot's latest event as far as its motion
+    /// is settled: far enough for the near side of the hull to be in view from anywhere
+    /// outside the pilot's future cone, and just as the hull then really flies, whatever the
+    /// pilot does next.
+    #[test]
+    fn the_other_hull_is_drawn_ahead_as_it_will_fly() {
+        for controls in [ControlMode::Delayed, ControlMode::Pod] {
+            let (mut p0, mut p1) = match_apps();
+            if controls == ControlMode::Pod {
+                p0.apply(Action::CycleControls);
+            }
+            let dt = 0.05;
+            play(&mut p0, &mut p1, 20, dt, &HeldInput { thrust_forward: true, ..Default::default() });
+            play(&mut p0, &mut p1, 10, dt, &HeldInput { thrust_right: true, ..Default::default() });
+            let seen = &p1.world.as_ref().unwrap().ships[0];
+            let (ahead, latest) = (seen.hull_ahead(), *seen.latest());
+            let end = ahead.last().expect("the hull's next moves are settled");
+            let pilot = latest.event();
+            let offset = (seen.latest_hull().event().spatial() - pilot.spatial()).length() as f64;
+            let reach = end.t - latest.t;
+            assert!(reach > SHIP_RADIUS + offset, "{controls:?}: drawn only {reach} ahead");
+
+            // Whatever the pilot does next, the hull flies as drawn.
+            play(&mut p0, &mut p1, 40, dt, &HeldInput { thrust_back: true, thrust_up: true, ..Default::default() });
+            let flown = &p0.world.as_ref().unwrap().ships[0];
+            assert!(flown.latest().t > end.t);
+            for a in &ahead {
+                let b = flown.hull_at(a.t);
+                let gap = (a.event().spatial() - b.event().spatial()).length();
+                assert!(gap < 0.02, "{controls:?} at t = {}: drawn {:?}, flew {:?}", a.t, a.pos, b.pos);
+            }
+            assert!(ahead.iter().any(|a| a.vel != latest.vel), "{controls:?}: the hull turns ahead");
+        }
     }
 
     /// Alone, switching the controls restarts the table.

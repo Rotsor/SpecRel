@@ -8,7 +8,7 @@
 
 use super::billiards::SHIP_RADIUS;
 use super::collide::{self, V3};
-use super::helm::{ControlMode, Hull};
+use super::helm::{command_delay, Command, ControlMode, Hull};
 use crate::mesh4d::{Mesh3D, WorldlineSample};
 use crate::minkowski::{Tetrad, Vec3, Vec4};
 use crate::renderer::Frontier;
@@ -96,6 +96,10 @@ pub struct Ship {
     pub hull: Vec<ShipSample>,
     /// How the controls reach the hull.
     pub controls: ControlMode,
+    /// [`ControlMode::Delayed`]: the orders the pilot had issued by its latest event that the
+    /// hull had not executed yet, as far as they have been heard of. They fix the hull's next
+    /// [`command_delay`] of motion.
+    orders: Vec<Command>,
     /// [`ControlMode::Pod`]: the hull's state at its latest sample, at full (`f32`) precision.
     helm: Hull,
     /// The player left the match: the ship ends at its last sample, and no longer holds the
@@ -112,6 +116,7 @@ impl Ship {
             track: vec![spawn],
             hull: vec![spawn],
             controls: ControlMode::default(),
+            orders: Vec::new(),
             helm: Hull::from_sample(&spawn),
             left: false,
             shots: 0,
@@ -160,8 +165,72 @@ impl Ship {
                 ShipSample { t: pilot.t, ..self.helm.sample() } // exactly the pilot's lab time
             }
         };
+        // Orders due by the last event were executed before the step to `pilot`.
+        let executed = self.latest().tau as f32;
+        self.orders.retain(|c| c.due > executed);
         self.track.push(pilot);
         self.hull.push(hull);
+    }
+
+    /// Hear of `orders` the pilot issued (in order) by its latest event.
+    pub fn hear_orders(&mut self, orders: &[Command]) {
+        self.orders.extend_from_slice(orders);
+    }
+
+    /// The hull center's motion past its latest sample, as far as it is already settled by
+    /// what has been heard of: with delayed controls, the orders on their way across the hull
+    /// ([`command_delay`] ahead of the pilot's latest event); in a control pod, as long as the
+    /// hull is still steering by pilot events already recorded (up to [`pod_delay`]
+    /// ahead). That covers the hull's events outside the future cone of the pilot's latest
+    /// event (all but the far corners of a pod flung out by a hard reversal), so drawing it
+    /// shows the whole hull to anyone outside that cone; the recorded track alone ends at the
+    /// pilot's lab time, short of the hull's near side.
+    ///
+    /// Only for drawing: the world itself (contacts, laser hits) waits for recorded samples.
+    ///
+    /// [`pod_delay`]: super::helm::pod_delay
+    pub fn hull_ahead(&self) -> Vec<ShipSample> {
+        if self.left {
+            return Vec::new();
+        }
+        match self.controls {
+            ControlMode::Delayed => self.delayed_ahead(),
+            ControlMode::Pod => self.pod_ahead(),
+        }
+    }
+
+    /// Fly the hull on through the orders still due, as its pilot would: each frame first
+    /// executes what has come due, then moves.
+    fn delayed_ahead(&self) -> Vec<ShipSample> {
+        let last = self.latest_hull();
+        let mut tetrad = Tetrad::rest();
+        tetrad.boost_to(last.u());
+        let (mut event, mut tau) = (last.event(), last.tau as f32);
+        let horizon = tau + command_delay();
+        let mut orders = self.orders.iter().peekable();
+        let mut ahead = Vec::new();
+        while tau < horizon {
+            while let Some(c) = orders.next_if(|c| c.due <= tau) {
+                c.order.execute(&mut tetrad, c.rapidity);
+            }
+            let dtau = AHEAD_STEP.min(horizon - tau);
+            event += tetrad.e[0] * dtau;
+            tau += dtau;
+            ahead.push(ShipSample::new(Frontier { origin: event, proper_time: tau }, tetrad.e[0]));
+        }
+        ahead
+    }
+
+    /// Steer the hull on while everything it steers by is recorded.
+    fn pod_ahead(&self) -> Vec<ShipSample> {
+        let mut hull = self.helm;
+        let mut ahead = Vec::new();
+        while hull.steering_is_known(self) && ahead.len() < MAX_AHEAD_STEPS {
+            let accel = hull.steering(self);
+            hull.advance_to(hull.event.t + AHEAD_STEP * hull.u.t, accel);
+            ahead.push(hull.sample());
+        }
+        ahead
     }
 
     /// The tracks are recorded up to lab time `t`.
@@ -245,9 +314,19 @@ impl Ship {
     /// What other players see of the hull: an open cage of bars along the edges of a cube whose
     /// corners reach the contact radius, so the pilot inside stays visible.
     pub fn hull_mesh() -> Mesh3D {
+        let mut cage = Mesh3D::default();
+        for (bar, _) in Self::hull_bars() {
+            append(&mut cage, &bar, Vec3::default());
+        }
+        cage
+    }
+
+    /// The cage's bars, in place in the hull, each with its center. The cage is not convex, so
+    /// its tube's end is capped bar by bar, each fanned to its own center.
+    pub fn hull_bars() -> Vec<(Mesh3D, Vec3)> {
         let h = SHIP_RADIUS as f32 / 3f32.sqrt();
         let b = 0.018;
-        let mut cage = Mesh3D::default();
+        let mut bars = Vec::new();
         for axis in 0..3 {
             for (i, j) in [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
                 let mut center = [0.0; 3];
@@ -256,10 +335,12 @@ impl Ship {
                 let mut he = [b; 3];
                 he[axis] = h + b;
                 let [cx, cy, cz] = center;
-                append(&mut cage, &Mesh3D::cube(Vec3::new(he[0], he[1], he[2])), Vec3::new(cx, cy, cz));
+                let (mut bar, center) = (Mesh3D::default(), Vec3::new(cx, cy, cz));
+                append(&mut bar, &Mesh3D::cube(Vec3::new(he[0], he[1], he[2])), center);
+                bars.push((bar, center));
             }
         }
-        cage
+        bars
     }
 
     /// What other players see of the pilot: a small clock cube (so they can read this player's
@@ -281,6 +362,15 @@ impl Ship {
 
 /// First of the four hull cage materials in `Scene4D::common_materials`.
 pub const HULL_MATERIALS: usize = 10;
+
+/// Proper-time step of [`Ship::hull_ahead`]'s integration (about a frame).
+const AHEAD_STEP: f32 = 1.0 / 30.0;
+
+/// A bound on [`Ship::hull_ahead`] in a control pod, a little over [`pod_delay`]'s worth of
+/// steps.
+///
+/// [`pod_delay`]: super::helm::pod_delay
+const MAX_AHEAD_STEPS: usize = 40;
 
 /// Half the side of the pilot's clock cube. It fits inside the pod's range of motion.
 const PILOT_HALF_EXTENT: f32 = 0.07;
@@ -381,6 +471,22 @@ mod tests {
         let p = ship.pilot_on_slice(hull.event(), hull.u());
         let expected = 15.0 + 0.05 / 0.75;
         assert!((p.t - expected).abs() < 1e-4, "{} vs {expected}", p.t);
+    }
+
+    /// A cap fanned to a pivot fills the mesh only if the pivot is behind every face. That
+    /// fails for the cage and its center (the fan would fill the open space between them), and
+    /// holds for each bar and its own center.
+    #[test]
+    fn the_cage_is_capped_bar_by_bar() {
+        let behind_all = |mesh: &Mesh3D, pivot: Vec3| {
+            mesh.triangles.iter().all(|tri| (pivot - mesh.vertices[tri.indices[0]]).dot(tri.normal) < 0.0)
+        };
+        assert!(!behind_all(&Ship::hull_mesh(), Vec3::default()));
+        let bars = Ship::hull_bars();
+        assert_eq!(bars.len(), 12);
+        for (bar, center) in &bars {
+            assert!(behind_all(bar, *center), "bar at {center:?}");
+        }
     }
 
     #[test]

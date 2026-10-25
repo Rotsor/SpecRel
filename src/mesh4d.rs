@@ -830,12 +830,26 @@ pub fn build_worldtube_simplices_with_decided(
 /// Seal a Born-rigid worldtube with the body's rest-frame cross-section at `sample` (e.g. where
 /// a Dynamic Mode history currently ends at the causal frontier): one tetrahedron per surface
 /// triangle, fanned to the body center. The cap is a spacelike 3-volume, so rays crossing the
-/// end of the tube see the body's interior there.
+/// end of the tube see the body's interior there. The fan only fills the body if every surface
+/// point can see the center: for other shapes, cap each convex part with
+/// [`build_worldtube_cap_about`].
 pub fn build_worldtube_cap(
     mesh: &Mesh3D,
     sample: &WorldlineSample,
     decided_at: f32,
     material_id: usize,
+) -> Vec<Simplex4D> {
+    build_worldtube_cap_about(mesh, sample, decided_at, material_id, Vec3::default())
+}
+
+/// [`build_worldtube_cap`], fanned to `pivot` (in the body's rest frame) instead of the center:
+/// a point that sees all of `mesh`, such as the center of a convex part.
+pub fn build_worldtube_cap_about(
+    mesh: &Mesh3D,
+    sample: &WorldlineSample,
+    decided_at: f32,
+    material_id: usize,
+    pivot: Vec3,
 ) -> Vec<Simplex4D> {
     let to_world = |p: Vec3| sample.center + sample.tetrad.local_spatial_to_world(p);
     let tau_at = |p: Vec3| sample.proper_time + p.dot(sample.phi);
@@ -852,10 +866,10 @@ pub fn build_worldtube_cap(
             let [uva, uvb, uvc] = tri.uv;
             let uv_mid = ((uva.0 + uvb.0 + uvc.0) / 3.0, (uva.1 + uvb.1 + uvc.1) / 3.0);
             Simplex4D::new(
-                [to_world(pa), to_world(pb), to_world(pc), sample.center],
+                [to_world(pa), to_world(pb), to_world(pc), to_world(pivot)],
                 [uva, uvb, uvc, uv_mid],
                 tri_bary,
-                [tau_at(pa), tau_at(pb), tau_at(pc), sample.proper_time],
+                [tau_at(pa), tau_at(pb), tau_at(pc), tau_at(pivot)],
                 [(0.0, 0.0); 4],
                 (1.0, 1.0),
                 sample.tetrad.local_spatial_to_world(tri.normal),

@@ -21,7 +21,7 @@ pub mod ship;
 
 use crate::bvh4d::Bvh4D;
 use crate::mesh4d::{
-    build_worldtube_cap, build_worldtube_simplices, build_worldtube_simplices_with_decided,
+    build_worldtube_cap, build_worldtube_cap_about, build_worldtube_simplices, build_worldtube_simplices_with_decided,
     sample_inertial_worldline, Mesh3D, DECIDED_AT_STATIC,
 };
 use crate::minkowski::{Vec3, Vec4};
@@ -29,7 +29,7 @@ use crate::renderer::{analytic_decision_age, Frontier};
 use crate::scene::{DemoScene, Scene4D};
 use body::{distance, is_decided, Body, BodyState, Impulse, STEP_DT};
 use collide::{P4, V3};
-use helm::ControlMode;
+use helm::{Command, ControlMode};
 use laser::{Progress, Pulse, Target};
 pub use ship::{PlayerId, Ship, ShipSample};
 
@@ -137,6 +137,12 @@ impl DynWorld {
     /// until [`DynWorld::extend`].
     pub fn record(&mut self, player: PlayerId, pilot: ShipSample) {
         self.ships[player as usize].record(pilot);
+    }
+
+    /// `player`'s pilot had issued `orders` by their latest recorded event (they only shape
+    /// how the hull is drawn ahead of its track: [`Ship::hull_ahead`]).
+    pub fn hear_orders(&mut self, player: PlayerId, orders: &[Command]) {
+        self.ships[player as usize].hear_orders(orders);
     }
 
     /// `player` flies with `controls` (only before their ship has moved).
@@ -412,19 +418,28 @@ impl DynWorld {
             simplices.extend(pulse.simplices(self.t_origin));
         }
 
-        // The other players' ships, up to their last known events: an open hull cage, and the
-        // pilot's clock inside it, where the decisions are made.
-        let (hull_mesh, pilot_mesh) = (Ship::hull_mesh(), Ship::pilot_mesh());
+        // The other players' ships: an open hull cage, and the pilot's clock inside it, where
+        // the decisions are made. The pilot ends at its last known event; the hull runs on as
+        // far as its motion is settled, so that all of it is in view from outside the pilot's
+        // future cone. With delayed controls the pilot rides at the hull's center, as settled.
+        let (hull_mesh, hull_bars, pilot_mesh) = (Ship::hull_mesh(), Ship::hull_bars(), Ship::pilot_mesh());
         for ship in self.ships.iter().filter(|s| s.player != self.viewer) {
-            for (track, mesh, m) in [
-                (&ship.hull, &hull_mesh, ship.hull_material()),
-                (&ship.track, &pilot_mesh, ship.material()),
-            ] {
-                let samples: Vec<_> =
-                    ship::render_indices(track, MAX_SEGMENT_DT).iter().map(|&i| track[i].sample()).collect();
-                simplices.extend(build_worldtube_simplices(mesh, &samples, m));
-                simplices.extend(build_worldtube_cap(mesh, samples.last().unwrap(), DECIDED_AT_STATIC, m));
+            let ahead = ship.hull_ahead();
+            let hull: Vec<_> = ship.hull.iter().chain(&ahead).copied().collect();
+            let pilot = match ship.controls {
+                ControlMode::Delayed => &hull,
+                ControlMode::Pod => &ship.track,
+            };
+            let m = ship.hull_material();
+            let samples = render_ship_samples(&hull);
+            simplices.extend(build_worldtube_simplices(&hull_mesh, &samples, m));
+            let end = samples.last().unwrap();
+            for (bar, center) in &hull_bars {
+                simplices.extend(build_worldtube_cap_about(bar, end, DECIDED_AT_STATIC, m, *center));
             }
+            let (samples, m) = (render_ship_samples(pilot), ship.material());
+            simplices.extend(build_worldtube_simplices(&pilot_mesh, &samples, m));
+            simplices.extend(build_worldtube_cap(&pilot_mesh, samples.last().unwrap(), DECIDED_AT_STATIC, m));
         }
 
         Scene4D {
@@ -436,6 +451,11 @@ impl DynWorld {
             t_max: o.t + window,
         }
     }
+}
+
+/// The worldtube samples to draw a ship's `track` with.
+fn render_ship_samples(track: &[ShipSample]) -> Vec<crate::mesh4d::WorldlineSample> {
+    ship::render_indices(track, MAX_SEGMENT_DT).iter().map(|&i| track[i].sample()).collect()
 }
 
 fn sub3(a: V3, b: V3) -> V3 {

@@ -8,7 +8,7 @@ use super::protocol::Message;
 use super::session::{Event, Session};
 use crate::dynamic::billiards;
 use crate::dynamic::collide::V3;
-use crate::dynamic::helm::ControlMode;
+use crate::dynamic::helm::{CommandQueue, ControlMode};
 use crate::dynamic::{DynWorld, PlayerId, ShipSample};
 use crate::minkowski::Vec4;
 use crate::renderer::FrameDynamics;
@@ -45,6 +45,8 @@ pub struct Match {
     problem: Option<String>,
     /// The local ship's latest event, as last sent.
     local_latest: Option<ShipSample>,
+    /// The due time of the latest delayed-control command sent.
+    sent_due: f32,
     /// Wall-clock seconds since the match started, as the frontend measures them.
     clock: f64,
     next_ping: f64,
@@ -65,6 +67,7 @@ impl Match {
             remote_waiting: false,
             problem: None,
             local_latest: None,
+            sent_due: f32::NEG_INFINITY,
             clock: 0.0,
             next_ping: 0.0,
             rtt: None,
@@ -100,8 +103,9 @@ impl Match {
                     self.problem = Some(format!("BOTH PLAYERS CLAIM PLAYER {}", player + 1));
                 }
                 Event::Joined(_) => {}
-                Event::Track { sample, waiting } => {
+                Event::Track { sample, waiting, orders } => {
                     world.record(self.remote, sample);
+                    world.hear_orders(self.remote, &orders);
                     self.remote_latest = sample;
                     self.remote_waiting = waiting;
                     changed = true;
@@ -158,11 +162,17 @@ impl Match {
         self.awaiting_peer() || self.pacer.is_waiting()
     }
 
-    /// Send the local pilot's latest event. Sent every frame, also while waiting (a heartbeat
-    /// that lets a stalled pair resolve as soon as both know where the other is).
-    pub fn send_track(&mut self, sample: ShipSample) {
+    /// Send the local pilot's latest event, with the delayed-control commands in `pending`
+    /// issued since the last one. Sent every frame, also while waiting (a heartbeat that lets
+    /// a stalled pair resolve as soon as both know where the other is).
+    pub fn send_track(&mut self, sample: ShipSample, pending: &CommandQueue) {
         let waiting = self.is_waiting();
-        self.session.send(&Message::Track { sample, waiting });
+        if self.local_latest.is_some_and(|l| sample.tau < l.tau) {
+            self.sent_due = f32::NEG_INFINITY; // the ship restarted
+        }
+        let orders: Vec<_> = pending.commands().filter(|c| c.due > self.sent_due).copied().collect();
+        self.sent_due = orders.last().map_or(self.sent_due, |c| c.due);
+        self.session.send(&Message::Track { sample, waiting, orders });
         self.local_latest = Some(sample);
     }
 

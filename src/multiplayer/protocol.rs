@@ -3,12 +3,12 @@
 
 use std::fmt;
 
-use crate::dynamic::helm::ControlMode;
+use crate::dynamic::helm::{Command, ControlMode, Order};
 use crate::dynamic::{PlayerId, ShipSample};
 use crate::minkowski::Vec4;
 
 /// Bumped whenever the encoding or the meaning of a message changes.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 
 const TAG_HELLO: u8 = 0;
 const TAG_TRACK: u8 = 1;
@@ -25,8 +25,9 @@ pub enum Message {
     /// First message of a session.
     Hello { version: u16, player: PlayerId },
     /// The sender's pilot reached `sample`; also a heartbeat while `waiting`. Their hull follows
-    /// from their pilot's track: each replica computes it.
-    Track { sample: ShipSample, waiting: bool },
+    /// from their pilot's track: each replica computes it. `orders` are the delayed-control
+    /// commands issued since the last `Track` (they fix where the hull goes next).
+    Track { sample: ShipSample, waiting: bool, orders: Vec<Command> },
     /// The sender's pilot, at `from`, fired a laser pulse along the lab direction `dir`.
     Laser { from: ShipSample, dir: [f64; 3] },
     /// The sender emitted a light flash at `at`.
@@ -47,6 +48,7 @@ pub enum DecodeError {
     Truncated,
     UnknownTag(u8),
     BadControls(u8),
+    BadOrder(u8),
     TrailingBytes,
 }
 
@@ -56,6 +58,7 @@ impl fmt::Display for DecodeError {
             Self::Truncated => write!(f, "truncated message"),
             Self::UnknownTag(t) => write!(f, "unknown message tag {t}"),
             Self::BadControls(c) => write!(f, "unknown controls {c}"),
+            Self::BadOrder(o) => write!(f, "unknown order {o}"),
             Self::TrailingBytes => write!(f, "trailing bytes after message"),
         }
     }
@@ -70,10 +73,14 @@ impl Message {
                 out.extend_from_slice(&version.to_le_bytes());
                 out.push(*player);
             }
-            Self::Track { sample, waiting } => {
+            Self::Track { sample, waiting, orders } => {
                 out.push(TAG_TRACK);
                 put_ship_sample(out, sample);
                 out.push(*waiting as u8);
+                out.extend_from_slice(&(orders.len() as u16).to_le_bytes());
+                for c in orders {
+                    put_command(out, c);
+                }
             }
             Self::Laser { from, dir } => {
                 out.push(TAG_LASER);
@@ -110,7 +117,9 @@ impl Message {
             TAG_HELLO => Self::Hello { version: r.u16()?, player: r.u8()? },
             TAG_TRACK => {
                 let sample = r.ship_sample()?;
-                Self::Track { sample, waiting: r.u8()? != 0 }
+                let waiting = r.u8()? != 0;
+                let orders = (0..r.u16()?).map(|_| r.command()).collect::<Result<_, _>>()?;
+                Self::Track { sample, waiting, orders }
             }
             TAG_LASER => Self::Laser { from: r.ship_sample()?, dir: r.v3()? },
             TAG_FLASH => Self::Flash { at: r.vec4()? },
@@ -145,6 +154,17 @@ fn put_ship_sample(out: &mut Vec<u8>, sample: &ShipSample) {
     put_f64s(out, &sample.pos);
     put_f64s(out, &sample.vel);
     put_f64s(out, &[sample.tau]);
+}
+
+fn put_command(out: &mut Vec<u8>, c: &Command) {
+    let (tag, v) = match c.order {
+        Order::Thrust(dir) => (0, dir),
+        Order::Steer(target) => (1, target),
+    };
+    out.push(tag);
+    put_vec4(out, v);
+    out.extend_from_slice(&c.rapidity.to_le_bytes());
+    out.extend_from_slice(&c.due.to_le_bytes());
 }
 
 fn put_vec4(out: &mut Vec<u8>, v: Vec4) {
@@ -190,6 +210,15 @@ impl Reader<'_> {
         Ok(Vec4::new(self.f32()?, self.f32()?, self.f32()?, self.f32()?))
     }
 
+    fn command(&mut self) -> Result<Command, DecodeError> {
+        let order = match self.u8()? {
+            0 => Order::Thrust(self.vec4()?),
+            1 => Order::Steer(self.vec4()?),
+            o => return Err(DecodeError::BadOrder(o)),
+        };
+        Ok(Command { order, rapidity: self.f32()?, due: self.f32()? })
+    }
+
     fn ship_sample(&mut self) -> Result<ShipSample, DecodeError> {
         Ok(ShipSample { t: self.f64()?, pos: self.v3()?, vel: self.v3()?, tau: self.f64()? })
     }
@@ -209,8 +238,15 @@ mod tests {
         vec![
             Message::Hello { version: PROTOCOL_VERSION, player: 0 },
             Message::Hello { version: u16::MAX, player: 255 },
-            Message::Track { sample, waiting: false },
-            Message::Track { sample, waiting: true },
+            Message::Track { sample, waiting: false, orders: Vec::new() },
+            Message::Track {
+                sample,
+                waiting: true,
+                orders: vec![
+                    Command { due: 1.5, rapidity: 0.01, order: Order::Thrust(Vec4::new(0.0, -0.0, 1.0, 0.0)) },
+                    Command { due: -0.0, rapidity: f32::MIN_POSITIVE, order: Order::Steer(Vec4::new(1.0, 0.0, 0.0, 0.0)) },
+                ],
+            },
             Message::Laser { from: sample, dir: [0.1, -0.2, f64::EPSILON] },
             Message::Laser { from: sample, dir: [-0.0; 3] },
             Message::Flash { at: Vec4::new(1.0e9, -0.0, f32::MIN_POSITIVE, -2.5) },
@@ -267,6 +303,9 @@ mod tests {
         bytes.push(0);
         assert_eq!(Message::decode(&bytes), Err(DecodeError::TrailingBytes));
         assert_eq!(Message::decode(&[TAG_CONTROLS, 2]), Err(DecodeError::BadControls(2)));
+        let mut bytes = encoded(&samples()[3]);
+        bytes[1 + 8 * 8 + 1 + 2] = 7; // the first order's tag
+        assert_eq!(Message::decode(&bytes), Err(DecodeError::BadOrder(7)));
         assert_eq!(DecodeError::UnknownTag(9).to_string(), "unknown message tag 9");
     }
 }

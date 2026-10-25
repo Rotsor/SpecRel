@@ -104,12 +104,14 @@ impl Order {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Command {
+/// An issued order, on its way across the hull. In a match each is also sent to the other
+/// replica, which needs them to know where the hull goes next ([`super::Ship::hull_ahead`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Command {
     /// Ship proper time at which the whole hull knows of it.
-    due: f32,
-    rapidity: f32,
-    order: Order,
+    pub due: f32,
+    pub rapidity: f32,
+    pub order: Order,
 }
 
 /// Option A: commands broadcast from the center at light speed, waiting until they have
@@ -136,6 +138,11 @@ impl CommandQueue {
     /// Commands issued but not executed yet: the engines are spooling up.
     pub fn pending(&self) -> usize {
         self.queue.len()
+    }
+
+    /// The commands issued but not executed yet, the earliest due first.
+    pub fn commands(&self) -> impl Iterator<Item = &Command> {
+        self.queue.iter()
     }
 
     pub fn clear(&mut self) {
@@ -181,6 +188,18 @@ impl Hull {
         } else {
             a
         }
+    }
+
+    /// Whether `ship`'s recorded tracks already hold everything [`Hull::steering`] reads: the
+    /// hull's state [`pod_delay`] ago, and the pilot's crossing of that state's simultaneity
+    /// slice. Then the hull's next move is settled, even past the pilot's latest event.
+    pub fn steering_is_known(&self, ship: &Ship) -> bool {
+        let tau = (self.tau - pod_delay()) as f64;
+        if tau > ship.latest_hull().tau {
+            return false;
+        }
+        let then = ship.hull_at_tau(tau);
+        (ship.latest().event() - then.event()).minkowski_dot(then.u()) <= 0.0
     }
 
     /// Where the pilot is now (at the hull's lab time), as far as the hull can know: as it last

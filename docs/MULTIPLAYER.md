@@ -86,6 +86,19 @@ get the same bits. The other player's ship is drawn as an open cage along the hu
 the pilot's clock cube inside it on the pilot's track, so you can see where its decisions are
 made.
 
+**The hull is drawn past the pilot's latest event.** Pacing keeps you outside `I⁺(O_remote)` of
+the remote *pilot*, but the hull reaches `SHIP_RADIUS` and more from it, and your past cone meets
+its near side up to that much later than its centre. A hull track that stopped at the pilot's lab
+time would leave the near bars missing whenever you are within that distance of the remote's
+cone, which the pacer allows, and the cut would move with every `Track`. But the hull's next
+moves are already settled: with delayed controls by the orders on their way across it (each
+`Track` carries those issued since the last one), and in a control pod by pilot events it has
+already recorded (it steers by news `pod_delay()` old). `Ship::hull_ahead` flies the hull on
+through that stretch, about a second of ship time, which covers every hull event outside
+`I⁺(O_remote)`. It is for drawing only: contacts and laser hits still wait for recorded samples.
+The tube's end is capped bar by bar, since a cap fanned from the hull's centre would fill the
+open cage.
+
 **God's eye shows what is still open.** In single player the God's-eye slice (`dt' = 0` in the
 camera frame) lies wholly outside the camera's future cone, so all of it is decided. In a match
 the slice can reach into `I⁺(O_remote)` when the other player lags behind in the camera's frame.
@@ -166,7 +179,7 @@ Every frame is `seq: u32 LE` followed by one encoded `Message`:
 | Message | Payload |
 |---|---|
 | `Hello` | protocol version, sender's `PlayerId` |
-| `Track` | the pilot's `ShipSample` (t, pos, vel, τ as `f64`) and the sender's waiting flag; sent every frame, including while waiting, as a heartbeat |
+| `Track` | the pilot's `ShipSample` (t, pos, vel, τ as `f64`), the sender's waiting flag, and the delayed-control orders issued since the last `Track` (count `u16`; each: kind, thrust direction or steering target `f32` ×4, rapidity, due τ); sent every frame, including while waiting, as a heartbeat |
 | `Controls` | the sender's `ControlMode` (delayed or pod), sent before their ship first moves |
 | `Laser` | the pilot's `ShipSample` at firing (its velocity fixes the frame the pulse is shaped in), lab direction (`f64` ×3) |
 | `Flash` | emission event (`f32` ×4) |

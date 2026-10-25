@@ -8,7 +8,7 @@
 
 use super::link::{Link, LinkState};
 use super::protocol::{Message, PROTOCOL_VERSION};
-use crate::dynamic::helm::ControlMode;
+use crate::dynamic::helm::{Command, ControlMode};
 use crate::dynamic::{PlayerId, ShipSample};
 use crate::minkowski::Vec4;
 
@@ -17,7 +17,7 @@ use crate::minkowski::Vec4;
 pub enum Event {
     /// The peer said hello with a compatible protocol.
     Joined(PlayerId),
-    Track { sample: ShipSample, waiting: bool },
+    Track { sample: ShipSample, waiting: bool, orders: Vec<Command> },
     /// The peer flies with `controls`.
     Controls(ControlMode),
     Laser { from: ShipSample, dir: [f64; 3] },
@@ -155,7 +155,7 @@ impl Session {
                 events.push(Event::Joined(player));
             }
             _ if !self.joined => events.push(Event::Error(format!("{msg:?} before Hello"))),
-            Message::Track { sample, waiting } => events.push(Event::Track { sample, waiting }),
+            Message::Track { sample, waiting, orders } => events.push(Event::Track { sample, waiting, orders }),
             Message::Controls { controls } => events.push(Event::Controls(controls)),
             Message::Laser { from, dir } => events.push(Event::Laser { from, dir }),
             Message::Flash { at } => events.push(Event::Flash(at)),
@@ -186,7 +186,7 @@ mod tests {
 
     fn track(i: u32) -> Message {
         let sample = ShipSample { t: i as f64, pos: [0.0; 3], vel: [0.0; 3], tau: i as f64 };
-        Message::Track { sample, waiting: false }
+        Message::Track { sample, waiting: false, orders: Vec::new() }
     }
 
     /// The `t` of every `Track`, `-1` for `Joined`; panics on anything else.
