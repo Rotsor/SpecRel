@@ -36,11 +36,17 @@ that player.
 (`normalize(u₁ + u₂)`; the ships have equal mass). In the CM frame let `Δt` and `Δx` be the time
 and distance from `O_remote` to `O_local`.
 
-* **Stop** before a step would satisfy `Δt > 0 ∧ Δt > |Δx| − CONE_MARGIN`. That means I am ahead
-  in CM time and within `CONE_MARGIN` (1.5 s) of the remote's future cone. The margin covers the
-  pucks near the other ship, which are finalized a little behind it. The check runs on the
-  *tentative* next event, so `O_local` never enters `I⁺(O_remote)`.
-* **Resume** only once the other player has caught up in the CM frame: `Δt ≤ 0`.
+* **Stop** before a step would satisfy `Δt > 0 ∧ Δt > |Δx|`, that is, before the interval to
+  `O_remote` would become timelike. The check runs on the *tentative* next event, so `O_local`
+  never enters `I⁺(O_remote)`. There is no margin. (An earlier version stopped 1.5 s short of the
+  cone, to cover pucks near the other ship that waited for its track before colliding with it.
+  Ships no longer touch bodies in a match, see below.)
+* **Resume** once the other player has made up half of the CM-time lead `Δt` I had when I
+  stopped (`RESUME_FRACTION`); if my next step would still be timelike then, stop again with the
+  new, smaller lead. This hysteresis keeps a ship pressed against the other's cone from flickering
+  between moving and waiting every frame. (Earlier, the ship waited for `Δt ≤ 0`.)
+* Bodies near the other ship are still finalized up to a shot's reach behind its cone (see §2),
+  so right at the cone's edge a puck close to it may be drawn a moment late.
 * While waiting, the player can look around and change views. Thrust and firing are frozen, and
   the HUD shows **WAITING FOR THE OTHER PLAYER**.
 
@@ -52,8 +58,12 @@ is 80% of the bound. The cap is measured per second of the ship's own clock (`d_
 ship cannot boost at all) and in every direction (diagonal thrust is normalized). `X` (brake to
 the lab frame) and `V` (match velocity) do not jump: they boost toward the target for as long as
 the key is held. Releasing the key mid-brake leaves the ship coasting at whatever velocity it
-reached. Collision kicks stay instantaneous. They already reach the camera only once their news
-has crossed the hull. (These rules hold for single-player Dynamic Mode too.)
+reached. (These rules hold for single-player Dynamic Mode too.)
+
+**Ships don't touch bodies in a match.** In single player a puck that hits the ship bounces off
+the hull and kicks the ship. In a match, getting that right for the other player's hull, causally
+and identically on both replicas, is hard, so ships and bodies pass through each other
+(`DynWorld::ship_contacts`). Shots still collide with everything else.
 
 **The hull hears the controls at light speed.** A rigid hull may only act on a command once news
 of it has reached all of it (`docs/SHIP_CONTROLS_CAUSALITY.md`, `src/dynamic/helm.rs`). The
@@ -69,13 +79,12 @@ other replica):
   `pod_delay()` (0.97 s) ago, flown on to now, so it never acts on news that hasn't crossed it.
 
 Each ship therefore has two tracks: the pilot's (the camera: frontier, shots, flashes; the only
-one sent in `Track` messages) and the hull centre's (what bodies collide with). Every replica
-computes the hull's track from the pilot's as it records it (`Ship::record`), in plain `f32`
-arithmetic with `sqrt` as the only function, so both replicas get the same bits. A control pod's
-hull isn't pushed by collisions; with delayed controls the owner's camera takes the kicks, as
-before. The other player's ship is
-drawn as an open cage along the hull track, with the pilot's clock cube inside it on the pilot's
-track, so you can see where its decisions are made.
+one sent in `Track` messages) and the hull centre's (what bodies collide with in single player,
+and what is drawn). Every replica computes the hull's track from the pilot's as it records it
+(`Ship::record`), in plain `f32` arithmetic with `sqrt` as the only function, so both replicas
+get the same bits. The other player's ship is drawn as an open cage along the hull track, with
+the pilot's clock cube inside it on the pilot's track, so you can see where its decisions are
+made.
 
 **God's eye shows what is still open.** In single player the God's-eye slice (`dt' = 0` in the
 camera frame) lies wholly outside the camera's future cone, so all of it is decided. In a match
@@ -116,8 +125,9 @@ finalized data (single-player Phase 4). On top of that, multiplayer requires the
   `f32` firing event and `f64` velocity.
 * **Inputs are applied in order.** A shot fired at `O_f` is sent before the track sample that
   moves past `O_f`. The receiver therefore inserts the projectile before its frontier for that
-  ship passes `O_f`, just as the firing peer did. Bodies that could touch the projectile wait for
-  that ship's track: the existing ship-proximity rule, extended to every ship.
+  ship passes `O_f`, just as the firing peer did. A body at step `k` waits for a live ship's track
+  to reach that step's lab time while a shot fired after the ship's latest known event could be
+  in reach (within `shot_radius()` plus light travel of it), so no body misses a shot.
 * **Identities are per player.** Projectile uids are seeded with `(player, shot index)`.
 * **Firing capacity is checked by the shooter only.** A received shot is always inserted
   (`DynWorld::launch`), because live-body counts can differ between peers at any given moment.
@@ -267,8 +277,9 @@ native and web players cannot play each other.
 
 ## 4. Not done yet
 
-* Ship–ship collisions. Ships pass through each other: a collision needs both tracks at the same
-  lab time, which forces lockstep at contact range.
+* Collisions of ships with bodies or with each other in a match. Ships pass through both: a
+  collision needs a ship's track at the same lab time as what it hits, which forces lockstep at
+  contact range.
 * More than two players (the world supports N ships; session and pacing are 2-player).
 * A relay for native peer-to-peer players behind symmetric NATs (web matches have one), and
   native↔web play (native WebRTC).

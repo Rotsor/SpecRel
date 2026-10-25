@@ -152,7 +152,8 @@ impl Match {
         !self.session.peer_joined() && !self.session.peer_left()
     }
 
-    /// The local player is held back: until the other one joins, then until they catch up.
+    /// The local player is held back: until the other one joins, then from when a step would
+    /// enter their future cone until they have made up half our lead.
     pub fn is_waiting(&self) -> bool {
         self.awaiting_peer() || self.pacer.is_waiting()
     }

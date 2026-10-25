@@ -66,10 +66,12 @@ and then brake. A player who pauses to look around and presses `X` sees exactly 
 
 ## 2. The pacing rule is holding the ship back
 
-When the tentative next event would come within `CONE_MARGIN` of the other player's future cone,
+When the tentative next event would be inside the other player's future cone,
 `Match::may_advance` returns `false`, and `App::step` restores the camera to `looked`. That undoes
 this frame's thrust and steering as well as the motion. The `Pacer` then stays stopped until the
-other player has caught up in the two ships' centre-of-momentum (CM) frame. The steering target
+other player has made up half the lead we had over them when we stopped, in the two ships'
+centre-of-momentum (CM) frame. (An earlier version stopped 1.5 s short of the cone and waited
+for the other player to catch up completely.) The steering target
 survives, so braking resumes once the ship is released. But nothing changes until then.
 
 This can last indefinitely when the other player isn't advancing:
@@ -78,11 +80,11 @@ This can last indefinitely when the other player isn't advancing:
   tabs, so testing both players in two tabs of one browser triggers it.
 * **They have a slow time scale** (`-`), which only slows things down.
 
-There's also a way braking can trigger the stop where coasting wouldn't. The CM frame is built
-from both ships' 4-velocities. A brake step changes ours, which changes the frame and the lead
-`dt`. So the braked tentative event can pass `must_wait` when coasting wouldn't have. The ship
-then stops on the frame you press `X`. It's harmless if the other player keeps playing, but
-combined with the bullet list above it looks like "X stopped working".
+An earlier version had a way for braking to trigger the stop where coasting wouldn't: the stop
+test compared against a margin in the two ships' CM frame, which a brake step changes. The stop
+test is now whether the next event is inside the other player's light cone, and that doesn't
+depend on any frame, so a velocity change alone can only start a stop by the (tiny) change in
+where the ship ends up this frame. (When to resume still depends on the CM frame.)
 
 **How to tell:** the banner `WAITING FOR THE OTHER PLAYER`, and `OBS EVENT (T, ...)` and
 `OBS TAU` are frozen. Thrust doesn't work either.
@@ -90,9 +92,6 @@ combined with the bullet list above it looks like "X stopped working".
 **Fix options:** mostly beyond this bug: the banner is already there. Possibly also:
 * Name the reason ("other player paused" / "tab inactive"). The `Track { waiting }` heartbeat
   could carry a `paused` flag.
-* Evaluate `must_wait` on the coasted event rather than the boosted one. Then a velocity change
-  alone can't start a stop. This needs a proof that the cone guarantee still holds, because the
-  boosted event is the one actually reached.
 
 ## 3. Less likely, web only
 

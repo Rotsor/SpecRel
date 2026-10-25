@@ -34,6 +34,9 @@ pub use ship::{PlayerId, Ship, ShipSample};
 /// ray length, nothing older can be seen.
 pub const HISTORY_WINDOW: f64 = 200.0;
 
+/// Slack on the reach of a not-yet-known shot, for the rounding of its `f32` firing event.
+const SHOT_SLACK: f64 = 1e-3;
+
 /// Render segments are split at least this often (in lab time), so that the per-vertex
 /// `decided_at` interpolated along a merged segment stays close to the per-step stamps.
 const MAX_SEGMENT_DT: f64 = 50.0;
@@ -65,6 +68,9 @@ pub struct DynWorld {
     /// Collision impulses delivered to the viewer's ship. The camera is the ship's center, so
     /// `App` applies each once its news has crossed the hull ([`Impulse::has_reached`]).
     pub ship_kicks: Vec<Impulse>,
+    /// Whether bodies collide with ships. Only in single player: in a match, getting contacts
+    /// with the other player's hull right and causal is hard, so ships pass through bodies.
+    ship_contacts: bool,
     /// Lab time of grid step 0.
     t_origin: f64,
 }
@@ -117,6 +123,7 @@ impl DynWorld {
             viewer,
             frontier,
             ship_kicks: Vec::new(),
+            ship_contacts: spawns.len() == 1,
             t_origin,
         };
         world.extend_with(|s| decision_time(s, frontier, u));
@@ -347,6 +354,18 @@ impl DynWorld {
         }
         touching.sort_by_key(|&j| self.bodies[j].uid);
 
+        if !self.ship_contacts {
+            // Ships don't touch bodies, but their shots do. A shot fired after a ship's latest
+            // known event appears inside its future cone, so wait if one could be within reach.
+            let reach = me.radius + billiards::shot_radius() + SHOT_SLACK;
+            for ship in self.ships.iter().filter(|ship| ship.is_live() && !ship.is_known_at(s.t)) {
+                let last = ship.latest();
+                if distance(s.pos, last.pos) < reach + (s.t - last.t) {
+                    return None;
+                }
+            }
+            return Some(Contacts { bodies: touching, ships: Vec::new(), launcher_clear: false });
+        }
         let reach = me.radius + SHIP_RADIUS;
         let (mut ships, mut launcher_clear) = (Vec::new(), false);
         for ship in &self.ships {
@@ -960,6 +979,38 @@ mod tests {
         }
         assert!(puck.latest().vel[2] > 0.0, "the puck bounced back");
         assert!(kick[3] < 0.0, "the ship is pushed away from the puck");
+    }
+
+    /// In a match, ships don't touch bodies: the same puck flies straight through the ship.
+    #[test]
+    fn in_a_match_a_puck_passes_through_the_ship() {
+        let spawns: Vec<_> = (0..2).map(|p| ShipSample::at_rest(billiards::spawn_event(p))).collect();
+        let mut world = DynWorld::new_match(DemoScene::RelativisticBilliards, &spawns, 0);
+        let o = world.frontier.origin;
+        let step = (o.t as f64 / STEP_DT).floor() as i64 - 40;
+        let t = step as f64 * STEP_DT;
+        let z = o.z as f64 + 0.5 + 0.6 * (o.t as f64 - t);
+        let state = BodyState { step, t, pos: [o.x as f64, o.y as f64, z], vel: [0.0, 0.0, -0.6], tau: 0.0 };
+        let mut puck = billiards::body(42, Kind::Puck, PUCK_MASS, state, 7);
+        puck.decided_at = vec![0.0];
+        world.bodies.push(puck);
+        for s in &mut world.ships {
+            let parked = ShipSample { t: t - 1.0, ..*s.latest() };
+            s.track.insert(0, parked);
+            s.hull.insert(0, parked);
+        }
+        // Both ships parked for 10 s.
+        for i in 1..=200 {
+            let dt = i as f32 * 0.05;
+            let other = billiards::spawn_event(1) + Vec4::new(dt, 0.0, 0.0, 0.0);
+            world.record(1, ShipSample::new(Frontier { origin: other, proper_time: dt }, rest()));
+            world.advance(Frontier { origin: o + Vec4::new(dt, 0.0, 0.0, 0.0), proper_time: dt }, rest());
+        }
+
+        assert!(world.ship_kicks.is_empty());
+        let puck = world.bodies.iter().find(|b| b.uid == 42).unwrap();
+        assert_eq!(puck.latest().vel, [0.0, 0.0, -0.6], "the puck flew on undisturbed");
+        assert!(puck.latest().pos[2] < o.z as f64 - 1.0, "through the ship");
     }
 
     /// The causality property: two runs with the same input up to the camera event `O` but

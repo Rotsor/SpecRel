@@ -142,6 +142,11 @@ pub fn pucks() -> Vec<Body> {
     bodies
 }
 
+/// The largest contact radius of a freshly fired projectile (every ammo has [`PUCK_MASS`]).
+pub fn shot_radius() -> f64 {
+    PUCK_RADIUS.max(SPORE_HALF_SIZE as f64 * 3f64.sqrt())
+}
+
 /// Shot number `seq` fired by `player`'s ship.
 pub fn projectile(player: PlayerId, seq: u64, ammo: Ammo, state: BodyState) -> Body {
     let uid = mix(0xF1BE, (player as u64) << 32 | seq);

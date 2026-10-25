@@ -4,9 +4,6 @@
 
 use crate::dynamic::ShipSample;
 
-/// How close (in CM-frame light-seconds) the local ship may get to the remote's future cone.
-pub const CONE_MARGIN: f64 = 1.5;
-
 /// The separation `O_local - O_remote` in the two ships' centre-of-momentum frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Lead {
@@ -63,11 +60,11 @@ fn dot(a: [f64; 4], b: [f64; 4]) -> f64 {
     a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3]
 }
 
-/// Whether `local` is ahead in CM time and within [`CONE_MARGIN`] of the remote's future cone.
-/// True for every event inside `I⁺(remote)`.
+/// Whether `local` is inside the open future light cone `I⁺(remote)`: the interval between
+/// the two events is timelike, with `local` later.
 pub fn must_wait(local: &ShipSample, remote: &ShipSample) -> bool {
     let l = lead(local, remote);
-    l.dt > 0.0 && l.dt > l.dist - CONE_MARGIN
+    l.dt > 0.0 && l.dt > l.dist
 }
 
 /// Whether the remote is level with or ahead of `local` in CM time.
@@ -75,41 +72,45 @@ pub fn caught_up(local: &ShipSample, remote: &ShipSample) -> bool {
     lead(local, remote).dt <= 0.0
 }
 
+/// Once stopped, the local ship waits until its CM-time lead over the remote has shrunk to this
+/// fraction of the lead it had when it stopped.
+pub const RESUME_FRACTION: f64 = 0.5;
+
 /// The stop/resume state machine for the local ship.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Pacer {
-    waiting: bool,
+    /// While stopped: the CM-time lead at or below which the ship may move again.
+    resume_at: Option<f64>,
 }
 
 impl Pacer {
     pub fn is_waiting(&self) -> bool {
-        self.waiting
+        self.resume_at.is_some()
     }
 
     /// Whether the local ship may move from `current` to the tentative `next` event, given the
     /// latest known `remote` event.
     ///
-    /// Checking `next` (not `current`) means the local event never enters `I⁺(remote)` from
-    /// ahead, since [`must_wait`] holds everywhere inside that cone. Once stopped, the ship
-    /// resumes only when the remote has caught up in CM time (hysteresis).
+    /// The ship stops before `next` would be inside `I⁺(remote)`, so it never enters that cone
+    /// from ahead. It then stays stopped (hysteresis) until the remote has made up all but
+    /// [`RESUME_FRACTION`] of the CM-time lead `current` had over it at that moment; if the
+    /// next step would still be timelike then, it stops again with a new, smaller threshold.
     ///
     /// A ship that is not ahead (`caught_up`) always advances. Since `lead` is antisymmetric,
     /// with exact information at least one of the two ships can always move. The price: two
     /// ships within one step of each other in CM time *and* space take turns stepping, so the
     /// trailing one may poke one step into the other's cone until that one catches up.
     pub fn may_advance(&mut self, current: &ShipSample, next: &ShipSample, remote: &ShipSample) -> bool {
-        if caught_up(current, remote) {
-            self.waiting = false;
+        let ahead = lead(current, remote).dt;
+        if ahead <= 0.0 {
+            self.resume_at = None;
             return true;
         }
-        if self.waiting {
+        if self.resume_at.is_some_and(|r| ahead > r) {
             return false;
         }
-        if must_wait(next, remote) {
-            self.waiting = true;
-            return false;
-        }
-        true
+        self.resume_at = must_wait(next, remote).then_some(ahead * RESUME_FRACTION);
+        !self.is_waiting()
     }
 }
 
@@ -185,12 +186,11 @@ mod tests {
     }
 
     #[test]
-    fn margin_in_the_rest_frame() {
+    fn waits_only_inside_the_cone() {
         let (a, b) = (rest(0.0, 0.0), rest(0.0, 10.0));
         assert!(!must_wait(&a, &b) && !must_wait(&b, &a));
-        let edge = 10.0 - CONE_MARGIN;
-        assert!(!must_wait(&rest(edge - 1e-6, 0.0), &b));
-        assert!(must_wait(&rest(edge + 1e-6, 0.0), &b));
+        assert!(!must_wait(&rest(10.0 - 1e-6, 0.0), &b));
+        assert!(must_wait(&rest(10.0 + 1e-6, 0.0), &b));
         assert!(caught_up(&a, &b) && !caught_up(&rest(1e-6, 0.0), &b));
     }
 
@@ -210,19 +210,38 @@ mod tests {
     }
 
     #[test]
-    fn pacer_waits_until_caught_up() {
+    fn pacer_waits_until_half_the_lead_is_made_up() {
         let remote = |t| rest(t, 10.0);
         let mut p = Pacer::default();
-        let (cur, next) = (rest(8.4, 0.0), rest(8.6, 0.0));
+        // 9.9 s ahead of the remote when the next step would enter its cone.
+        let (cur, next) = (rest(9.9, 0.0), rest(10.1, 0.0));
         assert!(!p.may_advance(&cur, &next, &remote(0.0)));
         assert!(p.is_waiting());
-        // Remote advances, local is still ahead (and even outside the margin): keep waiting.
-        assert!(!p.may_advance(&cur, &next, &remote(5.0)));
-        assert!(!p.may_advance(&cur, &next, &remote(8.3)));
+        // The next step is spacelike again, but the lead (9.7 s) isn't halved yet: keep waiting.
+        assert!(!p.may_advance(&cur, &next, &remote(0.2)));
+        assert!(!p.may_advance(&cur, &next, &remote(4.9)));
         assert!(p.is_waiting());
-        // Caught up: resume.
-        assert!(p.may_advance(&cur, &next, &remote(8.4)));
+        // Lead 4.9 s <= 9.9 / 2: resume, though still ahead.
+        assert!(p.may_advance(&cur, &next, &remote(5.0)));
         assert!(!p.is_waiting());
+        // Well clear of the cone: never wait, however far ahead.
+        assert!(p.may_advance(&rest(5.0, 0.0), &rest(5.2, 0.0), &remote(0.0)));
+    }
+
+    #[test]
+    fn pacer_stops_again_if_still_timelike_at_the_threshold() {
+        // Close together in space: half the lead is not enough to step out of the cone.
+        let remote = |t| rest(t, 0.1);
+        let mut p = Pacer::default();
+        let (cur, next) = (rest(1.0, 0.0), rest(1.2, 0.0));
+        assert!(!p.may_advance(&cur, &next, &remote(0.0)));
+        assert!(!p.may_advance(&cur, &next, &remote(0.5)), "lead 0.5: next still timelike");
+        assert!(p.is_waiting());
+        // Each time the lead halves, the next step is still timelike, so the ship stops again.
+        for t in [0.75, 0.875, 0.95] {
+            assert!(!p.may_advance(&cur, &next, &remote(t)), "remote at {t}");
+        }
+        assert!(p.may_advance(&cur, &next, &remote(1.0)), "caught up");
     }
 
     /// A ship that changes velocity at fixed proper times.
@@ -285,10 +304,12 @@ mod tests {
             assert!(!in_future_cone(&home.s, &trav.s) && !in_future_cone(&trav.s, &home.s));
         }
         assert_eq!(home.waited, 0);
-        assert!(trav.waited > 100, "{}", trav.waited);
+        assert!(trav.waited > 0, "the traveller had to wait");
         assert!(close(trav.s.pos[0], 10.0) && trav.s.vel[0] == 0.0, "trip not finished");
-        // Back at rest, the traveller has aged less.
-        assert!(home.s.tau - trav.s.tau > 10.0, "{} {}", home.s.tau, trav.s.tau);
+        // Back at rest, the traveller has aged less (compared at the same lab time: now it
+        // may run ahead of home by up to their 10 s light-travel time).
+        let trav_tau = trav.s.tau + (home.s.t - trav.s.t);
+        assert!(home.s.tau - trav_tau > 10.0, "{} {}", home.s.tau, trav_tau);
     }
 
     #[test]
