@@ -475,17 +475,17 @@ impl App {
     /// the null direction `e_0 + e_forward`, which is where the reticle (the screen's center)
     /// looks.
     fn fire(&mut self) {
-        let frontier = self.camera_frontier();
+        let e = &self.camera.tetrad.e;
+        let from = ShipSample::new(self.camera_frontier(), e[0]);
+        let k = e[0] + e[3];
+        let dir = [k.x / k.t, k.y / k.t, k.z / k.t].map(|c| c as f64);
         let Some(world) = self.world.as_mut() else {
             return;
         };
-        let e = &self.camera.tetrad.e;
-        let k = e[0] + e[3];
-        let dir = [k.x / k.t, k.y / k.t, k.z / k.t].map(|c| c as f64);
-        world.fire_laser(world.viewer, frontier, dir);
+        world.fire_laser(world.viewer, from, dir);
         self.world_grew = true;
         if let Some(m) = self.multiplayer.as_mut() {
-            m.send_laser(frontier, dir);
+            m.send_laser(from, dir);
         }
     }
 

@@ -156,10 +156,10 @@ impl DynWorld {
         self.extend_with(|_| tau)
     }
 
-    /// `player`'s pilot fires a laser pulse at `at` along the lab direction `dir`.
-    pub fn fire_laser(&mut self, player: PlayerId, at: Frontier, dir: V3) {
+    /// `player`'s pilot, at `from`, fires a laser pulse along the lab direction `dir`.
+    pub fn fire_laser(&mut self, player: PlayerId, from: ShipSample, dir: V3) {
         let ship = &mut self.ships[player as usize];
-        let pulse = Pulse::new(player, ship.shots, at, dir, self.t_origin, self.frontier.proper_time);
+        let pulse = Pulse::new(player, ship.shots, from, dir, self.t_origin, self.frontier.proper_time);
         ship.shots += 1;
         self.pulses.push(pulse);
     }
@@ -760,7 +760,8 @@ mod tests {
         let mut world = DynWorld::spawn(DemoScene::RelativisticBilliards);
         let before = world.bodies[0].latest().vel;
         let fired = world.frontier;
-        world.fire_laser(0, fired, aim_at_rack(&world));
+        let from = *world.ships[0].latest();
+        world.fire_laser(0, from, aim_at_rack(&world));
         world.extend();
         let has_rod = |w: &DynWorld| w.build_scene().bvh.simplices.iter().any(|s| s.material_id == laser::MATERIAL_PULSE);
         assert!(has_rod(&world), "the pulse is drawn from the start");
@@ -786,7 +787,7 @@ mod tests {
     #[test]
     fn a_laser_that_nothing_can_catch_is_known_at_once() {
         let mut world = DynWorld::spawn(DemoScene::RelativisticBilliards);
-        world.fire_laser(0, world.frontier, [0.0, 1.0, 0.0]);
+        world.fire_laser(0, *world.ships[0].latest(), [0.0, 1.0, 0.0]);
         world.extend();
         let pulse = &world.pulses[0];
         let end = pulse.end.expect("known to its end");
@@ -837,7 +838,7 @@ mod match_tests {
     #[derive(Clone, Copy)]
     enum Input {
         Sample(ShipSample),
-        Laser(Frontier, V3),
+        Laser(ShipSample, V3),
     }
 
     fn spawns() -> Vec<ShipSample> {
@@ -855,9 +856,10 @@ mod match_tests {
             let u = Vec4::four_velocity_from_beta(vel(i));
             f.origin += u * dtau;
             f.proper_time += dtau;
-            out.push(Input::Sample(ShipSample::new(f, u)));
+            let sample = ShipSample::new(f, u);
+            out.push(Input::Sample(sample));
             if i % fire_every == 0 {
-                out.push(Input::Laser(f, aim));
+                out.push(Input::Laser(sample, aim));
             }
         }
         out
@@ -866,7 +868,7 @@ mod match_tests {
     fn apply(world: &mut DynWorld, player: PlayerId, input: Input) {
         match input {
             Input::Sample(s) => world.record(player, s),
-            Input::Laser(at, dir) => world.fire_laser(player, at, dir),
+            Input::Laser(from, dir) => world.fire_laser(player, from, dir),
         }
     }
 

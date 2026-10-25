@@ -122,7 +122,7 @@ player a collision that the other never sees. Each body's next state is already 
 finalized data (single-player Phase 4). On top of that, multiplayer requires the following:
 
 * **Inputs travel exactly.** Ship samples are sent as `f64` bits. Laser shots are sent with
-  their `f32` firing event and `f64` direction.
+  the pilot's `ShipSample` at firing and their `f64` direction.
 * **Inputs are applied in order.** A shot fired at `O_f` is sent before the track sample that
   moves past `O_f`. The pulse lies on `O_f`'s light cone, so the receiver, which never passes
   `O_f`'s future cone before hearing of it, inserts it in time. Where a pulse goes out depends
@@ -168,7 +168,7 @@ Every frame is `seq: u32 LE` followed by one encoded `Message`:
 | `Hello` | protocol version, sender's `PlayerId` |
 | `Track` | the pilot's `ShipSample` (t, pos, vel, τ as `f64`) and the sender's waiting flag; sent every frame, including while waiting, as a heartbeat |
 | `Controls` | the sender's `ControlMode` (delayed or pod), sent before their ship first moves |
-| `Laser` | firing event (`Frontier`, `f32`), lab direction (`f64` ×3) |
+| `Laser` | the pilot's `ShipSample` at firing (its velocity fixes the frame the pulse is shaped in), lab direction (`f64` ×3) |
 | `Flash` | emission event (`f32` ×4) |
 | `Bye` | sender quits |
 | `Ping` / `Pong` | the sender's wall clock (`f64` seconds); `Pong` echoes a `Ping`'s, timing the round trip |

@@ -13,13 +13,12 @@
 use super::billiards::{self, SHIP_RADIUS};
 use super::body::{Body, STEP_DT};
 use super::collide::{dot3, V3};
-use super::ship::{PlayerId, Ship};
+use super::ship::{PlayerId, Ship, ShipSample};
 use crate::mesh4d::{build_worldtube_cap, build_worldtube_simplices_with_decided, Mesh3D, Simplex4D, WorldlineSample};
 use crate::minkowski::{Tetrad, Vec3, Vec4};
-use crate::renderer::Frontier;
 
-/// Length of the rod of light a pulse is drawn as, trailing its head (in light-seconds, so
-/// it is that long in time as well).
+/// Length of the rod of light a pulse is drawn as, trailing its head, in the shooter's rest
+/// frame at firing (in light-seconds, so it lasts that long there as well).
 pub const PULSE_LENGTH: f32 = 0.5;
 /// Half the thickness of the rod.
 const PULSE_HALF_WIDTH: f32 = 0.02;
@@ -80,6 +79,8 @@ pub struct Pulse {
     pub pos0: V3,
     /// Unit lab direction of flight
     pub dir: V3,
+    /// The shooter's lab velocity when it was fired: the pulse is shaped in that rest frame.
+    pub vel: V3,
     /// The viewer's proper time when this replica heard of it. Its whole path was decided by
     /// then (it lies on the firing event's light cone).
     pub fired_at: f32,
@@ -94,11 +95,10 @@ pub struct Pulse {
 }
 
 impl Pulse {
-    /// Shot `seq` of `shooter`, fired at `at` along the lab direction `dir`; `t_origin` is the
-    /// lab time of grid step 0, and `fired_at` the viewer's proper time now.
-    pub fn new(shooter: PlayerId, seq: u64, at: Frontier, dir: V3, t_origin: f64, fired_at: f32) -> Self {
-        let o = at.origin;
-        let (t0, pos0) = (o.t as f64, [o.x as f64, o.y as f64, o.z as f64]);
+    /// Shot `seq` of `shooter`, fired from `from` along the lab direction `dir`; `t_origin` is
+    /// the lab time of grid step 0, and `fired_at` the viewer's proper time now.
+    pub fn new(shooter: PlayerId, seq: u64, from: ShipSample, dir: V3, t_origin: f64, fired_at: f32) -> Self {
+        let (t0, pos0) = (from.t, from.pos);
         let l = dot3(dir, dir).sqrt();
         let dir = dir.map(|c| c / l);
         Self {
@@ -107,6 +107,7 @@ impl Pulse {
             t0,
             pos0,
             dir,
+            vel: from.vel,
             fired_at,
             cleared: ((t0 - t_origin) / STEP_DT).floor() as i64,
             stop: static_stop(t0, pos0, dir),
@@ -231,19 +232,25 @@ impl Pulse {
     }
 
     /// The pulse as drawn: an orange-red rod trailing its head, from where it was fired to as
-    /// far as it is known. Light has no rest frame, so the rod is shaped (and shaded) in the
-    /// lab frame.
+    /// far as it is known. Light has no rest frame, but a pulse does: the one its shooter fired
+    /// it in. There it is a rod of [`PULSE_LENGTH`] along the firing direction; shaped in any
+    /// other frame (the lab's), it would look skewed to everyone else, as if dragged by an
+    /// aether.
     pub fn simplices(&self, t_origin: f64) -> Vec<Simplex4D> {
-        let mesh = rod_mesh(self.dir);
-        let back = Vec3::new(self.dir[0] as f32, self.dir[1] as f32, self.dir[2] as f32) * (-0.5 * PULSE_LENGTH);
+        let [vx, vy, vz] = self.vel.map(|c| c as f32);
+        let tetrad = Tetrad::from_beta(Vec3::new(vx, vy, vz));
+        let [x, y, z] = self.dir.map(|c| c as f32);
+        let forward = tetrad.world_to_local_spatial(Vec4::new(1.0, x, y, z)).normalized();
+        let mesh = rod_mesh(forward);
+        let back = tetrad.local_spatial_to_world(forward * (-0.5 * PULSE_LENGTH));
         let sample = |t: f64| {
             let [x, y, z] = self.pos_at(t);
             WorldlineSample {
-                center: Vec4::new(t as f32, x as f32 + back.x, y as f32 + back.y, z as f32 + back.z),
+                center: Vec4::new(t as f32, x as f32, y as f32, z as f32) + back,
                 proper_time: 0.0,
                 phi: Vec3::default(),
                 proper_accel_local: Vec3::default(),
-                tetrad: Tetrad::rest(),
+                tetrad,
             }
         };
         let ends = [sample(self.t0), sample(self.known_to(t_origin))];
@@ -308,9 +315,8 @@ fn ray_box(o: V3, dir: V3, center: V3, he: V3) -> Option<f64> {
     (near <= far).then_some(near)
 }
 
-/// A thin box along `dir`, centered on the origin.
-fn rod_mesh(dir: V3) -> Mesh3D {
-    let d = Vec3::new(dir[0] as f32, dir[1] as f32, dir[2] as f32).normalized();
+/// A thin box along the unit `d`, centered on the origin.
+fn rod_mesh(d: Vec3) -> Mesh3D {
     let up = if d.y.abs() < 0.9 { Vec3::new(0.0, 1.0, 0.0) } else { Vec3::new(1.0, 0.0, 0.0) };
     let a = up.cross(d).normalized();
     let b = d.cross(a);
@@ -336,8 +342,8 @@ mod tests {
     use super::*;
 
     fn pulse(pos0: V3, dir: V3) -> Pulse {
-        let at = Frontier { origin: Vec4::new(0.0, pos0[0] as f32, pos0[1] as f32, pos0[2] as f32), proper_time: 0.0 };
-        Pulse::new(0, 0, at, dir, 0.0, 0.0)
+        let from = ShipSample { t: 0.0, pos: pos0, vel: [0.0; 3], tau: 0.0 };
+        Pulse::new(0, 0, from, dir, 0.0, 0.0)
     }
 
     #[test]
@@ -370,14 +376,38 @@ mod tests {
 
     #[test]
     fn the_rod_points_along_the_pulse() {
-        let dir = [0.6, 0.0, 0.8];
-        let rod = rod_mesh(dir);
+        let rod = rod_mesh(Vec3::new(0.6, 0.0, 0.8));
         let along = |v: &Vec3| v.x * 0.6 + v.z * 0.8;
         let len = rod.vertices.iter().map(along).fold(f32::MIN, f32::max) * 2.0;
         assert!((len - PULSE_LENGTH).abs() < 1e-5);
         for v in &rod.vertices {
             let across = (*v - Vec3::new(0.6, 0.0, 0.8) * along(v)).length();
             assert!(across < 2.0 * PULSE_HALF_WIDTH);
+        }
+    }
+
+    /// Fired by a moving shooter, the rod is the one the shooter fired: in their rest frame,
+    /// every point of it trails the head along the firing direction, by at most
+    /// [`PULSE_LENGTH`]. (Shaped in the lab, it would lean against the shooter's motion.)
+    #[test]
+    fn the_rod_is_shaped_in_the_shooters_frame() {
+        let beta = Vec3::new(0.6, 0.0, 0.3);
+        let tetrad = Tetrad::from_beta(beta);
+        // Fired sideways (+x) in the shooter's frame: forward in the lab, by aberration.
+        let k = tetrad.future_light_ray_direction(Vec3::new(1.0, 0.0, 0.0));
+        let dir = [k.x / k.t, k.y / k.t, k.z / k.t].map(|c| c as f64);
+        let from = ShipSample { t: 0.0, pos: [0.0; 3], vel: [0.6, 0.0, 0.3], tau: 0.0 };
+        let mut p = Pulse::new(0, 0, from, dir, 0.0, 0.0);
+        p.cleared = 40; // known to lab time 40 STEP_DT
+        let simplices = p.simplices(0.0);
+        assert!(!simplices.is_empty());
+        for s in &simplices {
+            // Where the vertex is relative to the head that passed the firing event at the
+            // same shooter time.
+            let local = tetrad.world_to_local(s.v0);
+            let r = Vec3::new(local.x, local.y, local.z) - Vec3::new(local.t, 0.0, 0.0);
+            assert!(r.x <= 1e-4 && r.x >= -PULSE_LENGTH - 1e-4, "{r:?}");
+            assert!(r.y.abs() <= 2.0 * PULSE_HALF_WIDTH && r.z.abs() <= 2.0 * PULSE_HALF_WIDTH, "{r:?}");
         }
     }
 }

@@ -6,10 +6,9 @@ use std::fmt;
 use crate::dynamic::helm::ControlMode;
 use crate::dynamic::{PlayerId, ShipSample};
 use crate::minkowski::Vec4;
-use crate::renderer::Frontier;
 
 /// Bumped whenever the encoding or the meaning of a message changes.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 const TAG_HELLO: u8 = 0;
 const TAG_TRACK: u8 = 1;
@@ -21,15 +20,15 @@ const TAG_PONG: u8 = 6;
 const TAG_CONTROLS: u8 = 7;
 
 /// One message from a peer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Message {
     /// First message of a session.
     Hello { version: u16, player: PlayerId },
     /// The sender's pilot reached `sample`; also a heartbeat while `waiting`. Their hull follows
     /// from their pilot's track: each replica computes it.
     Track { sample: ShipSample, waiting: bool },
-    /// The sender fired a laser pulse at event `at` along the lab direction `dir`.
-    Laser { at: Frontier, dir: [f64; 3] },
+    /// The sender's pilot, at `from`, fired a laser pulse along the lab direction `dir`.
+    Laser { from: ShipSample, dir: [f64; 3] },
     /// The sender emitted a light flash at `at`.
     Flash { at: Vec4 },
     /// The sender quits.
@@ -40,25 +39,6 @@ pub enum Message {
     Pong { sent: f64 },
     /// The sender flies with `controls` (sent before their ship first moves).
     Controls { controls: ControlMode },
-}
-
-// `Frontier` has no `PartialEq`, so compare its fields here.
-impl PartialEq for Message {
-    fn eq(&self, other: &Self) -> bool {
-        use Message::*;
-        match (self, other) {
-            (Hello { version: a, player: p }, Hello { version: b, player: q }) => a == b && p == q,
-            (Track { sample: a, waiting: w }, Track { sample: b, waiting: v }) => a == b && w == v,
-            (Controls { controls: a }, Controls { controls: b }) => a == b,
-            (Laser { at: a, dir: v }, Laser { at: b, dir: w }) => {
-                a.origin == b.origin && a.proper_time == b.proper_time && v == w
-            }
-            (Flash { at: a }, Flash { at: b }) => a == b,
-            (Bye, Bye) => true,
-            (Ping { sent: a }, Ping { sent: b }) | (Pong { sent: a }, Pong { sent: b }) => a == b,
-            _ => false,
-        }
-    }
 }
 
 /// Why a frame could not be decoded.
@@ -92,16 +72,12 @@ impl Message {
             }
             Self::Track { sample, waiting } => {
                 out.push(TAG_TRACK);
-                put_f64s(out, &[sample.t]);
-                put_f64s(out, &sample.pos);
-                put_f64s(out, &sample.vel);
-                put_f64s(out, &[sample.tau]);
+                put_ship_sample(out, sample);
                 out.push(*waiting as u8);
             }
-            Self::Laser { at, dir } => {
+            Self::Laser { from, dir } => {
                 out.push(TAG_LASER);
-                put_vec4(out, at.origin);
-                out.extend_from_slice(&at.proper_time.to_le_bytes());
+                put_ship_sample(out, from);
                 put_f64s(out, dir);
             }
             Self::Flash { at } => {
@@ -136,10 +112,7 @@ impl Message {
                 let sample = r.ship_sample()?;
                 Self::Track { sample, waiting: r.u8()? != 0 }
             }
-            TAG_LASER => {
-                let at = Frontier { origin: r.vec4()?, proper_time: r.f32()? };
-                Self::Laser { at, dir: r.v3()? }
-            }
+            TAG_LASER => Self::Laser { from: r.ship_sample()?, dir: r.v3()? },
             TAG_FLASH => Self::Flash { at: r.vec4()? },
             TAG_BYE => Self::Bye,
             TAG_PING => Self::Ping { sent: r.f64()? },
@@ -165,6 +138,13 @@ fn put_f64s(out: &mut Vec<u8>, xs: &[f64]) {
     for x in xs {
         out.extend_from_slice(&x.to_le_bytes());
     }
+}
+
+fn put_ship_sample(out: &mut Vec<u8>, sample: &ShipSample) {
+    put_f64s(out, &[sample.t]);
+    put_f64s(out, &sample.pos);
+    put_f64s(out, &sample.vel);
+    put_f64s(out, &[sample.tau]);
 }
 
 fn put_vec4(out: &mut Vec<u8>, v: Vec4) {
@@ -226,14 +206,13 @@ mod tests {
             vel: [0.999_999_999, -0.5, 0.0],
             tau: 123.456,
         };
-        let at = Frontier { origin: Vec4::new(3.0e7, -0.0, 1.5, f32::MAX), proper_time: 77.25 };
         vec![
             Message::Hello { version: PROTOCOL_VERSION, player: 0 },
             Message::Hello { version: u16::MAX, player: 255 },
             Message::Track { sample, waiting: false },
             Message::Track { sample, waiting: true },
-            Message::Laser { at, dir: [0.1, -0.2, f64::EPSILON] },
-            Message::Laser { at, dir: [-0.0; 3] },
+            Message::Laser { from: sample, dir: [0.1, -0.2, f64::EPSILON] },
+            Message::Laser { from: sample, dir: [-0.0; 3] },
             Message::Flash { at: Vec4::new(1.0e9, -0.0, f32::MIN_POSITIVE, -2.5) },
             Message::Bye,
             Message::Ping { sent: 12.5 },

@@ -11,7 +11,6 @@ use super::protocol::{Message, PROTOCOL_VERSION};
 use crate::dynamic::helm::ControlMode;
 use crate::dynamic::{PlayerId, ShipSample};
 use crate::minkowski::Vec4;
-use crate::renderer::Frontier;
 
 /// Something the peer did, in the order it was sent.
 #[derive(Clone, Debug)]
@@ -21,7 +20,7 @@ pub enum Event {
     Track { sample: ShipSample, waiting: bool },
     /// The peer flies with `controls`.
     Controls(ControlMode),
-    Laser { at: Frontier, dir: [f64; 3] },
+    Laser { from: ShipSample, dir: [f64; 3] },
     Flash(Vec4),
     /// The peer probes the round trip; answer with `Message::Pong { sent }`.
     Ping { sent: f64 },
@@ -158,7 +157,7 @@ impl Session {
             _ if !self.joined => events.push(Event::Error(format!("{msg:?} before Hello"))),
             Message::Track { sample, waiting } => events.push(Event::Track { sample, waiting }),
             Message::Controls { controls } => events.push(Event::Controls(controls)),
-            Message::Laser { at, dir } => events.push(Event::Laser { at, dir }),
+            Message::Laser { from, dir } => events.push(Event::Laser { from, dir }),
             Message::Flash { at } => events.push(Event::Flash(at)),
             Message::Ping { sent } => events.push(Event::Ping { sent }),
             Message::Pong { sent } => events.push(Event::Pong { sent }),

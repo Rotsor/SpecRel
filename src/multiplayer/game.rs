@@ -11,7 +11,7 @@ use crate::dynamic::collide::V3;
 use crate::dynamic::helm::ControlMode;
 use crate::dynamic::{DynWorld, PlayerId, ShipSample};
 use crate::minkowski::Vec4;
-use crate::renderer::{FrameDynamics, Frontier};
+use crate::renderer::FrameDynamics;
 
 pub const PLAYERS: usize = 2;
 
@@ -106,8 +106,8 @@ impl Match {
                     self.remote_waiting = waiting;
                     changed = true;
                 }
-                Event::Laser { at, dir } => {
-                    world.fire_laser(self.remote, at, dir);
+                Event::Laser { from, dir } => {
+                    world.fire_laser(self.remote, from, dir);
                     changed = true;
                 }
                 Event::Flash(at) => dynamics.emit_flash(at),
@@ -171,8 +171,8 @@ impl Match {
         self.session.send(&Message::Controls { controls });
     }
 
-    pub fn send_laser(&mut self, at: Frontier, dir: V3) {
-        self.session.send(&Message::Laser { at, dir });
+    pub fn send_laser(&mut self, from: ShipSample, dir: V3) {
+        self.session.send(&Message::Laser { from, dir });
     }
 
     pub fn send_flash(&mut self, at: Vec4) {
