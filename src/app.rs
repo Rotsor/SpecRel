@@ -3,9 +3,7 @@
 //! translate their own key events into [`Action`]s and [`HeldInput`], and keep only what is
 //! genuinely theirs (rendering backend, resolution, HUD visibility, presentation).
 
-use crate::dynamic::billiards::{self, Ammo, FIRE_SPEED, SHIP_RADIUS};
-use crate::dynamic::body::{BodyState, Impulse};
-use crate::dynamic::collide::P4;
+use crate::dynamic::billiards;
 use crate::dynamic::helm::{self, CommandQueue, ControlMode, Hull, Order};
 use crate::dynamic::{DynWorld, PlayerId, ShipSample};
 use crate::minkowski::{Vec3, Vec4};
@@ -56,10 +54,9 @@ pub enum Action {
     EmitFlash,
     ProphecyDeltaUp,
     ProphecyDeltaDown,
-    /// Dynamic Mode: launch the current ammo from the ship along the view direction.
+    /// Dynamic Mode: fire a laser pulse from the pilot along the view direction (at the
+    /// reticle).
     Fire,
-    /// Dynamic Mode: cycle what [`Action::Fire`] launches.
-    CycleAmmo,
     /// Dynamic Mode: switch between delayed controls and a control pod ([`ControlMode`]).
     /// Alone this restarts the table; in a match it only works before the match starts.
     CycleControls,
@@ -95,7 +92,7 @@ pub struct HeldInput {
 }
 
 /// Dynamic Mode: an [`Action::Brake`] or [`Action::MatchVelocity`] in progress. The ship is a
-/// rigid body of radius [`SHIP_RADIUS`], so it cannot change velocity at once: it boosts toward
+/// rigid body of radius [`billiards::SHIP_RADIUS`], so it cannot change velocity at once: it boosts toward
 /// `target` at its pilot's acceleration ([`ControlMode::pilot_accel`]) for as long as its key
 /// stays down.
 #[derive(Clone, Copy)]
@@ -114,14 +111,10 @@ pub struct App {
     pub time_scale_idx: usize,
     /// The causal simulation behind the current scene, if it is a Dynamic Mode scene.
     pub world: Option<DynWorld>,
-    /// What [`Action::Fire`] launches in Dynamic Mode.
-    pub ammo: Ammo,
     /// Dynamic Mode: how the ship's controls reach its hull.
     pub controls: ControlMode,
     /// [`ControlMode::Delayed`]: commands on their way across the hull.
     commands: CommandQueue,
-    /// Ship collision impulses whose news has not crossed the hull yet.
-    kicks_in_flight: Vec<Impulse>,
     steer: Option<Steer>,
     /// Bumped whenever a scene's geometry is replaced, so frontends know to re-upload it.
     pub scene_generation: u64,
@@ -151,10 +144,8 @@ impl App {
             paused: false,
             time_scale_idx: DEFAULT_TIME_SCALE_IDX,
             world: None,
-            ammo: Ammo::Puck,
             controls: ControlMode::default(),
             commands: CommandQueue::default(),
-            kicks_in_flight: Vec::new(),
             steer: None,
             scene_generation: 0,
             world_grew: false,
@@ -298,7 +289,6 @@ impl App {
             Action::ProphecyDeltaUp => self.cfg.step_prophecy_delta(1.0),
             Action::ProphecyDeltaDown => self.cfg.step_prophecy_delta(-1.0),
             Action::Fire => self.fire(),
-            Action::CycleAmmo => self.ammo = self.ammo.next(),
             // The pilot and the hull's center only coincide again when nothing has moved yet.
             Action::CycleControls if multiplayer => {
                 if self.camera.proper_time == 0.0 {
@@ -453,9 +443,6 @@ impl App {
             let shift = -DYNAMIC_REBASE_AFTER_T;
             self.camera.position.t += shift;
             self.dynamics.shift_time(shift);
-            for kick in &mut self.kicks_in_flight {
-                kick.t += shift as f64;
-            }
             if let Some(world) = self.world.as_mut() {
                 world.rebase(shift as f64);
             }
@@ -472,24 +459,10 @@ impl App {
             m.send_track(*world.ships[m.local() as usize].latest());
         }
 
-        // With delayed controls, collisions push back on the ship. The camera is the hull's
-        // center: it feels a kick once news of the contact has crossed the hull, like any other
-        // body. (A control pod's hull isn't kicked: see `Ship::record`.)
-        self.kicks_in_flight.append(&mut world.ship_kicks);
-        let p = self.camera.position;
-        let ship = BodyState {
-            step: 0,
-            t: p.t as f64,
-            pos: [p.x as f64, p.y as f64, p.z as f64],
-            vel: [0.0; 3],
-            tau: 0.0,
-        };
-        let (arrived, flying): (Vec<_>, Vec<_>) = std::mem::take(&mut self.kicks_in_flight)
-            .into_iter()
-            .partition(|k| k.has_reached(&ship, SHIP_RADIUS));
-        self.kicks_in_flight = flying;
-        for kick in arrived {
-            self.kick_ship(kick.dp);
+        // A laser hit on a hull lights it up (each player sees the flash when its light
+        // arrives).
+        for hit in world.fresh_hits.drain(..) {
+            self.dynamics.emit_hit_flash(hit);
         }
 
         self.rebuild_timer += dt_wall;
@@ -498,42 +471,50 @@ impl App {
         }
     }
 
-    /// Launch the current ammo at [`FIRE_SPEED`] along the view direction in the ship's rest
-    /// frame: lab 4-velocity `gamma (e_0 + FIRE_SPEED * e_forward)`.
+    /// Fire a laser pulse from the pilot along the view direction in the ship's rest frame:
+    /// the null direction `e_0 + e_forward`, which is where the reticle (the screen's center)
+    /// looks.
     fn fire(&mut self) {
         let frontier = self.camera_frontier();
         let Some(world) = self.world.as_mut() else {
             return;
         };
         let e = &self.camera.tetrad.e;
-        let u = e[0] + e[3] * FIRE_SPEED as f32;
-        let vel = [u.x / u.t, u.y / u.t, u.z / u.t].map(|c| c as f64);
-        if world.fire(frontier, vel, self.ammo) {
-            self.world_grew = true;
-            if let Some(m) = self.multiplayer.as_mut() {
-                m.send_fire(frontier, vel, self.ammo);
-            }
+        let k = e[0] + e[3];
+        let dir = [k.x / k.t, k.y / k.t, k.z / k.t].map(|c| c as f64);
+        world.fire_laser(world.viewer, frontier, dir);
+        self.world_grew = true;
+        if let Some(m) = self.multiplayer.as_mut() {
+            m.send_laser(frontier, dir);
         }
     }
 
-    /// Add collision 4-momentum `kick` to the ship (rest mass `SHIP_MASS`) and re-point the
-    /// camera's 4-velocity along the result.
-    fn kick_ship(&mut self, kick: P4) {
-        self.camera.tetrad.boost_to(helm::kicked(self.camera.tetrad.e[0], kick));
-    }
-
-    /// The HUD's second line: the scene description, plus the ammo and controls in Dynamic
+    /// The HUD's second line: the scene description, plus the laser and controls in Dynamic
     /// Mode.
     pub fn scene_description(&self) -> String {
         let desc = self.scene().demo.description();
-        let ammo = format!("[ENTER] FIRE {} | [\\] AMMO", self.ammo.name());
+        let laser = "[ENTER] FIRE LASER";
         if let Some(m) = &self.multiplayer {
-            format!("{ammo} | {} | {}", self.controls_status(), m.status())
+            format!("{laser} | {} | {}", self.controls_status(), m.status())
         } else if self.is_dynamic() {
-            format!("{ammo} | {} | {desc}", self.controls_status())
+            format!("{laser} | {} | {desc}", self.controls_status())
         } else {
             desc.to_string()
         }
+    }
+
+    /// Dynamic Mode: the laser scoreboard for the HUD. In a match, the hits each side has
+    /// landed on the other's hull, counted as news of them arrives; alone, the shots fired.
+    pub fn scoreboard(&self) -> Option<String> {
+        let world = self.world.as_ref()?;
+        let me = world.viewer as usize;
+        Some(match &self.multiplayer {
+            Some(_) => {
+                let theirs: u32 = world.scores.iter().enumerate().filter(|&(p, _)| p != me).map(|(_, s)| s).sum();
+                format!("LASER HITS  YOU {} : {} THEM", world.scores[me], theirs)
+            }
+            None => format!("LASER SHOTS {}", world.ships[me].shots),
+        })
     }
 
     /// The controls, for the HUD: the command lag (and whether the engines are spooling up), or
@@ -574,7 +555,6 @@ impl App {
         };
         self.paused = false;
         self.dynamics.flashes.clear();
-        self.kicks_in_flight.clear();
         self.steer = None;
         self.commands.clear();
 
@@ -601,6 +581,8 @@ impl App {
 mod tests {
     use super::*;
     use crate::scene::DemoScene;
+    use crate::dynamic::billiards::SHIP_RADIUS;
+    use crate::dynamic::laser;
 
     fn twin_app() -> App {
         App::new(vec![Scene4D::build(DemoScene::TwinParadox)], 64, 40)
@@ -708,30 +690,27 @@ mod tests {
         assert_eq!(app.camera.position, p0, "scrubbing and teleporting are disabled");
     }
 
+    /// The laser leaves the pilot where the reticle (the screen's center) looks: straight
+    /// ahead in the ship's rest frame, where the center pixel's past light ray comes from.
+    /// (In the lab, aberration bends the two differently.)
     #[test]
-    fn firing_launches_the_selected_ammo_forward() {
+    fn the_laser_fires_at_the_reticle() {
         let mut app = billiards_app();
-        let before = app.world.as_ref().unwrap().bodies.len();
-        app.apply(Action::CycleAmmo);
-        assert_eq!(app.ammo, Ammo::Sticky);
+        app.look(0.4, -0.2, 0.1);
+        app.camera.tetrad.boost_local(Vec3::new(0.5, 0.0, 0.3)); // moving: aberration
         app.apply(Action::Fire);
         let world = app.world.as_ref().unwrap();
-        assert_eq!(world.bodies.len(), before + 1);
-        let shot = world.bodies.last().unwrap();
-        assert!(shot.is_sticky() && shot.born);
-        // Straight ahead (+z) at the launch speed, the camera being at rest.
-        let v = shot.latest().vel;
-        assert!((v[2] - FIRE_SPEED).abs() < 1e-6 && v[0].abs() < 1e-6);
-        assert!(app.scene_description().contains("STICKY PUCK"));
-    }
-
-    #[test]
-    fn ship_kick_changes_the_camera_velocity() {
-        let mut app = billiards_app();
-        // The momentum a 0.6c puck hands over when it bounces straight back: (0, 0, 0, -1.5).
-        app.kick_ship([0.0, 0.0, 0.0, -1.5]);
-        let beta = app.camera.tetrad.beta();
-        assert!(beta.z < -0.2 && beta.x.abs() < 1e-6, "ship pushed back: {beta:?}");
+        let pulse = &world.pulses[0];
+        assert_eq!(pulse.t0, app.camera.position.t as f64);
+        let [x, y, z] = pulse.dir.map(|c| c as f32);
+        let k = Vec4::new(1.0, x, y, z);
+        let e = &app.camera.tetrad.e;
+        let local = [1, 2, 3].map(|i| k.minkowski_dot(e[i]));
+        assert!(local[0].abs() < 1e-5 && local[1].abs() < 1e-5 && local[2] > 0.0, "{local:?}");
+        let center = app.camera.tetrad.past_light_ray_direction(Vec3::new(0.0, 0.0, 1.0));
+        assert!(center.minkowski_dot(e[3]) > 0.0 && center.minkowski_dot(e[1]).abs() < 1e-6);
+        assert!(app.scene_description().contains("FIRE LASER"));
+        assert_eq!(app.scoreboard().as_deref(), Some("LASER SHOTS 1"));
     }
 
     #[test]
@@ -989,29 +968,48 @@ mod tests {
         assert!(line.contains("| INTERVAL 25.00LS | CM DIST 25.00LS |"), "{line}"); // the spawns
     }
 
-    /// Shots, flashes and the worlds they shape are shared: both replicas agree.
+    /// Laser shots, flashes and the worlds they shape are shared: both replicas agree. The
+    /// players spawn 25 ls apart facing each other, so shots straight ahead hit 25 s later;
+    /// each hit lights a flash, and lands on a player's scoreboard once news of it arrives
+    /// there: at once on the hull that was hit, 25 s later back at the shooter.
     #[test]
-    fn a_match_shares_shots_and_flashes() {
+    fn a_match_shares_lasers_hits_and_flashes() {
         let (mut p0, mut p1) = match_apps();
         p0.apply(Action::SelectScene(0)); // ignored in a match
         assert!(p0.is_dynamic());
-        for frame in 0..600 {
-            if frame % 50 == 10 {
+        let mut boards = Vec::new();
+        for frame in 0..1500 {
+            if frame % 100 == 10 && frame < 500 {
                 p0.apply(Action::Fire);
-                p1.apply(Action::CycleAmmo);
                 p1.apply(Action::Fire);
             }
             if frame == 30 {
                 p1.apply(Action::EmitFlash);
             }
-            let ahead = HeldInput { thrust_forward: frame < 20, ..Default::default() };
-            p0.step(0.05, &ahead);
-            p1.step(0.05, &ahead);
+            p0.step(0.05, &HeldInput::default());
+            p1.step(0.05, &HeldInput::default());
+            if frame % 50 == 0 {
+                boards.push(p0.scoreboard().unwrap());
+            }
         }
-        assert_eq!(p0.dynamics.flashes.len(), 1, "player 1's flash reached player 0");
+        let flashes = |app: &App, color| app.dynamics.flashes.iter().filter(|f| f.color == color).count();
+        let white = p1.dynamics.flashes[0].color;
+        assert_eq!(flashes(&p0, white), 1, "player 1's flash reached player 0");
+        assert_eq!(flashes(&p0, crate::renderer::HIT_FLASH_COLOR), 10, "every hit lights a flash");
         let (w0, w1) = (p0.world.as_ref().unwrap(), p1.world.as_ref().unwrap());
         let shots = |w: &DynWorld, p: PlayerId| w.ships[p as usize].shots;
-        assert!(shots(w0, 0) >= 10 && shots(w0, 1) == shots(w1, 1) && shots(w1, 0) == shots(w0, 0));
+        assert!(shots(w0, 0) == 5 && shots(w0, 1) == 5 && shots(w1, 0) == 5 && shots(w1, 1) == 5);
+        for p in &w0.pulses {
+            let q = w1.pulses.iter().find(|q| (q.shooter, q.seq) == (p.shooter, p.seq)).unwrap();
+            assert_eq!(p.end, q.end);
+            assert!(matches!(p.end.unwrap().target, laser::Target::Ship(t) if t != p.shooter));
+        }
+        assert_eq!((&w0.scores[..], &w1.scores[..]), (&[5, 5][..], &[5, 5][..]));
+        // Player 0 heard of the hits on their own hull long before those on player 1's.
+        let at = |frame: usize| &boards[frame / 50];
+        assert_eq!(at(400), "LASER HITS  YOU 0 : 0 THEM");
+        assert_eq!(at(950), "LASER HITS  YOU 0 : 5 THEM");
+        assert_eq!(at(1450), "LASER HITS  YOU 5 : 5 THEM");
         let mut compared = 0;
         for x in &w0.bodies {
             let y = w1.bodies.iter().find(|y| y.uid == x.uid).expect("same bodies in both worlds");

@@ -3,7 +3,7 @@
 //! event is the apex of a future light cone the world may not grow into.
 //!
 //! A ship has two worldlines (see `docs/SHIP_CONTROLS_CAUSALITY.md`): the pilot's, where the
-//! decisions are made, and the hull's, the rigid body that collides. With delayed commands the
+//! decisions are made, and the hull's, the rigid body that lasers hit. With delayed commands the
 //! pilot sits at the hull's center; in a control pod they float inside the hull.
 
 use super::billiards::SHIP_RADIUS;
@@ -91,8 +91,8 @@ pub struct Ship {
     /// The pilot's recorded worldline, oldest first, pruned behind the history window; never
     /// empty. Shots and flashes leave from here, and its latest event bounds the frontier.
     pub track: Vec<ShipSample>,
-    /// The hull center's worldline: `hull[i]` is at `track[i]`'s lab time. Bodies collide
-    /// with the hull.
+    /// The hull center's worldline: `hull[i]` is at `track[i]`'s lab time. Laser pulses hit
+    /// the hull.
     pub hull: Vec<ShipSample>,
     /// How the controls reach the hull.
     pub controls: ControlMode,
@@ -101,7 +101,7 @@ pub struct Ship {
     /// The player left the match: the ship ends at its last sample, and no longer holds the
     /// frontier back.
     pub left: bool,
-    /// Projectiles fired so far (they seed the projectiles' uids).
+    /// Laser pulses fired so far (they number the pulses).
     pub shots: u64,
 }
 
@@ -141,12 +141,12 @@ impl Ship {
     /// Record the pilot's next event, and move the hull's center to the same lab time.
     /// Samples are only ever appended, so whatever has been read from the tracks stays true.
     /// A paused or waiting player repeats its event; a repeat is dropped unless the velocity
-    /// changed on the spot (a collision kick).
+    /// changed on the spot (a delayed command coming due while paused).
     ///
     /// With delayed controls the hull's center is the pilot. A control pod's hull steers
     /// toward the pod by what it knows ([`Hull::steering`]), in pure `f32` arithmetic with
-    /// `sqrt` as the only function, so every replica gets the same bits. Collisions don't push
-    /// it: its motion depends on its pilot's track alone.
+    /// `sqrt` as the only function, so every replica gets the same bits: its motion depends
+    /// on its pilot's track alone.
     pub fn record(&mut self, pilot: ShipSample) {
         let last = self.latest();
         if pilot.t < last.t || *last == pilot {
@@ -280,7 +280,7 @@ impl Ship {
 }
 
 /// First of the four hull cage materials in `Scene4D::common_materials`.
-pub const HULL_MATERIALS: usize = 12;
+pub const HULL_MATERIALS: usize = 10;
 
 /// Half the side of the pilot's clock cube. It fits inside the pod's range of motion.
 const PILOT_HALF_EXTENT: f32 = 0.07;

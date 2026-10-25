@@ -60,10 +60,10 @@ the lab frame) and `V` (match velocity) do not jump: they boost toward the targe
 the key is held. Releasing the key mid-brake leaves the ship coasting at whatever velocity it
 reached. (These rules hold for single-player Dynamic Mode too.)
 
-**Ships don't touch bodies in a match.** In single player a puck that hits the ship bounces off
-the hull and kicks the ship. In a match, getting that right for the other player's hull, causally
-and identically on both replicas, is hard, so ships and bodies pass through each other
-(`DynWorld::ship_contacts`). Shots still collide with everything else.
+**Ships don't touch bodies.** Getting contacts with the other player's hull right, causally and
+identically on both replicas, is hard, so ships and pucks pass through each other. The players
+shoot lasers instead (`src/dynamic/laser.rs`): a pulse pushes nothing, so nothing waits for it,
+and it goes out at the first puck, hull or rail it meets.
 
 **The hull hears the controls at light speed.** A rigid hull may only act on a command once news
 of it has reached all of it (`docs/SHIP_CONTROLS_CAUSALITY.md`, `src/dynamic/helm.rs`). The
@@ -121,22 +121,22 @@ Both replicas must agree bit for bit. Billiards is chaotic, so any drift would e
 player a collision that the other never sees. Each body's next state is already a pure function of
 finalized data (single-player Phase 4). On top of that, multiplayer requires the following:
 
-* **Inputs travel exactly.** Ship samples are sent as `f64` bits. Fire events are sent with their
-  `f32` firing event and `f64` velocity.
+* **Inputs travel exactly.** Ship samples are sent as `f64` bits. Laser shots are sent with
+  their `f32` firing event and `f64` direction.
 * **Inputs are applied in order.** A shot fired at `O_f` is sent before the track sample that
-  moves past `O_f`. The receiver therefore inserts the projectile before its frontier for that
-  ship passes `O_f`, just as the firing peer did. A body at step `k` waits for a live ship's track
-  to reach that step's lab time while a shot fired after the ship's latest known event could be
-  in reach (within `shot_radius()` plus light travel of it), so no body misses a shot.
-* **Identities are per player.** Projectile uids are seeded with `(player, shot index)`.
-* **Firing capacity is checked by the shooter only.** A received shot is always inserted
-  (`DynWorld::launch`), because live-body counts can differ between peers at any given moment.
+  moves past `O_f`. The pulse lies on `O_f`'s light cone, so the receiver, which never passes
+  `O_f`'s future cone before hearing of it, inserts it in time. Where a pulse goes out depends
+  on the pucks and on the other ship's hull: it waits for that ship's track wherever it might
+  meet the hull (`laser::Pulse::advance`), so both replicas find the same end.
+* **Identities are per player.** Pulses are identified by `(player, shot index)`.
+* **Scores are local news.** Each replica counts a hit once the hit event lies in its own
+  player's past light cone, so the two scoreboards agree once the news has reached both.
 * **No lab-time rebase in multiplayer.** Rebasing at different moments on the two peers would
   change `f64` rounding. Physics is `f64`, so precision is fine for days. Render precision
   degrades slowly after many hours.
 * Pruning keeps everything newer than the *earliest* live frontier minus the history window.
 * Both peers must run the same build on the same platform (`f64` arithmetic is IEEE, but the
-  `cbrt` in `puck_radius` comes from the platform's libm).
+  `cbrt` in `billiards::body` comes from the platform's libm).
 
 ## 3. Architecture
 
@@ -168,7 +168,7 @@ Every frame is `seq: u32 LE` followed by one encoded `Message`:
 | `Hello` | protocol version, sender's `PlayerId` |
 | `Track` | the pilot's `ShipSample` (t, pos, vel, τ as `f64`) and the sender's waiting flag; sent every frame, including while waiting, as a heartbeat |
 | `Controls` | the sender's `ControlMode` (delayed or pod), sent before their ship first moves |
-| `Fire` | firing event (`Frontier`, `f32`), lab velocity (`f64` ×3), ammo |
+| `Laser` | firing event (`Frontier`, `f32`), lab direction (`f64` ×3) |
 | `Flash` | emission event (`f32` ×4) |
 | `Bye` | sender quits |
 | `Ping` / `Pong` | the sender's wall clock (`f64` seconds); `Pong` echoes a `Ping`'s, timing the round trip |

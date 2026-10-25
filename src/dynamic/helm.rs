@@ -11,8 +11,7 @@
 
 use std::collections::VecDeque;
 
-use super::billiards::{SHIP_ACCEL, SHIP_MASS};
-use super::collide::P4;
+use super::billiards::SHIP_ACCEL;
 use super::ship::{Ship, ShipSample};
 use crate::minkowski::{project_to_rest_space, Tetrad, Vec4};
 use crate::renderer::Frontier;
@@ -246,20 +245,6 @@ const ACCEL_WINDOW: f64 = 0.1;
 /// Scale a timelike vector to unit norm.
 fn normalized(v: Vec4) -> Vec4 {
     v / (-v.minkowski_norm_sq()).sqrt()
-}
-
-/// The 4-velocity of a ship (rest mass [`SHIP_MASS`]) moving with `u` once it receives
-/// collision 4-momentum `kick`.
-pub fn kicked(u: Vec4, kick: P4) -> Vec4 {
-    let p = [
-        SHIP_MASS * u.t as f64 + kick[0],
-        SHIP_MASS * u.x as f64 + kick[1],
-        SHIP_MASS * u.y as f64 + kick[2],
-        SHIP_MASS * u.z as f64 + kick[3],
-    ];
-    let m = (p[0] * p[0] - p[1] * p[1] - p[2] * p[2] - p[3] * p[3]).sqrt();
-    let [t, x, y, z] = p.map(|c| (c / m) as f32);
-    Vec4::new(t, x, y, z)
 }
 
 #[cfg(test)]

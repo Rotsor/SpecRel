@@ -1,7 +1,6 @@
 //! Bodies with a causally finalized history, and the frontier rule that gates their growth.
 
 use super::collide::{self, V3};
-use super::ship::PlayerId;
 use crate::mesh4d::{Mesh3D, WorldlineSample};
 use crate::minkowski::{Tetrad, Vec3, Vec4};
 
@@ -84,25 +83,11 @@ pub fn is_decided(state: &BodyState, radius: f64, origin: Vec4) -> bool {
     state.t - origin.t as f64 + event_margin(state, radius) <= distance(state.pos, o)
 }
 
-/// What a body is, as far as its interactions are concerned.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Kind {
-    /// Collides elastically (unless the other body is sticky).
-    Puck,
-    /// Sticks to whatever it touches: both end up co-moving, heavier by the kinetic energy
-    /// the contact dissipated (see [`collide::stick`]).
-    Sticky,
-    /// Splits into two fragments once its own clock reads `lifetime`; fragments of generation
-    /// `generation > 0` are spores again with a shorter fuse, the last generation plain pucks.
-    Spore { lifetime: f64, generation: u32 },
-}
-
 /// A body with a history finalized up to the causal frontier.
 pub struct Body {
     /// Stable identity, derived from how the body came to be (so two runs of the world agree
     /// on it even when they create different bodies elsewhere).
     pub uid: u64,
-    pub kind: Kind,
     /// Rest mass
     pub mass: f64,
     /// Rest-frame surface mesh
@@ -114,22 +99,15 @@ pub struct Body {
     pub history: Vec<BodyState>,
     /// Camera proper time at which each history step was finalized (parallel to `history`).
     pub decided_at: Vec<f32>,
-    /// The body was created mid-scene (fired, merged, decayed), so its tube gets a start cap.
-    pub born: bool,
-    /// The body ceased to exist after its last history step (merged, decayed or left).
+    /// The body ceased to exist after its last history step (it left play).
     pub ended: bool,
-    /// The ship that fired it: passes through that ship until first clear of it.
-    pub launcher: Option<PlayerId>,
     /// Collision impulses received but not yet felt: see [`Impulse::has_reached`].
     pub pending: Vec<Impulse>,
     /// Uids of the bodies touching it at its latest step (a contact acts once, when it begins).
     pub touching: Vec<u64>,
-    /// Ships touching it at its latest step.
-    pub touching_ships: Vec<PlayerId>,
-    /// Material switches as `(first step, material)`, e.g. glowing once a sticky hit adds mass.
-    pub material_changes: Vec<(i64, usize)>,
-    /// Rest mass as `(first step, mass)`, oldest first, starting with its birth: a sticky hit
-    /// adds mass. Other bodies read it at the step of a contact, which may lie in its past.
+    /// Rest mass as `(first step, mass)`, oldest first, starting with its birth (an elastic
+    /// contact keeps it up to rounding). Other bodies read it at the step of a contact, which
+    /// may lie in its past.
     pub mass_changes: Vec<(i64, f64)>,
 }
 
@@ -167,20 +145,8 @@ impl Body {
         (i >= 0).then(|| self.history.get(i as usize)).flatten()
     }
 
-    pub fn is_sticky(&self) -> bool {
-        self.kind == Kind::Sticky
-    }
-
     /// Rest mass at global grid `step`.
     pub fn mass_at(&self, step: i64) -> f64 {
         self.mass_changes.iter().rev().find(|&&(from, _)| from <= step).map_or(self.mass_changes[0].1, |&(_, m)| m)
-    }
-
-    pub fn material_at(&self, step: i64) -> usize {
-        self.material_changes
-            .iter()
-            .rev()
-            .find(|&&(from, _)| from <= step)
-            .map_or(self.material_id, |&(_, m)| m)
     }
 }

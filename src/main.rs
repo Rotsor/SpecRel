@@ -16,7 +16,7 @@ use app::{Action, App, HeldInput};
 #[cfg(not(target_arch = "wasm32"))]
 use gpu::GpuRenderer;
 #[cfg(not(target_arch = "wasm32"))]
-use hud::{draw_banner, draw_hud};
+use hud::{draw_banner, draw_hud, draw_reticle};
 #[cfg(not(target_arch = "wasm32"))]
 use minifb::{Key, KeyRepeat, Window, WindowOptions};
 #[cfg(not(target_arch = "wasm32"))]
@@ -56,7 +56,6 @@ const KEY_ACTIONS: &[(Key, Action)] = &[
     (Key::Slash, Action::EmitFlash),
     (Key::Enter, Action::Fire),
     (Key::NumPadEnter, Action::Fire),
-    (Key::Backslash, Action::CycleAmmo),
     (Key::Semicolon, Action::CycleControls),
 ];
 
@@ -426,12 +425,16 @@ fn main() {
             _ => render_frame(app.scene(), &app.camera, &app.cfg, &app.dynamics, &mut framebuffer),
         }
 
+        if app.is_dynamic() {
+            draw_reticle(&mut framebuffer, app.cfg.width, app.cfg.height);
+        }
         if show_hud {
             let backend = if gpu.is_some() && use_gpu { "GPU" } else { "CPU" };
             draw_hud(
                 &mut framebuffer,
                 app.scene().demo,
                 &app.scene_description(),
+                app.scoreboard().as_deref(),
                 app.net_metrics().as_deref(),
                 &app.camera,
                 &app.cfg,

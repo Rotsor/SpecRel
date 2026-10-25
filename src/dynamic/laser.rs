@@ -1,0 +1,383 @@
+//! Lasers: the ships' weapon. A pulse of light leaves the pilot along the view direction and
+//! flies at `c` until it meets a puck, a ship's hull or the table, and goes out there. Hitting
+//! another player's hull scores a hit.
+//!
+//! A pulse is the only thing in the world that does not have to wait for the frontier: its
+//! whole path lies on the boundary of the firing event's future light cone, so the input that
+//! fired it fixes it at once. Only where it *ends* depends on others, and only on bodies and
+//! hulls, which never depend on it (light pushes nothing here). So a pulse is advanced on the
+//! shared lab-time grid behind them: across a step once every puck and hull that could be in
+//! its way during that step is known. Then every replica of a match finds the same end, however
+//! late it hears of the other player.
+
+use super::billiards::{self, SHIP_RADIUS};
+use super::body::{Body, STEP_DT};
+use super::collide::{dot3, V3};
+use super::ship::{PlayerId, Ship};
+use crate::mesh4d::{build_worldtube_cap, build_worldtube_simplices_with_decided, Mesh3D, Simplex4D, WorldlineSample};
+use crate::minkowski::{Tetrad, Vec3, Vec4};
+use crate::renderer::Frontier;
+
+/// Length of the rod of light a pulse is drawn as, trailing its head (in light-seconds, so
+/// it is that long in time as well).
+pub const PULSE_LENGTH: f32 = 0.5;
+/// Half the thickness of the rod.
+const PULSE_HALF_WIDTH: f32 = 0.02;
+/// A pulse that has met nothing this far (lab light-seconds) from where it was fired is gone.
+pub const LASER_RANGE: f64 = 120.0;
+/// Material of pulses in `Scene4D::common_materials`.
+pub const MATERIAL_PULSE: usize = 9;
+
+/// What stopped a pulse.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Target {
+    /// A puck, by uid.
+    Body(u64),
+    /// A player's hull: a hit for the shooter.
+    Ship(PlayerId),
+    /// The felt or a rail.
+    Table,
+    /// Nothing within [`LASER_RANGE`].
+    Nothing,
+}
+
+/// Where and when a pulse went out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PulseEnd {
+    /// Lab time
+    pub t: f64,
+    pub pos: V3,
+    pub target: Target,
+}
+
+impl PulseEnd {
+    /// The event, in `f32` render coordinates.
+    pub fn event(&self) -> Vec4 {
+        let [x, y, z] = self.pos;
+        Vec4::new(self.t as f32, x as f32, y as f32, z as f32)
+    }
+}
+
+/// What [`Pulse::advance`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Progress {
+    /// Something that might be in the way is not known yet.
+    Waiting,
+    /// Crossed one more grid step unhindered.
+    Advanced,
+    /// Went out (or already had).
+    Ended,
+}
+
+/// A pulse of laser light: its head is at `pos0 + dir (t - t0)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pulse {
+    pub shooter: PlayerId,
+    /// The shooter's shot count when it was fired: `(shooter, seq)` identifies it.
+    pub seq: u64,
+    /// Lab time of the firing event
+    pub t0: f64,
+    pub pos0: V3,
+    /// Unit lab direction of flight
+    pub dir: V3,
+    /// The viewer's proper time when this replica heard of it. Its whole path was decided by
+    /// then (it lies on the firing event's light cone).
+    pub fired_at: f32,
+    /// The path is known to be clear up to grid step `cleared` (or `t0`, if later).
+    cleared: i64,
+    /// Where it goes out if nothing moving gets in its way first: the table, or out of range.
+    /// Static, so known at once.
+    stop: PulseEnd,
+    pub end: Option<PulseEnd>,
+    /// Its hit on a ship is on the viewer's scoreboard: news of it has reached the viewer.
+    pub scored: bool,
+}
+
+impl Pulse {
+    /// Shot `seq` of `shooter`, fired at `at` along the lab direction `dir`; `t_origin` is the
+    /// lab time of grid step 0, and `fired_at` the viewer's proper time now.
+    pub fn new(shooter: PlayerId, seq: u64, at: Frontier, dir: V3, t_origin: f64, fired_at: f32) -> Self {
+        let o = at.origin;
+        let (t0, pos0) = (o.t as f64, [o.x as f64, o.y as f64, o.z as f64]);
+        let l = dot3(dir, dir).sqrt();
+        let dir = dir.map(|c| c / l);
+        Self {
+            shooter,
+            seq,
+            t0,
+            pos0,
+            dir,
+            fired_at,
+            cleared: ((t0 - t_origin) / STEP_DT).floor() as i64,
+            stop: static_stop(t0, pos0, dir),
+            end: None,
+            scored: false,
+        }
+    }
+
+    /// Where the head is at lab time `t`.
+    pub fn pos_at(&self, t: f64) -> V3 {
+        let s = t - self.t0;
+        [0, 1, 2].map(|c| self.pos0[c] + self.dir[c] * s)
+    }
+
+    /// Lab time up to which the pulse is known: where it went out, or how far it is known to
+    /// have flown unhindered.
+    pub fn known_to(&self, t_origin: f64) -> f64 {
+        match self.end {
+            Some(end) => end.t,
+            None => (t_origin + self.cleared as f64 * STEP_DT).max(self.t0),
+        }
+    }
+
+    /// Fly across the next grid step, unless something that might be in the way during it is
+    /// not known yet. Every puck and hull except the shooter's own counts; the first one the
+    /// head touches stops it.
+    pub fn advance(&mut self, bodies: &[Body], ships: &[Ship], t_origin: f64) -> Progress {
+        if self.end.is_some() {
+            return Progress::Ended;
+        }
+        let k = self.cleared;
+        let ta = self.known_to(t_origin);
+        let tb = (t_origin + (k + 1) as f64 * STEP_DT).min(self.stop.t);
+        // A center last known at `pos` at lab time `t` that is still unknown at `tb` can't
+        // have come within `r` of the head during `[ta, tb]` unless this holds.
+        let could_reach = |pos: V3, t: f64, r: f64| {
+            super::body::distance(pos, self.pos_at(tb)) < r + (tb - t) + (tb - ta)
+        };
+
+        let mut first: Option<(f64, Target)> = None;
+        let mut take = |t: Option<f64>, target: Target| {
+            if let Some(t) = t {
+                if first.is_none_or(|(best, _)| t < best) {
+                    first = Some((t, target));
+                }
+            }
+        };
+        for body in bodies {
+            if body.first_step() > k {
+                continue; // not there yet (or pruned long ago)
+            }
+            match (body.at(k), body.at(k + 1)) {
+                (Some(a), Some(b)) => {
+                    // Between grid steps a body moves in a straight line (as it is drawn).
+                    let f = |t: f64| (t - a.t) / (b.t - a.t);
+                    let at = |t: f64| [0, 1, 2].map(|c| a.pos[c] + (b.pos[c] - a.pos[c]) * f(t));
+                    take(self.sweep(ta, tb, at(ta), at(tb), body.radius), Target::Body(body.uid));
+                }
+                _ if body.ended => {} // gone by step k + 1
+                _ => {
+                    let last = body.latest();
+                    if could_reach(last.pos, last.t, body.radius) {
+                        return Progress::Waiting;
+                    }
+                }
+            }
+        }
+        for ship in ships.iter().filter(|s| s.player != self.shooter) {
+            // A ship that left ends at its last sample.
+            let known = ship.latest().t;
+            if known < tb && ship.is_live() {
+                let last = ship.latest_hull();
+                if could_reach(last.pos, last.t, SHIP_RADIUS) {
+                    return Progress::Waiting;
+                }
+                continue;
+            }
+            // The hull moves in a straight line between its samples.
+            let mut t = ta;
+            let ends = ship.hull.iter().map(|s| s.t).filter(|&s| s > ta && s < tb);
+            for u in ends.chain([tb]).map(|u| u.min(known)) {
+                if u > t {
+                    let hit = self.sweep(t, u, ship.hull_at(t).pos, ship.hull_at(u).pos, SHIP_RADIUS);
+                    take(hit, Target::Ship(ship.player));
+                    t = u;
+                }
+            }
+        }
+
+        self.end = match first {
+            Some((t, target)) => Some(PulseEnd { t, pos: self.pos_at(t), target }),
+            None if tb >= self.stop.t => Some(self.stop),
+            None => {
+                self.cleared = k + 1;
+                return Progress::Advanced;
+            }
+        };
+        Progress::Ended
+    }
+
+    /// The first lab time in `[ta, tb]` at which the head is within `r` of a center moving in
+    /// a straight line from `ca` (at `ta`) to `cb` (at `tb`).
+    fn sweep(&self, ta: f64, tb: f64, ca: V3, cb: V3, r: f64) -> Option<f64> {
+        let head = self.pos_at(ta);
+        let d0: V3 = [0, 1, 2].map(|c| head[c] - ca[c]);
+        let c = dot3(d0, d0) - r * r;
+        if c <= 0.0 {
+            return Some(ta); // already inside (fired from within it)
+        }
+        let len = tb - ta;
+        let w: V3 = [0, 1, 2].map(|i| self.dir[i] - (cb[i] - ca[i]) / len);
+        let (a, b) = (dot3(w, w), dot3(d0, w));
+        if b >= 0.0 || a == 0.0 {
+            return None; // not closing in
+        }
+        let disc = b * b - a * c;
+        if disc < 0.0 {
+            return None;
+        }
+        let s = (-b - disc.sqrt()) / a;
+        (s <= len).then_some(ta + s)
+    }
+
+    /// The pulse as drawn: an orange-red rod trailing its head, from where it was fired to as
+    /// far as it is known. Light has no rest frame, so the rod is shaped (and shaded) in the
+    /// lab frame.
+    pub fn simplices(&self, t_origin: f64) -> Vec<Simplex4D> {
+        let mesh = rod_mesh(self.dir);
+        let back = Vec3::new(self.dir[0] as f32, self.dir[1] as f32, self.dir[2] as f32) * (-0.5 * PULSE_LENGTH);
+        let sample = |t: f64| {
+            let [x, y, z] = self.pos_at(t);
+            WorldlineSample {
+                center: Vec4::new(t as f32, x as f32 + back.x, y as f32 + back.y, z as f32 + back.z),
+                proper_time: 0.0,
+                phi: Vec3::default(),
+                proper_accel_local: Vec3::default(),
+                tetrad: Tetrad::rest(),
+            }
+        };
+        let ends = [sample(self.t0), sample(self.known_to(t_origin))];
+        let mut simplices =
+            build_worldtube_simplices_with_decided(&mesh, &ends, Some(&[self.fired_at; 2]), MATERIAL_PULSE);
+        for end in &ends {
+            simplices.extend(build_worldtube_cap(&mesh, end, self.fired_at, MATERIAL_PULSE));
+        }
+        simplices
+    }
+
+    /// Shift every event by `dt` in lab time (`t_origin` moves with it).
+    pub fn rebase(&mut self, dt: f64) {
+        self.t0 += dt;
+        self.stop.t += dt;
+        if let Some(end) = &mut self.end {
+            end.t += dt;
+        }
+    }
+}
+
+/// Where a pulse fired at `(t0, pos0)` along `dir` meets the static table, or runs out of range.
+fn static_stop(t0: f64, pos0: V3, dir: V3) -> PulseEnd {
+    let mut best = (LASER_RANGE, Target::Nothing);
+    let felt = billiards::TABLE_Y as f64;
+    if dir[1] != 0.0 {
+        let s = (felt - pos0[1]) / dir[1];
+        let half = billiards::FELT_HALF_SIZE as f64;
+        let on_felt = |s: f64| (pos0[0] + dir[0] * s).abs() <= half && (pos0[2] + dir[2] * s).abs() <= half;
+        if s >= 0.0 && s < best.0 && on_felt(s) {
+            best = (s, Target::Table);
+        }
+    }
+    for (center, he) in billiards::rail_boxes() {
+        let (c, h) = ([center.x, center.y, center.z], [he.x, he.y, he.z]);
+        if let Some(s) = ray_box(pos0, dir, c.map(f64::from), h.map(f64::from)) {
+            if s < best.0 {
+                best = (s, Target::Table);
+            }
+        }
+    }
+    let (s, target) = best;
+    PulseEnd { t: t0 + s, pos: [0, 1, 2].map(|c| pos0[c] + dir[c] * s), target }
+}
+
+/// Distance along the ray from `o` along unit `dir` to the box at `center` with half extents
+/// `he` (0 from inside), if it meets it.
+fn ray_box(o: V3, dir: V3, center: V3, he: V3) -> Option<f64> {
+    let (mut near, mut far) = (0.0f64, f64::INFINITY);
+    for c in 0..3 {
+        let (lo, hi) = (center[c] - he[c] - o[c], center[c] + he[c] - o[c]);
+        if dir[c] == 0.0 {
+            if lo > 0.0 || hi < 0.0 {
+                return None;
+            }
+            continue;
+        }
+        let (a, b) = (lo / dir[c], hi / dir[c]);
+        near = near.max(a.min(b));
+        far = far.min(a.max(b));
+    }
+    (near <= far).then_some(near)
+}
+
+/// A thin box along `dir`, centered on the origin.
+fn rod_mesh(dir: V3) -> Mesh3D {
+    let d = Vec3::new(dir[0] as f32, dir[1] as f32, dir[2] as f32).normalized();
+    let up = if d.y.abs() < 0.9 { Vec3::new(0.0, 1.0, 0.0) } else { Vec3::new(1.0, 0.0, 0.0) };
+    let a = up.cross(d).normalized();
+    let b = d.cross(a);
+    let to_lab = |v: Vec3| a * v.x + b * v.y + d * v.z;
+    let mut rod = Mesh3D::cube(Vec3::new(PULSE_HALF_WIDTH, PULSE_HALF_WIDTH, 0.5 * PULSE_LENGTH));
+    for v in &mut rod.vertices {
+        *v = to_lab(*v);
+    }
+    for tri in &mut rod.triangles {
+        tri.normal = to_lab(tri.normal);
+    }
+    rod
+}
+
+/// Whether news of `event` has reached an observer at `o`: it lies in `o`'s causal past.
+pub fn has_reached(event: Vec4, o: Vec4) -> bool {
+    let d = o - event;
+    d.t >= d.spatial().length()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pulse(pos0: V3, dir: V3) -> Pulse {
+        let at = Frontier { origin: Vec4::new(0.0, pos0[0] as f32, pos0[1] as f32, pos0[2] as f32), proper_time: 0.0 };
+        Pulse::new(0, 0, at, dir, 0.0, 0.0)
+    }
+
+    #[test]
+    fn pulses_stop_at_the_felt_and_rails_or_run_out_of_range() {
+        // Straight down from above the table.
+        let p = pulse([0.0, 0.0, 5.0], [0.0, -1.0, 0.0]);
+        assert_eq!(p.stop.target, Target::Table);
+        assert!((p.stop.t - 2.2).abs() < 1e-6, "{:?}", p.stop);
+        // Along the table at rail height: the far rail.
+        let p = pulse([0.0, -2.0, 5.0], [0.0, 0.0, 1.0]);
+        assert_eq!(p.stop.target, Target::Table);
+        assert!((p.stop.pos[2] - billiards::Z_MAX).abs() < 1e-6, "{:?}", p.stop);
+        // Up and away.
+        let p = pulse([0.0, 0.0, 5.0], [0.0, 1.0, 0.0]);
+        assert_eq!(p.stop.target, Target::Nothing);
+        assert_eq!(p.stop.t, LASER_RANGE);
+    }
+
+    #[test]
+    fn the_head_meets_a_moving_sphere_where_they_touch() {
+        let p = pulse([0.0; 3], [1.0, 0.0, 0.0]);
+        // A sphere of radius 0.5 crossing the pulse's path, centered on it at t = 10.
+        let t = p.sweep(9.0, 11.0, [10.0, -0.5, 0.0], [10.0, 0.5, 0.0], 0.5).unwrap();
+        // |(t, 0) - (10, 0.5 (t - 10))| = 0.5 at t = 10 - 0.5 / sqrt(1.25).
+        assert!((t - (10.0 - 0.5 / 1.25f64.sqrt())).abs() < 1e-9, "{t}");
+        // Out of reach, or behind: no hit.
+        assert_eq!(p.sweep(9.0, 11.0, [10.0, 2.0, 0.0], [10.0, 2.0, 0.0], 0.5), None);
+        assert_eq!(p.sweep(9.0, 11.0, [5.0, 0.0, 0.0], [5.0, 0.0, 0.0], 0.5), None);
+    }
+
+    #[test]
+    fn the_rod_points_along_the_pulse() {
+        let dir = [0.6, 0.0, 0.8];
+        let rod = rod_mesh(dir);
+        let along = |v: &Vec3| v.x * 0.6 + v.z * 0.8;
+        let len = rod.vertices.iter().map(along).fold(f32::MIN, f32::max) * 2.0;
+        assert!((len - PULSE_LENGTH).abs() < 1e-5);
+        for v in &rod.vertices {
+            let across = (*v - Vec3::new(0.6, 0.0, 0.8) * along(v)).length();
+            assert!(across < 2.0 * PULSE_HALF_WIDTH);
+        }
+    }
+}

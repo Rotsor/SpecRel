@@ -75,6 +75,35 @@ pub fn draw_banner(fb: &mut [u32], fb_w: usize, fb_h: usize, text: &str) {
     draw_text_scaled(fb, fb_w, fb_h, x, y0 + pad_y, text, 0xFFE866, scale);
 }
 
+/// Color of the aiming reticle (the laser's orange-red).
+pub const RETICLE_COLOR: u32 = 0xFF6A30;
+
+/// Whether pixel `(x, y)` of a `fb_w x fb_h` framebuffer belongs to the aiming reticle at the
+/// screen's center: four short arms around an open middle, so the target stays visible. The
+/// web blit shader draws the same shape (`web/index.html`).
+pub fn is_reticle_pixel(fb_w: usize, fb_h: usize, x: usize, y: usize) -> bool {
+    let s = (fb_w / HUD_BASE_WIDTH).max(1) as i64;
+    let (gap, len) = (6 * s, 10 * s);
+    let dx = (x as i64 - (fb_w / 2) as i64).abs();
+    let dy = (y as i64 - (fb_h / 2) as i64).abs();
+    let arm = |along: i64, across: i64| across <= s && along >= gap && along < gap + len;
+    arm(dx, dy) || arm(dy, dx)
+}
+
+/// Draw the aiming reticle (see [`is_reticle_pixel`]) onto a framebuffer. Drawn whether or not
+/// the HUD is shown.
+pub fn draw_reticle(fb: &mut [u32], fb_w: usize, fb_h: usize) {
+    let r = 16 * (fb_w / HUD_BASE_WIDTH).max(1);
+    let (cx, cy) = (fb_w / 2, fb_h / 2);
+    for y in cy.saturating_sub(r)..(cy + r).min(fb_h) {
+        for x in cx.saturating_sub(r)..(cx + r).min(fb_w) {
+            if is_reticle_pixel(fb_w, fb_h, x, y) {
+                fb[y * fb_w + x] = RETICLE_COLOR;
+            }
+        }
+    }
+}
+
 fn fill_rect_solid(
     fb: &mut [u32],
     fb_w: usize,
@@ -99,6 +128,7 @@ pub fn draw_hud(
     fb: &mut [u32],
     demo: DemoScene,
     desc: &str,
+    score: Option<&str>,
     net: Option<&str>,
     camera: &Camera4D,
     cfg: &RenderConfig,
@@ -118,6 +148,7 @@ pub fn draw_hud(
         0,
         demo,
         desc,
+        score,
         net,
         camera,
         cfg,
@@ -136,6 +167,7 @@ pub fn draw_hud_overlay(
     overlay: &mut [u32],
     demo: DemoScene,
     desc: &str,
+    score: Option<&str>,
     net: Option<&str>,
     camera: &Camera4D,
     cfg: &RenderConfig,
@@ -165,6 +197,7 @@ pub fn draw_hud_overlay(
         0xFF00_0000,
         demo,
         desc,
+        score,
         net,
         camera,
         cfg,
@@ -184,6 +217,7 @@ fn draw_hud_lines(
     alpha_mask: u32,
     demo: DemoScene,
     desc: &str,
+    score: Option<&str>,
     net: Option<&str>,
     camera: &Camera4D,
     cfg: &RenderConfig,
@@ -240,6 +274,12 @@ fn draw_hud_lines(
 
     let text_scale = 2 * s;
     draw_text_scaled(fb, fb_w, fb_h, 22 * s, 22 * s, &line_scene, alpha_mask | 0xFF9944, text_scale);
+    if let Some(score) = score {
+        // Right-aligned in the box, in the laser's color.
+        let box_right = 12 * s + (fb_w - 24 * s).min(1240 * s);
+        let x = box_right.saturating_sub(10 * s + score.chars().count() * 6 * text_scale);
+        draw_text_scaled(fb, fb_w, fb_h, x, 22 * s, score, alpha_mask | RETICLE_COLOR, text_scale);
+    }
     draw_text_scaled(fb, fb_w, fb_h, 22 * s, 46 * s, desc, alpha_mask | 0xFFD980, text_scale);
     draw_text_scaled(fb, fb_w, fb_h, 22 * s, 74 * s, &line1, alpha_mask | 0xFFE866, text_scale);
     draw_text_scaled(fb, fb_w, fb_h, 22 * s, 98 * s, &line2, alpha_mask | 0x66F2FF, text_scale);

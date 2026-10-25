@@ -226,6 +226,9 @@ pub const MAX_HAZE_ORIGINS: usize = MAX_REMOTE_FRONTIERS + 1;
 /// beyond the renderers' maximum ray length, nothing they light can be seen any more.
 pub const FLASH_MAX_RADIUS: f32 = 200.0;
 
+/// Color of the flash a laser hit lights.
+pub const HIT_FLASH_COLOR: Vec3 = Vec3::new(1.0, 0.35, 0.12);
+
 impl FrameDynamics {
     /// Proper-time offset of the Frontier view's ray origin behind the camera event.
     pub fn frontier_view_offset(&self) -> f32 {
@@ -268,15 +271,29 @@ impl FrameDynamics {
 
     /// Emit the player's light flash at event `at`, evicting the oldest if all slots are full.
     pub fn emit_flash(&mut self, at: Vec4) {
-        if self.flashes.len() >= MAX_FLASHES {
-            self.flashes.remove(0);
-        }
-        self.flashes.push(FlashEvent {
+        self.push_flash(FlashEvent {
             at,
             width: 0.8,
             intensity: 2.5,
             color: Vec3::new(1.0, 0.9, 0.7),
         });
+    }
+
+    /// A laser hit on a ship's hull at `at`: a short orange-red flash.
+    pub fn emit_hit_flash(&mut self, at: Vec4) {
+        self.push_flash(FlashEvent {
+            at,
+            width: 0.5,
+            intensity: 3.0,
+            color: HIT_FLASH_COLOR,
+        });
+    }
+
+    fn push_flash(&mut self, flash: FlashEvent) {
+        if self.flashes.len() >= MAX_FLASHES {
+            self.flashes.remove(0);
+        }
+        self.flashes.push(flash);
     }
 
     /// Drop flashes whose shell has expanded beyond [`FLASH_MAX_RADIUS`] by lab time `now_t`.

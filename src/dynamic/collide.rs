@@ -83,42 +83,6 @@ pub fn elastic(m_a: f64, v_a: V3, m_b: f64, v_b: V3, separation: V3) -> Option<(
     Some((mass_and_velocity(pa_new).1, mass_and_velocity(pb_new).1))
 }
 
-/// Two bodies stick together: the merged body carries the total 4-momentum, so its rest mass
-/// exceeds `m_a + m_b` by the kinetic energy dissipated in the CM frame.
-pub fn merge(parts: &[(f64, V3)]) -> (f64, V3) {
-    let total = parts
-        .iter()
-        .fold([0.0; 4], |acc, &(m, v)| add(acc, momentum(m, v)));
-    mass_and_velocity(total)
-}
-
-/// Perfectly inelastic contact between two bodies that stay separate: both end up moving at
-/// the CM velocity `P / E`, and the dissipated kinetic energy heats them in proportion to their
-/// rest masses: body `i` gets the share `m_i / (m_a + m_b)` of the total 4-momentum `P`, so its
-/// rest mass grows by the same factor `M / (m_a + m_b)` as the merged body of [`merge`].
-/// Returns each body's 4-momentum change.
-pub fn stick(m_a: f64, v_a: V3, m_b: f64, v_b: V3) -> (P4, P4) {
-    let (pa, pb) = (momentum(m_a, v_a), momentum(m_b, v_b));
-    let total = add(pa, pb);
-    let share = |m: f64| total.map(|c| c * m / (m_a + m_b));
-    (sub(share(m_a), pa), sub(share(m_b), pb))
-}
-
-/// A body of rest mass `m` moving at `v` splits into two equal fragments flying apart at
-/// `speed` along `dir_rest` (a unit vector in the parent's rest frame). Each fragment's energy
-/// in that frame is `m / 2`, so its rest mass is `m / (2 gamma(speed))`.
-pub fn decay(m: f64, v: V3, dir_rest: V3, speed: f64) -> [(f64, V3); 2] {
-    let g = 1.0 / (1.0 - speed * speed).sqrt();
-    let m_child = m / (2.0 * g);
-    let to_lab = v.map(|x| -x);
-    [1.0, -1.0].map(|sign| {
-        let u = dir_rest.map(|d| sign * speed * d);
-        let p = boost(momentum(m_child, u), to_lab);
-        (m_child, mass_and_velocity(p).1)
-    })
-}
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,36 +112,5 @@ mod tests {
         }
         // Already separating: no collision.
         assert!(elastic(1.0, [-0.3, 0.0, 0.0], 1.0, [0.0; 3], [0.7, 0.0, 0.0]).is_none());
-    }
-
-    #[test]
-    fn merging_turns_kinetic_energy_into_rest_mass() {
-        let parts = [(1.0, [0.6, 0.0, 0.0]), (1.0, [0.0, 0.0, 0.0])];
-        let (m, v) = merge(&parts);
-        assert!(m > 2.1, "merged rest mass {m}"); // E = 2.25, p = 0.75 => M = 2.121
-        let total = add(momentum(1.0, parts[0].1), momentum(1.0, parts[1].1));
-        assert_p4_eq(momentum(m, v), total, 1e-9);
-    }
-
-    #[test]
-    fn sticking_conserves_four_momentum_and_comoves() {
-        let (ma, va, mb, vb) = (1.0, [0.6, 0.0, 0.1], 2.0, [-0.1, 0.0, 0.0]);
-        let (dpa, dpb) = stick(ma, va, mb, vb);
-        assert_p4_eq(add(dpa, dpb), [0.0; 4], 1e-12);
-        let (m1, v1) = mass_and_velocity(add(momentum(ma, va), dpa));
-        let (m2, v2) = mass_and_velocity(add(momentum(mb, vb), dpb));
-        for c in 0..3 {
-            assert!((v1[c] - v2[c]).abs() < 1e-12);
-        }
-        let (merged, _) = merge(&[(ma, va), (mb, vb)]);
-        assert!((m1 + m2 - merged).abs() < 1e-12 && merged > ma + mb);
-    }
-
-    #[test]
-    fn decay_conserves_four_momentum() {
-        let (m, v) = (1.0, [0.6, 0.0, 0.2]);
-        let [(m1, v1), (m2, v2)] = decay(m, v, [0.0, 0.0, 1.0], 0.5);
-        assert!((m1 - m2).abs() < 1e-12 && m1 < m / 2.0);
-        assert_p4_eq(add(momentum(m1, v1), momentum(m2, v2)), momentum(m, v), 1e-9);
     }
 }

@@ -338,8 +338,7 @@
       <button data-key="8"><kbd>[M]</kbd>Render Mode</button>
       <button data-key="10"><kbd>[H]</kbd>Shadow Mode</button>
       <button data-key="21"><kbd>[/]</kbd>Light Flash</button>
-      <button data-key="25"><kbd>[Enter]</kbd>Fire</button>
-      <button data-key="26"><kbd>[\]</kbd>Ammo</button>
+      <button data-key="25"><kbd>[Enter]</kbd>Fire Laser</button>
       <button data-key="23"><kbd>[PgDn]</kbd>Prophecy &minus;&Delta;</button>
       <button data-key="22"><kbd>[PgUp]</kbd>Prophecy +&Delta;</button>
       <button data-hold="121"><kbd>[V]</kbd>Match Velocity</button>
@@ -379,7 +378,8 @@
 
   <script type="module">
     // Fullscreen WGSL blit shader that composites the compute shader's packed 0x00RRGGBB
-    // scene output buffer and the 1X HUD overlay buffer directly onto the WebGPU canvas.
+    // scene output buffer, the aiming reticle and the 1X HUD overlay buffer directly onto the
+    // WebGPU canvas.
     const BLIT_WGSL = /* wgsl */`
       struct BlitParams {
         width: u32,
@@ -388,9 +388,21 @@
         hud_height: u32,
         hud_scale: u32,
         show_hud: u32,
-        _pad0: u32,
+        show_reticle: u32,
         _pad1: u32,
       };
+
+      // The same shape as hud::is_reticle_pixel (src/hud.rs).
+      fn is_reticle_pixel(x: u32, y: u32) -> bool {
+        let s = i32(max(params.width / 1280u, 1u));
+        let gap = 6 * s;
+        let len = 10 * s;
+        let dx = abs(i32(x) - i32(params.width / 2u));
+        let dy = abs(i32(y) - i32(params.height / 2u));
+        let h = dy <= s && dx >= gap && dx < gap + len;
+        let v = dx <= s && dy >= gap && dy < gap + len;
+        return h || v;
+      }
 
       @group(0) @binding(0) var<uniform> params: BlitParams;
       @group(0) @binding(1) var<storage, read> scene_pixels: array<u32>;
@@ -419,6 +431,12 @@
         var r = (raw >> 16u) & 0xFFu;
         var g = (raw >> 8u) & 0xFFu;
         var b = raw & 0xFFu;
+
+        if params.show_reticle != 0u && is_reticle_pixel(px, py) {
+          r = 0xFFu;
+          g = 0x6Au;
+          b = 0x30u;
+        }
 
         if params.show_hud != 0u {
           let s = max(params.hud_scale, 1u);
@@ -454,7 +472,6 @@
       Digit5: 5, Numpad5: 5,
       Digit6: 24, Numpad6: 24,
       Enter: 25, NumpadEnter: 25,
-      Backslash: 26, IntlBackslash: 26,
       Semicolon: 19,
       KeyN: 6,
       KeyB: 7,
@@ -1259,7 +1276,7 @@
               wasm.web_hud_height(),
               resScale,
               showHud,
-              0,
+              wasm.web_show_reticle(),
               0,
             ]);
             g.device.queue.writeBuffer(g.blitParamsBuf, 0, blitParams);

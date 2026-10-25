@@ -14,7 +14,7 @@
 use crate::app::{Action, App, HeldInput};
 use crate::gpu::{build_tables_data, GpuUniforms, PackedSceneGpuData, RENDER_WGSL};
 use crate::dynamic::PlayerId;
-use crate::hud::{draw_hud, draw_hud_overlay, HUD_BASE_WIDTH, HUD_OVERLAY_HEIGHT};
+use crate::hud::{draw_hud, draw_hud_overlay, draw_reticle, HUD_BASE_WIDTH, HUD_OVERLAY_HEIGHT};
 use crate::multiplayer::link::{LinkState, QueueLink, QueueLinkHandle};
 use crate::renderer::render_frame;
 use crate::scene::{DemoScene, Scene4D};
@@ -47,7 +47,6 @@ pub const KEY_PAGE_UP: u32 = 22;
 pub const KEY_PAGE_DOWN: u32 = 23;
 pub const KEY_6: u32 = 24;
 pub const KEY_ENTER: u32 = 25;
-pub const KEY_BACKSLASH: u32 = 26;
 pub const KEY_SEMICOLON: u32 = 19;
 
 // Continuous held-key bitflags (100 + bit index)
@@ -82,7 +81,6 @@ fn key_action(code: u32) -> Option<Action> {
         KEY_1..=KEY_5 => Action::SelectScene((code - KEY_1) as usize),
         KEY_6 => Action::SelectScene(5),
         KEY_ENTER => Action::Fire,
-        KEY_BACKSLASH => Action::CycleAmmo,
         KEY_SEMICOLON => Action::CycleControls,
         KEY_N => Action::NextScene,
         KEY_B => Action::PrevScene,
@@ -325,6 +323,7 @@ pub extern "C" fn web_step(dt_secs: f32) {
         };
         let demo = app.scene().demo;
         let desc = app.scene_description();
+        let score = app.scoreboard();
         let net = app.net_metrics();
 
         if s.gpu_available && s.use_gpu {
@@ -333,6 +332,7 @@ pub extern "C" fn web_step(dt_secs: f32) {
                     &mut s.hud_overlay,
                     demo,
                     &desc,
+                    score.as_deref(),
                     net.as_deref(),
                     &app.camera,
                     &app.cfg,
@@ -356,6 +356,7 @@ pub extern "C" fn web_step(dt_secs: f32) {
                         &mut s.hud_overlay,
                         demo,
                         &desc,
+                        score.as_deref(),
                         net.as_deref(),
                         &app.camera,
                         &app.cfg,
@@ -366,12 +367,17 @@ pub extern "C" fn web_step(dt_secs: f32) {
                     );
                 }
             } else {
-                // Canvas2D fallback: bake HUD directly into `cpu_fb` and swizzle to RGBA bytes.
+                // Canvas2D fallback: bake the reticle and HUD directly into `cpu_fb` and
+                // swizzle to RGBA bytes.
+                if app.is_dynamic() {
+                    draw_reticle(&mut s.cpu_fb, app.cfg.width, app.cfg.height);
+                }
                 if s.show_hud {
                     draw_hud(
                         &mut s.cpu_fb,
                         demo,
                         &desc,
+                        score.as_deref(),
                         net.as_deref(),
                         &app.camera,
                         &app.cfg,
@@ -498,6 +504,12 @@ pub extern "C" fn web_use_gpu() -> u32 {
 #[no_mangle]
 pub extern "C" fn web_show_hud() -> u32 {
     with_state(|s| u32::from(s.show_hud))
+}
+
+/// Whether the blit shader draws the aiming reticle (Dynamic Mode).
+#[no_mangle]
+pub extern "C" fn web_show_reticle() -> u32 {
+    with_state(|s| u32::from(s.app.is_dynamic()))
 }
 
 #[no_mangle]

@@ -3,18 +3,17 @@
 
 use std::fmt;
 
-use crate::dynamic::billiards::Ammo;
 use crate::dynamic::helm::ControlMode;
 use crate::dynamic::{PlayerId, ShipSample};
 use crate::minkowski::Vec4;
 use crate::renderer::Frontier;
 
 /// Bumped whenever the encoding or the meaning of a message changes.
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 
 const TAG_HELLO: u8 = 0;
 const TAG_TRACK: u8 = 1;
-const TAG_FIRE: u8 = 2;
+const TAG_LASER: u8 = 2;
 const TAG_FLASH: u8 = 3;
 const TAG_BYE: u8 = 4;
 const TAG_PING: u8 = 5;
@@ -29,8 +28,8 @@ pub enum Message {
     /// The sender's pilot reached `sample`; also a heartbeat while `waiting`. Their hull follows
     /// from their pilot's track: each replica computes it.
     Track { sample: ShipSample, waiting: bool },
-    /// The sender fired at event `at` with lab velocity `vel`.
-    Fire { at: Frontier, vel: [f64; 3], ammo: Ammo },
+    /// The sender fired a laser pulse at event `at` along the lab direction `dir`.
+    Laser { at: Frontier, dir: [f64; 3] },
     /// The sender emitted a light flash at `at`.
     Flash { at: Vec4 },
     /// The sender quits.
@@ -51,8 +50,8 @@ impl PartialEq for Message {
             (Hello { version: a, player: p }, Hello { version: b, player: q }) => a == b && p == q,
             (Track { sample: a, waiting: w }, Track { sample: b, waiting: v }) => a == b && w == v,
             (Controls { controls: a }, Controls { controls: b }) => a == b,
-            (Fire { at: a, vel: v, ammo: m }, Fire { at: b, vel: w, ammo: n }) => {
-                a.origin == b.origin && a.proper_time == b.proper_time && v == w && m == n
+            (Laser { at: a, dir: v }, Laser { at: b, dir: w }) => {
+                a.origin == b.origin && a.proper_time == b.proper_time && v == w
             }
             (Flash { at: a }, Flash { at: b }) => a == b,
             (Bye, Bye) => true,
@@ -67,7 +66,6 @@ impl PartialEq for Message {
 pub enum DecodeError {
     Truncated,
     UnknownTag(u8),
-    BadAmmo(u8),
     BadControls(u8),
     TrailingBytes,
 }
@@ -77,7 +75,6 @@ impl fmt::Display for DecodeError {
         match self {
             Self::Truncated => write!(f, "truncated message"),
             Self::UnknownTag(t) => write!(f, "unknown message tag {t}"),
-            Self::BadAmmo(a) => write!(f, "unknown ammo {a}"),
             Self::BadControls(c) => write!(f, "unknown controls {c}"),
             Self::TrailingBytes => write!(f, "trailing bytes after message"),
         }
@@ -101,12 +98,11 @@ impl Message {
                 put_f64s(out, &[sample.tau]);
                 out.push(*waiting as u8);
             }
-            Self::Fire { at, vel, ammo } => {
-                out.push(TAG_FIRE);
+            Self::Laser { at, dir } => {
+                out.push(TAG_LASER);
                 put_vec4(out, at.origin);
                 out.extend_from_slice(&at.proper_time.to_le_bytes());
-                put_f64s(out, vel);
-                out.push(ammo_code(*ammo));
+                put_f64s(out, dir);
             }
             Self::Flash { at } => {
                 out.push(TAG_FLASH);
@@ -140,16 +136,9 @@ impl Message {
                 let sample = r.ship_sample()?;
                 Self::Track { sample, waiting: r.u8()? != 0 }
             }
-            TAG_FIRE => {
+            TAG_LASER => {
                 let at = Frontier { origin: r.vec4()?, proper_time: r.f32()? };
-                let vel = r.v3()?;
-                let ammo = match r.u8()? {
-                    0 => Ammo::Puck,
-                    1 => Ammo::Sticky,
-                    2 => Ammo::Spore,
-                    a => return Err(DecodeError::BadAmmo(a)),
-                };
-                Self::Fire { at, vel, ammo }
+                Self::Laser { at, dir: r.v3()? }
             }
             TAG_FLASH => Self::Flash { at: r.vec4()? },
             TAG_BYE => Self::Bye,
@@ -169,14 +158,6 @@ impl Message {
             return Err(DecodeError::TrailingBytes);
         }
         Ok(msg)
-    }
-}
-
-fn ammo_code(ammo: Ammo) -> u8 {
-    match ammo {
-        Ammo::Puck => 0,
-        Ammo::Sticky => 1,
-        Ammo::Spore => 2,
     }
 }
 
@@ -251,9 +232,8 @@ mod tests {
             Message::Hello { version: u16::MAX, player: 255 },
             Message::Track { sample, waiting: false },
             Message::Track { sample, waiting: true },
-            Message::Fire { at, vel: [0.1, -0.2, f64::EPSILON], ammo: Ammo::Puck },
-            Message::Fire { at, vel: [0.0; 3], ammo: Ammo::Sticky },
-            Message::Fire { at, vel: [-0.0; 3], ammo: Ammo::Spore },
+            Message::Laser { at, dir: [0.1, -0.2, f64::EPSILON] },
+            Message::Laser { at, dir: [-0.0; 3] },
             Message::Flash { at: Vec4::new(1.0e9, -0.0, f32::MIN_POSITIVE, -2.5) },
             Message::Bye,
             Message::Ping { sent: 12.5 },
@@ -305,8 +285,8 @@ mod tests {
         assert_eq!(Message::decode(&[200]), Err(DecodeError::UnknownTag(200)));
         assert_eq!(Message::decode(&[TAG_BYE, 0]), Err(DecodeError::TrailingBytes));
         let mut bytes = encoded(&samples()[4]);
-        *bytes.last_mut().unwrap() = 3;
-        assert_eq!(Message::decode(&bytes), Err(DecodeError::BadAmmo(3)));
+        bytes.push(0);
+        assert_eq!(Message::decode(&bytes), Err(DecodeError::TrailingBytes));
         assert_eq!(Message::decode(&[TAG_CONTROLS, 2]), Err(DecodeError::BadControls(2)));
         assert_eq!(DecodeError::UnknownTag(9).to_string(), "unknown message tag 9");
     }

@@ -6,7 +6,7 @@ use super::link::Link;
 use super::pacing::{self, Pacer};
 use super::protocol::Message;
 use super::session::{Event, Session};
-use crate::dynamic::billiards::{self, Ammo};
+use crate::dynamic::billiards;
 use crate::dynamic::collide::V3;
 use crate::dynamic::helm::ControlMode;
 use crate::dynamic::{DynWorld, PlayerId, ShipSample};
@@ -90,7 +90,7 @@ impl Match {
     }
 
     /// Apply everything the other player did since the last call, in order: their ship's
-    /// track and shots to `world`, their flashes to `dynamics`. Returns whether the world
+    /// track and laser shots to `world`, their flashes to `dynamics`. Returns whether the world
     /// changed (it still needs [`DynWorld::extend`]).
     pub fn receive(&mut self, world: &mut DynWorld, dynamics: &mut FrameDynamics) -> bool {
         let mut changed = false;
@@ -106,8 +106,8 @@ impl Match {
                     self.remote_waiting = waiting;
                     changed = true;
                 }
-                Event::Fire { at, vel, ammo } => {
-                    world.launch(self.remote, at, vel, ammo);
+                Event::Laser { at, dir } => {
+                    world.fire_laser(self.remote, at, dir);
                     changed = true;
                 }
                 Event::Flash(at) => dynamics.emit_flash(at),
@@ -171,8 +171,8 @@ impl Match {
         self.session.send(&Message::Controls { controls });
     }
 
-    pub fn send_fire(&mut self, at: Frontier, vel: V3, ammo: Ammo) {
-        self.session.send(&Message::Fire { at, vel, ammo });
+    pub fn send_laser(&mut self, at: Frontier, dir: V3) {
+        self.session.send(&Message::Laser { at, dir });
     }
 
     pub fn send_flash(&mut self, at: Vec4) {

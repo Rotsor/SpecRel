@@ -83,7 +83,7 @@ impl DemoScene {
                 "CENTER=MASTER CLOCK (V=0). RING=6 CLOCKS ORBITING AT 0.80C (GAMMA=1.67) + LIGHT CLOCK!"
             }
             Self::RelativisticBilliards => {
-                "RAM PUCKS WITH THE SHIP. [G] FRONTIER/PROPHECY, [M] DECISION AGE"
+                "AIM WITH THE RETICLE. [G] FRONTIER/PROPHECY, [M] DECISION AGE"
             }
         }
     }
@@ -250,32 +250,15 @@ impl Scene4D {
                 2.0,
                 0.030,
             ),
-            // 9: Merged puck: kinetic energy turned into rest mass (incandescent gold/orange glow)
+            // 9: Laser pulse: self-luminous orange-red light (`dynamic::laser::MATERIAL_PULSE`)
             Material::new(
-                Vec3::new(1.00, 0.82, 0.22),
-                Vec3::new(0.98, 0.35, 0.10),
-                0.55,
-                2.0,
-                0.035,
-            ),
-            // 10: Sticky (inelastic) puck (magenta & plum checkerboard)
-            Material::new(
-                Vec3::new(0.95, 0.25, 0.72),
-                Vec3::new(0.42, 0.10, 0.35),
-                0.30,
-                2.0,
-                0.030,
-            ),
-            // 11: Spore: clock face counting its own proper time down to the decay (lime bezel)
-            Material::new(
-                Vec3::new(0.55, 1.00, 0.25),
-                Vec3::new(0.12, 0.40, 0.10),
-                0.30,
+                Vec3::new(1.00, 0.10, 0.025),
+                Vec3::new(1.00, 0.10, 0.025),
+                1.20,
                 1.0,
-                0.025,
-            )
-            .with_pattern(SurfacePattern::ClockFace),
-            // 12-15: Ship hull cages, in the colors of clock bezels 1-4
+                0.0,
+            ),
+            // 10-13: Ship hull cages, in the colors of clock bezels 1-4
             Self::hull_material(Vec3::new(0.20, 0.72, 0.95)),
             Self::hull_material(Vec3::new(0.96, 0.32, 0.24)),
             Self::hull_material(Vec3::new(0.96, 0.78, 0.20)),
