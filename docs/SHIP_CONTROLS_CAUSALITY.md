@@ -160,8 +160,9 @@ ship; shrinking the ship is the lever for less lag, as the tables above show.
 **Every ship has two tracks** (`Ship::track`, `Ship::hull`). The pilot's track is the camera: it
 bounds the frontier, and shots and flashes leave from it. The hull centre's track, at the same lab
 times, is what bodies collide with (`Ship::hull_at`). `Ship::seen_from` is gone: the hull moves
-causally, so contacts use the rigid hull as it is. Kicks reach the hull once their news has
-crossed it, as before.
+causally, so contacts use the rigid hull as it is. Only the pilot's track is input and travels
+over the network; every replica derives the hull's track from it as it records each sample
+(`Ship::record`). A `Controls` message tells the other replica which mode a ship flies.
 
 **Option A (`ControlMode::Delayed`, the default).** The camera is the hull's centre, and the two
 tracks coincide. Each frame's thrust or steering becomes an `Order` stamped with the ship's clock
@@ -182,7 +183,9 @@ matters: without it the hull steered by bounces it heard of a second late, overs
 rattled between the walls with growing amplitude. With it, bursts, reversals and coasting all
 settle (`station_keeping_settles_after_any_burst`); the pod peaks about 0.2 off centre. A pod that
 outruns the hull hits the inner wall at `POD_RANGE` and loses its outward speed relative to the
-hull (`WALL_RESTITUTION` = 0). The hull ignores the push: it is much heavier.
+hull (`WALL_RESTITUTION` = 0). The hull ignores the push: it is much heavier. Collisions with
+pucks don't push a pod's hull either (the puck still bounces off it), so the hull's motion depends
+on its pilot's track alone. With delayed controls, kicks still reach the camera as before.
 
 Two corrections to the sketch above:
 
@@ -190,9 +193,11 @@ Two corrections to the sketch above:
   `ln((1 + a s) / (1 − a R)) / a` of the centre's time, not the Option A formula at `R + s`
   (which would put the rear past the horizon here). With `s` = 0.2 that is `pod_delay()` = 0.97 s
   (`signal_delay`, checked against the Rindler worldlines in a test).
-* **The protocol changes.** Instead of each replica recomputing the hull from the pod's track (which
-  would need bit-identical `f32` transcendental functions on every platform), the owner sends both
-  samples in each `Track` message (protocol version 3).
+* **Bit-identical replicas.** Each replica computes every hull, so the hull's integration uses
+  only arithmetic and `sqrt` (a first-order boost step rather than `cosh`/`sinh`), and the delays
+  and the pod's acceleration are literals checked against their formulas in a test, rather than
+  calls to a platform's `ln`. A test checks that the other player's replica computes the same hull
+  track bit for bit.
 
 **Seeing the decision centre.** Other players' ships are drawn as an open cage of bars along the
 hull track (`Ship::hull_mesh`, materials 12–15 in the player's colour), with the pilot's clock cube

@@ -9,6 +9,7 @@
 use super::link::{Link, LinkState};
 use super::protocol::{Message, PROTOCOL_VERSION};
 use crate::dynamic::billiards::Ammo;
+use crate::dynamic::helm::ControlMode;
 use crate::dynamic::{PlayerId, ShipSample};
 use crate::minkowski::Vec4;
 use crate::renderer::Frontier;
@@ -18,7 +19,9 @@ use crate::renderer::Frontier;
 pub enum Event {
     /// The peer said hello with a compatible protocol.
     Joined(PlayerId),
-    Track { sample: ShipSample, hull: ShipSample, waiting: bool },
+    Track { sample: ShipSample, waiting: bool },
+    /// The peer flies with `controls`.
+    Controls(ControlMode),
     Fire { at: Frontier, vel: [f64; 3], ammo: Ammo },
     Flash(Vec4),
     /// The peer probes the round trip; answer with `Message::Pong { sent }`.
@@ -154,7 +157,8 @@ impl Session {
                 events.push(Event::Joined(player));
             }
             _ if !self.joined => events.push(Event::Error(format!("{msg:?} before Hello"))),
-            Message::Track { sample, hull, waiting } => events.push(Event::Track { sample, hull, waiting }),
+            Message::Track { sample, waiting } => events.push(Event::Track { sample, waiting }),
+            Message::Controls { controls } => events.push(Event::Controls(controls)),
             Message::Fire { at, vel, ammo } => events.push(Event::Fire { at, vel, ammo }),
             Message::Flash { at } => events.push(Event::Flash(at)),
             Message::Ping { sent } => events.push(Event::Ping { sent }),
@@ -184,7 +188,7 @@ mod tests {
 
     fn track(i: u32) -> Message {
         let sample = ShipSample { t: i as f64, pos: [0.0; 3], vel: [0.0; 3], tau: i as f64 };
-        Message::Track { sample, hull: sample, waiting: false }
+        Message::Track { sample, waiting: false }
     }
 
     /// The `t` of every `Track`, `-1` for `Joined`; panics on anything else.

@@ -4,12 +4,13 @@
 use std::fmt;
 
 use crate::dynamic::billiards::Ammo;
+use crate::dynamic::helm::ControlMode;
 use crate::dynamic::{PlayerId, ShipSample};
 use crate::minkowski::Vec4;
 use crate::renderer::Frontier;
 
 /// Bumped whenever the encoding or the meaning of a message changes.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 const TAG_HELLO: u8 = 0;
 const TAG_TRACK: u8 = 1;
@@ -18,15 +19,16 @@ const TAG_FLASH: u8 = 3;
 const TAG_BYE: u8 = 4;
 const TAG_PING: u8 = 5;
 const TAG_PONG: u8 = 6;
+const TAG_CONTROLS: u8 = 7;
 
 /// One message from a peer.
 #[derive(Clone, Debug)]
 pub enum Message {
     /// First message of a session.
     Hello { version: u16, player: PlayerId },
-    /// The sender's pilot reached `sample`, with their hull's center at `hull` (at the same lab
-    /// time); also a heartbeat while `waiting`.
-    Track { sample: ShipSample, hull: ShipSample, waiting: bool },
+    /// The sender's pilot reached `sample`; also a heartbeat while `waiting`. Their hull follows
+    /// from their pilot's track: each replica computes it.
+    Track { sample: ShipSample, waiting: bool },
     /// The sender fired at event `at` with lab velocity `vel`.
     Fire { at: Frontier, vel: [f64; 3], ammo: Ammo },
     /// The sender emitted a light flash at `at`.
@@ -37,6 +39,8 @@ pub enum Message {
     Ping { sent: f64 },
     /// The answer to a `Ping`, echoing its stamp.
     Pong { sent: f64 },
+    /// The sender flies with `controls` (sent before their ship first moves).
+    Controls { controls: ControlMode },
 }
 
 // `Frontier` has no `PartialEq`, so compare its fields here.
@@ -45,9 +49,8 @@ impl PartialEq for Message {
         use Message::*;
         match (self, other) {
             (Hello { version: a, player: p }, Hello { version: b, player: q }) => a == b && p == q,
-            (Track { sample: a, hull: h, waiting: w }, Track { sample: b, hull: k, waiting: v }) => {
-                a == b && h == k && w == v
-            }
+            (Track { sample: a, waiting: w }, Track { sample: b, waiting: v }) => a == b && w == v,
+            (Controls { controls: a }, Controls { controls: b }) => a == b,
             (Fire { at: a, vel: v, ammo: m }, Fire { at: b, vel: w, ammo: n }) => {
                 a.origin == b.origin && a.proper_time == b.proper_time && v == w && m == n
             }
@@ -65,6 +68,7 @@ pub enum DecodeError {
     Truncated,
     UnknownTag(u8),
     BadAmmo(u8),
+    BadControls(u8),
     TrailingBytes,
 }
 
@@ -74,6 +78,7 @@ impl fmt::Display for DecodeError {
             Self::Truncated => write!(f, "truncated message"),
             Self::UnknownTag(t) => write!(f, "unknown message tag {t}"),
             Self::BadAmmo(a) => write!(f, "unknown ammo {a}"),
+            Self::BadControls(c) => write!(f, "unknown controls {c}"),
             Self::TrailingBytes => write!(f, "trailing bytes after message"),
         }
     }
@@ -88,14 +93,12 @@ impl Message {
                 out.extend_from_slice(&version.to_le_bytes());
                 out.push(*player);
             }
-            Self::Track { sample, hull, waiting } => {
+            Self::Track { sample, waiting } => {
                 out.push(TAG_TRACK);
-                for s in [sample, hull] {
-                    put_f64s(out, &[s.t]);
-                    put_f64s(out, &s.pos);
-                    put_f64s(out, &s.vel);
-                    put_f64s(out, &[s.tau]);
-                }
+                put_f64s(out, &[sample.t]);
+                put_f64s(out, &sample.pos);
+                put_f64s(out, &sample.vel);
+                put_f64s(out, &[sample.tau]);
                 out.push(*waiting as u8);
             }
             Self::Fire { at, vel, ammo } => {
@@ -118,6 +121,13 @@ impl Message {
                 out.push(TAG_PONG);
                 put_f64s(out, &[*sent]);
             }
+            Self::Controls { controls } => {
+                out.push(TAG_CONTROLS);
+                out.push(match controls {
+                    ControlMode::Delayed => 0,
+                    ControlMode::Pod => 1,
+                });
+            }
         }
     }
 
@@ -128,8 +138,7 @@ impl Message {
             TAG_HELLO => Self::Hello { version: r.u16()?, player: r.u8()? },
             TAG_TRACK => {
                 let sample = r.ship_sample()?;
-                let hull = r.ship_sample()?;
-                Self::Track { sample, hull, waiting: r.u8()? != 0 }
+                Self::Track { sample, waiting: r.u8()? != 0 }
             }
             TAG_FIRE => {
                 let at = Frontier { origin: r.vec4()?, proper_time: r.f32()? };
@@ -146,6 +155,14 @@ impl Message {
             TAG_BYE => Self::Bye,
             TAG_PING => Self::Ping { sent: r.f64()? },
             TAG_PONG => Self::Pong { sent: r.f64()? },
+            TAG_CONTROLS => {
+                let controls = match r.u8()? {
+                    0 => ControlMode::Delayed,
+                    1 => ControlMode::Pod,
+                    c => return Err(DecodeError::BadControls(c)),
+                };
+                Self::Controls { controls }
+            }
             t => return Err(DecodeError::UnknownTag(t)),
         };
         if !r.0.is_empty() {
@@ -232,8 +249,8 @@ mod tests {
         vec![
             Message::Hello { version: PROTOCOL_VERSION, player: 0 },
             Message::Hello { version: u16::MAX, player: 255 },
-            Message::Track { sample, hull: sample, waiting: false },
-            Message::Track { sample, hull: ShipSample { tau: -0.5, ..sample }, waiting: true },
+            Message::Track { sample, waiting: false },
+            Message::Track { sample, waiting: true },
             Message::Fire { at, vel: [0.1, -0.2, f64::EPSILON], ammo: Ammo::Puck },
             Message::Fire { at, vel: [0.0; 3], ammo: Ammo::Sticky },
             Message::Fire { at, vel: [-0.0; 3], ammo: Ammo::Spore },
@@ -241,6 +258,8 @@ mod tests {
             Message::Bye,
             Message::Ping { sent: 12.5 },
             Message::Pong { sent: -0.0 },
+            Message::Controls { controls: ControlMode::Delayed },
+            Message::Controls { controls: ControlMode::Pod },
         ]
     }
 
@@ -288,6 +307,7 @@ mod tests {
         let mut bytes = encoded(&samples()[4]);
         *bytes.last_mut().unwrap() = 3;
         assert_eq!(Message::decode(&bytes), Err(DecodeError::BadAmmo(3)));
+        assert_eq!(Message::decode(&[TAG_CONTROLS, 2]), Err(DecodeError::BadControls(2)));
         assert_eq!(DecodeError::UnknownTag(9).to_string(), "unknown message tag 9");
     }
 }

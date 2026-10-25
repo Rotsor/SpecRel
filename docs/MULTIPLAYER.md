@@ -52,12 +52,13 @@ is 80% of the bound. The cap is measured per second of the ship's own clock (`d_
 ship cannot boost at all) and in every direction (diagonal thrust is normalized). `X` (brake to
 the lab frame) and `V` (match velocity) do not jump: they boost toward the target for as long as
 the key is held. Releasing the key mid-brake leaves the ship coasting at whatever velocity it
-reached. Collision kicks stay instantaneous. They already reach the hull only once their news has
-crossed it. (These rules hold for single-player Dynamic Mode too.)
+reached. Collision kicks stay instantaneous. They already reach the camera only once their news
+has crossed the hull. (These rules hold for single-player Dynamic Mode too.)
 
 **The hull hears the controls at light speed.** A rigid hull may only act on a command once news
 of it has reached all of it (`docs/SHIP_CONTROLS_CAUSALITY.md`, `src/dynamic/helm.rs`). The
-player picks one of two ways with `;`, before the match starts:
+player picks one of two ways with `;`, before the match starts (a `Controls` message tells the
+other replica):
 
 * **Delayed controls** (option A, the default): the camera is the hull's centre, and every command
   executes `command_delay()` (0.80 s) of ship time after it was issued; the HUD says **SPOOLING**
@@ -67,8 +68,12 @@ player picks one of two ways with `;`, before the match starts:
   the pod, steering by what it learned of it `pod_delay()` (0.97 s) ago and replaying that against
   its own past (inner-wall bounces included), so it never acts on news that hasn't crossed it.
 
-Each ship therefore records two tracks: the pilot's (the camera: frontier, shots, flashes) and
-the hull centre's (contacts, kicks). Both travel in `Track` messages. The other player's ship is
+Each ship therefore has two tracks: the pilot's (the camera: frontier, shots, flashes; the only
+one sent in `Track` messages) and the hull centre's (what bodies collide with). Every replica
+computes the hull's track from the pilot's as it records it (`Ship::record`), in plain `f32`
+arithmetic with `sqrt` as the only function, so both replicas get the same bits. A control pod's
+hull isn't pushed by collisions; with delayed controls the owner's camera takes the kicks, as
+before. The other player's ship is
 drawn as an open cage along the hull track, with the pilot's clock cube inside it on the pilot's
 track, so you can see where its decisions are made.
 
@@ -151,7 +156,8 @@ Every frame is `seq: u32 LE` followed by one encoded `Message`:
 | Message | Payload |
 |---|---|
 | `Hello` | protocol version, sender's `PlayerId` |
-| `Track` | the pilot's and the hull centre's `ShipSample` (t, pos, vel, τ as `f64`, at the same lab time) and the sender's waiting flag; sent every frame, including while waiting, as a heartbeat (protocol version 3) |
+| `Track` | the pilot's `ShipSample` (t, pos, vel, τ as `f64`) and the sender's waiting flag; sent every frame, including while waiting, as a heartbeat |
+| `Controls` | the sender's `ControlMode` (delayed or pod), sent before their ship first moves |
 | `Fire` | firing event (`Frontier`, `f32`), lab velocity (`f64` ×3), ammo |
 | `Flash` | emission event (`f32` ×4) |
 | `Bye` | sender quits |

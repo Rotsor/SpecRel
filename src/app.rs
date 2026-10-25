@@ -120,9 +120,6 @@ pub struct App {
     pub controls: ControlMode,
     /// [`ControlMode::Delayed`]: commands on their way across the hull.
     commands: CommandQueue,
-    /// The ship's hull. With delayed controls it is centered on the camera; with a control pod
-    /// the camera is the pod, and the hull follows it.
-    hull: Hull,
     /// Ship collision impulses whose news has not crossed the hull yet.
     kicks_in_flight: Vec<Impulse>,
     steer: Option<Steer>,
@@ -157,7 +154,6 @@ impl App {
             ammo: Ammo::Puck,
             controls: ControlMode::default(),
             commands: CommandQueue::default(),
-            hull: Hull::around(Frontier { origin: camera.position, proper_time: 0.0 }, camera.tetrad.e[0]),
             kicks_in_flight: Vec::new(),
             steer: None,
             scene_generation: 0,
@@ -307,7 +303,10 @@ impl App {
             Action::CycleControls if multiplayer => {
                 if self.camera.proper_time == 0.0 {
                     self.controls = self.controls.next();
-                    self.reset_helm();
+                    if let (Some(m), Some(world)) = (self.multiplayer.as_mut(), self.world.as_mut()) {
+                        world.set_controls(m.local(), self.controls);
+                        m.send_controls(self.controls);
+                    }
                 }
             }
             Action::CycleControls => {
@@ -343,7 +342,7 @@ impl App {
             rot_speed * axis(input.roll_right, input.roll_left),
         );
         let looked = self.camera;
-        let helm = (self.commands.clone(), self.hull);
+        let commands = self.commands.clone();
 
         // 2. Proper acceleration thrusters (Lorentz boost in observer's local rest frame)
         let d_tau = if self.paused { 0.0 } else { dt_wall * self.time_scale() };
@@ -375,7 +374,9 @@ impl App {
                 }
                 ControlMode::Pod => {
                     // A pod that drifted into the inner wall bounces off it first.
-                    self.hull.bounce(self.camera.position, &mut self.camera.tetrad);
+                    if let Some(hull) = self.hull() {
+                        hull.bounce(self.camera.position, &mut self.camera.tetrad);
+                    }
                     if let Some(order) = order {
                         order.execute(&mut self.camera.tetrad, rapidity);
                     }
@@ -410,9 +411,6 @@ impl App {
             self.camera.position += self.camera.tetrad.e[0] * d_tau;
             time_changed = true;
         }
-        if self.is_dynamic() {
-            self.move_hull();
-        }
 
         // 5. Multiplayer: never move into the other player's future light cone. If this frame's
         // thrust and motion would, undo them (commands already issued or executed included) and
@@ -423,7 +421,7 @@ impl App {
             };
             if !m.may_advance(&sample(&looked), &sample(&self.camera)) {
                 self.camera = looked;
-                (self.commands, self.hull) = helm;
+                self.commands = commands;
             }
         }
 
@@ -443,23 +441,11 @@ impl App {
         self.dynamics.retire_flashes(self.camera.position.t);
     }
 
-    /// Bring the hull to the camera's lab time. With delayed controls it is centered on the
-    /// camera; a control pod's hull steers by what has crossed it so far.
-    fn move_hull(&mut self) {
-        match self.controls {
-            ControlMode::Delayed => self.hull = Hull::around(self.camera_frontier(), self.camera.tetrad.e[0]),
-            ControlMode::Pod => {
-                let world = self.world.as_ref().expect("dynamic scene has a world");
-                let accel = self.hull.steering(&world.ships[world.viewer as usize]);
-                self.hull.advance_to(self.camera.position.t, accel);
-            }
-        }
-    }
-
-    /// Put the hull back around the camera, with no commands under way.
-    fn reset_helm(&mut self) {
-        self.commands.clear();
-        self.hull = Hull::around(self.camera_frontier(), self.camera.tetrad.e[0]);
+    /// Dynamic Mode: the hull's center at the camera's lab time, as the pilot knows it (the world
+    /// computes the hull's track from the pilot's).
+    fn hull(&self) -> Option<Hull> {
+        let world = self.world.as_ref()?;
+        Some(world.ships[world.viewer as usize].hull_estimate(self.camera.position.t as f64))
     }
 
     /// Dynamic Mode: move the causal frontier to the camera and finalize what it uncovered,
@@ -470,7 +456,6 @@ impl App {
         if self.multiplayer.is_none() && self.camera.position.t > DYNAMIC_REBASE_AFTER_T {
             let shift = -DYNAMIC_REBASE_AFTER_T;
             self.camera.position.t += shift;
-            self.hull.event.t += shift;
             self.dynamics.shift_time(shift);
             for kick in &mut self.kicks_in_flight {
                 kick.t += shift as f64;
@@ -484,19 +469,18 @@ impl App {
         let frontier = self.camera_frontier();
         self.dynamics.frontier = Some(frontier);
         let world = self.world.as_mut().expect("dynamic scene has a world");
-        let pilot = ShipSample::new(frontier, self.camera.tetrad.e[0]);
-        self.world_grew |= world.advance_with_hull(pilot, self.hull.sample());
+        self.world_grew |= world.advance(frontier, self.camera.tetrad.e[0]);
         self.dynamics.frontier_lag = world.frontier_lag(self.camera.tetrad.e[0]);
         self.dynamics.remote_origins = world.remote_origins();
         if let Some(m) = self.multiplayer.as_mut() {
-            let ship = &world.ships[m.local() as usize];
-            m.send_track(*ship.latest(), *ship.latest_hull());
+            m.send_track(*world.ships[m.local() as usize].latest());
         }
 
-        // Collisions with the hull push back on it once news of the contact has crossed it,
-        // like any other body.
+        // With delayed controls, collisions push back on the ship. The camera is the hull's
+        // center: it feels a kick once news of the contact has crossed the hull, like any other
+        // body. (A control pod's hull isn't kicked: see `Ship::record`.)
         self.kicks_in_flight.append(&mut world.ship_kicks);
-        let p = self.hull.event;
+        let p = self.camera.position;
         let ship = BodyState {
             step: 0,
             t: p.t as f64,
@@ -536,13 +520,10 @@ impl App {
         }
     }
 
-    /// Add collision 4-momentum `kick` to the hull. With delayed controls the camera is the
-    /// hull's center and moves with it; a control pod floats on, until the hull catches it.
+    /// Add collision 4-momentum `kick` to the ship (rest mass `SHIP_MASS`) and re-point the
+    /// camera's 4-velocity along the result.
     fn kick_ship(&mut self, kick: P4) {
-        match self.controls {
-            ControlMode::Delayed => self.camera.tetrad.boost_to(helm::kicked(self.camera.tetrad.e[0], kick)),
-            ControlMode::Pod => self.hull.kick(kick),
-        }
+        self.camera.tetrad.boost_to(helm::kicked(self.camera.tetrad.e[0], kick));
     }
 
     /// The HUD's second line: the scene description, plus the ammo and controls in Dynamic
@@ -568,7 +549,7 @@ impl App {
                 format!("[;] DELAYED CONTROLS {:.2}S{spooling}", helm::command_delay())
             }
             ControlMode::Pod => {
-                let offset = self.hull.offset(self.camera.position).minkowski_norm_sq().max(0.0).sqrt();
+                let offset = self.hull().map_or(0.0, |h| h.offset(self.camera.position).minkowski_norm_sq().max(0.0).sqrt());
                 format!("[;] CONTROL POD, {offset:.2} OFF CENTER")
             }
         }
@@ -599,12 +580,15 @@ impl App {
         self.dynamics.flashes.clear();
         self.kicks_in_flight.clear();
         self.steer = None;
-        self.reset_helm();
+        self.commands.clear();
 
         self.world = demo.is_dynamic().then(|| match player {
             Some(p) => DynWorld::new_match(demo, &game::spawns(), p),
             None => DynWorld::new(demo, self.camera_frontier(), self.camera.tetrad.e[0]),
         });
+        if let Some(world) = self.world.as_mut() {
+            world.set_controls(world.viewer, self.controls);
+        }
         self.dynamics.frontier = self.world.as_ref().map(|w| w.frontier);
         let u = self.camera.tetrad.e[0];
         self.dynamics.frontier_lag = self.world.as_ref().map_or(0.0, |w| w.frontier_lag(u));
@@ -913,7 +897,8 @@ mod tests {
     }
 
     /// With a control pod the pilot accelerates at once; the hull only follows once news of it
-    /// has crossed the hull, and the other player sees the two apart.
+    /// has crossed the hull. The other player's replica, told only the controls and the
+    /// pilot's track, computes the very same hull and sees the two apart.
     #[test]
     fn a_control_pod_responds_at_once_and_its_hull_follows() {
         let (mut p0, mut p1) = match_apps();
@@ -924,24 +909,27 @@ mod tests {
         play(&mut p0, &mut p1, 2, dt, &forward);
         assert!(p0.camera.proper_time > 0.0);
         assert!(rapidity(&p0) > 0.9 * helm::pod_accel() * dt, "no lag");
-        assert_eq!(p0.hull.u, Vec4::new(1.0, 0.0, 0.0, 0.0), "the hull hasn't heard yet");
+        assert_eq!(p0.hull().unwrap().u, Vec4::new(1.0, 0.0, 0.0, 0.0), "the hull hasn't heard yet");
 
         p0.apply(Action::CycleControls); // too late now
         assert_eq!(p0.controls, ControlMode::Pod);
 
         play(&mut p0, &mut p1, 40, dt, &forward);
-        assert!(p0.hull.u.z > 0.1, "the hull follows: {:?}", p0.hull.u);
-        let offset = p0.hull.offset(p0.camera.position).minkowski_norm_sq().sqrt();
+        assert!(p0.hull().unwrap().u.z > 0.1, "the hull follows: {:?}", p0.hull().unwrap().u);
+        let offset = p0.hull().unwrap().offset(p0.camera.position).minkowski_norm_sq().sqrt();
         assert!(offset > 0.02 && offset < SHIP_RADIUS as f32, "pod off center by {offset}");
         assert!(p0.scene_description().contains("CONTROL POD"));
 
-        // Player 1 has player 0's hull and pilot tracks, apart, exactly as player 0 recorded them.
+        // Player 1 computed player 0's hull from their pilot's track, bit for bit.
         play(&mut p0, &mut p1, 5, dt, &HeldInput::default());
         let (mine, seen) = (&p0.world.as_ref().unwrap().ships[0], &p1.world.as_ref().unwrap().ships[0]);
-        let last = *seen.latest();
-        let i = mine.track.iter().position(|s| *s == last).expect("player 1 heard player 0's track");
-        assert_eq!(mine.hull[i], *seen.latest_hull());
-        assert!((last.pos[2] - seen.latest_hull().pos[2]).abs() > 0.02, "pilot and hull apart");
+        assert_eq!(seen.controls, ControlMode::Pod);
+        let n = seen.track.len();
+        assert!(n > 40, "player 1 heard player 0's track");
+        assert_eq!(mine.track[..n], seen.track[..]);
+        assert_eq!(mine.hull[..n], seen.hull[..], "both replicas computed the same hull");
+        let (pilot, hull) = (seen.latest(), seen.latest_hull());
+        assert!((pilot.pos[2] - hull.pos[2]).abs() > 0.02, "pilot and hull apart");
     }
 
     /// Alone, switching the controls restarts the table.

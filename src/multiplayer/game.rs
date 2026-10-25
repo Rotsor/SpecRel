@@ -8,6 +8,7 @@ use super::protocol::Message;
 use super::session::{Event, Session};
 use crate::dynamic::billiards::{self, Ammo};
 use crate::dynamic::collide::V3;
+use crate::dynamic::helm::ControlMode;
 use crate::dynamic::{DynWorld, PlayerId, ShipSample};
 use crate::minkowski::Vec4;
 use crate::renderer::{FrameDynamics, Frontier};
@@ -99,8 +100,8 @@ impl Match {
                     self.problem = Some(format!("BOTH PLAYERS CLAIM PLAYER {}", player + 1));
                 }
                 Event::Joined(_) => {}
-                Event::Track { sample, hull, waiting } => {
-                    world.record(self.remote, sample, hull);
+                Event::Track { sample, waiting } => {
+                    world.record(self.remote, sample);
                     self.remote_latest = sample;
                     self.remote_waiting = waiting;
                     changed = true;
@@ -110,6 +111,10 @@ impl Match {
                     changed = true;
                 }
                 Event::Flash(at) => dynamics.emit_flash(at),
+                Event::Controls(controls) => {
+                    world.set_controls(self.remote, controls);
+                    changed = true;
+                }
                 Event::Ping { sent } => self.session.send(&Message::Pong { sent }),
                 Event::Pong { sent } => {
                     let sample = self.clock - sent;
@@ -152,13 +157,17 @@ impl Match {
         self.awaiting_peer() || self.pacer.is_waiting()
     }
 
-    /// Send the local ship's latest events, its pilot's and its hull's. Sent every frame, also
-    /// while waiting (a heartbeat that lets a stalled pair resolve as soon as both know where
-    /// the other is).
-    pub fn send_track(&mut self, sample: ShipSample, hull: ShipSample) {
+    /// Send the local pilot's latest event. Sent every frame, also while waiting (a heartbeat
+    /// that lets a stalled pair resolve as soon as both know where the other is).
+    pub fn send_track(&mut self, sample: ShipSample) {
         let waiting = self.is_waiting();
-        self.session.send(&Message::Track { sample, hull, waiting });
+        self.session.send(&Message::Track { sample, waiting });
         self.local_latest = Some(sample);
+    }
+
+    /// Tell the other player which controls we fly with (before our ship first moves).
+    pub fn send_controls(&mut self, controls: ControlMode) {
+        self.session.send(&Message::Controls { controls });
     }
 
     pub fn send_fire(&mut self, at: Frontier, vel: V3, ammo: Ammo) {

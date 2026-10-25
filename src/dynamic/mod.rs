@@ -27,6 +27,7 @@ use crate::scene::{DemoScene, Scene4D};
 use billiards::{Ammo, SHIP_MASS, SHIP_RADIUS};
 use body::{distance, is_decided, Body, BodyState, Impulse, Kind, STEP_DT};
 use collide::{P4, V3};
+use helm::ControlMode;
 pub use ship::{PlayerId, Ship, ShipSample};
 
 /// How far behind the camera (in lab time) histories are kept: beyond the renderers' maximum
@@ -126,24 +127,22 @@ impl DynWorld {
         self.t_origin + step as f64 * STEP_DT
     }
 
-    /// Move the viewer's frontier to its pilot's new event (moving with 4-velocity `u`), with
-    /// the hull centered on it, and finalize every step that just became decided. Returns
-    /// whether anything changed.
+    /// Move the viewer's frontier to its pilot's new event (moving with 4-velocity `u`) and
+    /// finalize every step that just became decided. Returns whether anything changed.
     pub fn advance(&mut self, frontier: Frontier, u: Vec4) -> bool {
-        let sample = ShipSample::new(frontier, u);
-        self.advance_with_hull(sample, sample)
-    }
-
-    /// [`DynWorld::advance`] for a ship whose hull center is at `hull` (at the pilot's lab time).
-    pub fn advance_with_hull(&mut self, pilot: ShipSample, hull: ShipSample) -> bool {
-        self.record(self.viewer, pilot, hull);
+        self.record(self.viewer, ShipSample::new(frontier, u));
         self.extend()
     }
 
-    /// Record `player`'s next ship events: their pilot's and their hull center's, at the same
-    /// lab time. Nothing is finalized until [`DynWorld::extend`].
-    pub fn record(&mut self, player: PlayerId, pilot: ShipSample, hull: ShipSample) {
-        self.ships[player as usize].record(pilot, hull);
+    /// Record `player`'s pilot's next event (their hull follows it). Nothing is finalized
+    /// until [`DynWorld::extend`].
+    pub fn record(&mut self, player: PlayerId, pilot: ShipSample) {
+        self.ships[player as usize].record(pilot);
+    }
+
+    /// `player` flies with `controls` (only before their ship has moved).
+    pub fn set_controls(&mut self, player: PlayerId, controls: ControlMode) {
+        self.ships[player as usize].set_controls(controls);
     }
 
     /// `player` left the match: their ship ends where it was last seen.
@@ -258,7 +257,8 @@ impl DynWorld {
             }
         }
         // Ships are far heavier than pucks, and each player's replica applies the kicks to its
-        // own ship; here only the viewer's are collected.
+        // own ship; here only the viewer's are collected. A control pod's hull isn't kicked at
+        // all: its motion is a function of its pilot's track alone.
         let mut kick = None;
         for &(player, ship) in &contacts.ships {
             if me.touching_ships.contains(&player) {
@@ -269,7 +269,7 @@ impl DynWorld {
                 let at = touching_point(s.pos, r, ship.pos, SHIP_RADIUS);
                 let dp = collide::sub(collide::momentum(me.mass, v), collide::momentum(me.mass, s.vel));
                 received.push(Impulse { t: s.t, pos: at, dp });
-                if player == self.viewer {
+                if player == self.viewer && self.ships[player as usize].controls == ControlMode::Delayed {
                     kick = Some(Impulse { t: s.t, pos: at, dp: dp.map(|c| -c) });
                 }
             }
@@ -449,8 +449,8 @@ impl DynWorld {
                 imp.t += dt;
             }
         }
-        for s in self.ships.iter_mut().flat_map(|ship| ship.track.iter_mut().chain(&mut ship.hull)) {
-            s.t += dt;
+        for ship in &mut self.ships {
+            ship.rebase(dt);
         }
         for kick in &mut self.ship_kicks {
             kick.t += dt;
@@ -1066,7 +1066,7 @@ mod match_tests {
 
     fn apply(world: &mut DynWorld, player: PlayerId, input: Input) {
         match input {
-            Input::Sample(s) => world.record(player, s, s),
+            Input::Sample(s) => world.record(player, s),
             Input::Fire(at, vel, ammo) => world.launch(player, at, vel, ammo),
         }
     }

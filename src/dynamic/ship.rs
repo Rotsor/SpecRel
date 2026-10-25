@@ -8,6 +8,7 @@
 
 use super::billiards::SHIP_RADIUS;
 use super::collide::{self, V3};
+use super::helm::{ControlMode, Hull};
 use crate::mesh4d::{Mesh3D, WorldlineSample};
 use crate::minkowski::{Tetrad, Vec3, Vec4};
 use crate::renderer::Frontier;
@@ -82,14 +83,21 @@ impl ShipSample {
 
 /// A player's ship: a heavy sphere of radius [`SHIP_RADIUS`] (the hull) with its pilot (the
 /// player's camera) inside, and both worldlines recorded so far.
+///
+/// Only the pilot's track is input. The hull's track is a pure function of it, so every
+/// replica computes the same hull.
 pub struct Ship {
     pub player: PlayerId,
     /// The pilot's recorded worldline, oldest first, pruned behind the history window; never
     /// empty. Shots and flashes leave from here, and its latest event bounds the frontier.
     pub track: Vec<ShipSample>,
-    /// The hull center's worldline, one sample per pilot sample, at the same lab times.
-    /// Bodies collide with the hull.
+    /// The hull center's worldline: `hull[i]` is at `track[i]`'s lab time. Bodies collide
+    /// with the hull.
     pub hull: Vec<ShipSample>,
+    /// How the controls reach the hull.
+    pub controls: ControlMode,
+    /// [`ControlMode::Pod`]: the hull's state at its latest sample, at full (`f32`) precision.
+    helm: Hull,
     /// The player left the match: the ship ends at its last sample, and no longer holds the
     /// frontier back.
     pub left: bool,
@@ -99,7 +107,22 @@ pub struct Ship {
 
 impl Ship {
     pub fn new(player: PlayerId, spawn: ShipSample) -> Self {
-        Self { player, track: vec![spawn], hull: vec![spawn], left: false, shots: 0 }
+        Self {
+            player,
+            track: vec![spawn],
+            hull: vec![spawn],
+            controls: ControlMode::default(),
+            helm: Hull::from_sample(&spawn),
+            left: false,
+            shots: 0,
+        }
+    }
+
+    /// Switch the controls. Only while the ship is still at its spawn event: the pilot and the
+    /// hull's center must coincide.
+    pub fn set_controls(&mut self, controls: ControlMode) {
+        debug_assert_eq!(self.track.len(), 1, "controls change only before the ship moves");
+        self.controls = controls;
     }
 
     pub fn latest(&self) -> &ShipSample {
@@ -115,15 +138,28 @@ impl Ship {
         !self.left
     }
 
-    /// Record the ship's next events: the pilot's, and the hull center's at the same lab time.
-    /// Samples are only ever appended, so whatever has been read from the tracks stays true. A
-    /// paused or waiting player repeats its events; a repeat is dropped unless a velocity
+    /// Record the pilot's next event, and move the hull's center to the same lab time.
+    /// Samples are only ever appended, so whatever has been read from the tracks stays true.
+    /// A paused or waiting player repeats its event; a repeat is dropped unless the velocity
     /// changed on the spot (a collision kick).
-    pub fn record(&mut self, pilot: ShipSample, hull: ShipSample) {
-        let (last, last_hull) = (self.latest(), self.latest_hull());
-        if pilot.t < last.t || (*last == pilot && *last_hull == hull) {
+    ///
+    /// With delayed controls the hull's center is the pilot. A control pod's hull steers
+    /// toward the pod by what it knows ([`Hull::steering`]), in pure `f32` arithmetic with
+    /// `sqrt` as the only function, so every replica gets the same bits. Collisions don't push
+    /// it: its motion depends on its pilot's track alone.
+    pub fn record(&mut self, pilot: ShipSample) {
+        let last = self.latest();
+        if pilot.t < last.t || *last == pilot {
             return;
         }
+        let hull = match self.controls {
+            ControlMode::Delayed => pilot,
+            ControlMode::Pod => {
+                let accel = self.helm.steering(self);
+                self.helm.advance_to(pilot.t as f32, accel);
+                ShipSample { t: pilot.t, ..self.helm.sample() } // exactly the pilot's lab time
+            }
+        };
         self.track.push(pilot);
         self.hull.push(hull);
     }
@@ -131,6 +167,24 @@ impl Ship {
     /// The tracks are recorded up to lab time `t`.
     pub fn is_known_at(&self, t: f64) -> bool {
         self.latest().t >= t
+    }
+
+    /// Shift every event by `dt` in lab time.
+    pub fn rebase(&mut self, dt: f64) {
+        for s in self.track.iter_mut().chain(&mut self.hull) {
+            s.t += dt;
+        }
+        self.helm.event.t += dt as f32;
+    }
+
+    /// The hull's center at lab time `t`, as well as the pilot can know it now: its recorded
+    /// state, or, past the recorded track, its latest state coasted on. Only for the pilot's
+    /// own decisions (bumping into the inner wall, the HUD); the world uses [`Ship::hull_at`].
+    pub fn hull_estimate(&self, t: f64) -> Hull {
+        let at = if self.is_known_at(t) { self.hull_at(t) } else { *self.latest_hull() };
+        let mut hull = Hull::from_sample(&at);
+        hull.advance_to(t as f32, Vec4::default());
+        hull
     }
 
     /// The pilot's state at lab time `t` (within the recorded track).
@@ -296,7 +350,8 @@ mod tests {
             let vel = if t > 10.0 + 1e-9 { [0.5, 0.0, 0.0] } else { [0.0; 3] };
             let tau = t.min(10.0) + (t - 10.0).max(0.0) * 0.75f64.sqrt();
             let hull = ShipSample { t, pos: [x, 0.0, 0.0], vel, tau };
-            ship.record(ShipSample { pos: [x + 0.1, 0.0, 0.0], ..hull }, hull);
+            ship.track.push(ShipSample { pos: [x + 0.1, 0.0, 0.0], ..hull });
+            ship.hull.push(hull);
         }
         ship
     }
