@@ -60,8 +60,9 @@ touching the hull at event `E` must not feel thrust applied after the centre cro
 light cone. Contacts use `Ship::seen_from`: the centre's state on the past cone of the touching
 body's centre, coasted on inertially to `E`'s lab time. Coasting adds no new information, so the
 contact depends only on input in `E`'s causal past. Collisions of this kind therefore treat the
-hull as non-rigid: it lags the centre by up to a few tenths of a second while thrusting, and
-`SHIP_ACCEL` keeps that lag small. The other player's ship is still *drawn* rigidly around its
+hull as non-rigid. It responds to thrust after the light-travel time from the centre: about
+0.75 s for a puck resting against the hull, longer ahead of a fast ship. `SHIP_ACCEL` bounds how
+far the hull and the centre can drift apart in that time. The other player's ship is still *drawn* rigidly around its
 centre. That only affects what the drawing looks like; nothing in the game depends on it.
 
 A player with `Δt ≤ 0` never needs to stop, so at least one player can always move. Both can be
