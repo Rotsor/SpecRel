@@ -9,7 +9,7 @@ use crate::minkowski::Vec4;
 use crate::renderer::Frontier;
 
 /// Bumped whenever the encoding or the meaning of a message changes.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 const TAG_HELLO: u8 = 0;
 const TAG_TRACK: u8 = 1;
@@ -22,8 +22,9 @@ const TAG_BYE: u8 = 4;
 pub enum Message {
     /// First message of a session.
     Hello { version: u16, player: PlayerId },
-    /// The sender's ship reached `sample`; also a heartbeat while `waiting`.
-    Track { sample: ShipSample, waiting: bool },
+    /// The sender's pilot reached `sample`, with their hull's center at `hull` (at the same lab
+    /// time); also a heartbeat while `waiting`.
+    Track { sample: ShipSample, hull: ShipSample, waiting: bool },
     /// The sender fired at event `at` with lab velocity `vel`.
     Fire { at: Frontier, vel: [f64; 3], ammo: Ammo },
     /// The sender emitted a light flash at `at`.
@@ -38,7 +39,9 @@ impl PartialEq for Message {
         use Message::*;
         match (self, other) {
             (Hello { version: a, player: p }, Hello { version: b, player: q }) => a == b && p == q,
-            (Track { sample: a, waiting: w }, Track { sample: b, waiting: v }) => a == b && w == v,
+            (Track { sample: a, hull: h, waiting: w }, Track { sample: b, hull: k, waiting: v }) => {
+                a == b && h == k && w == v
+            }
             (Fire { at: a, vel: v, ammo: m }, Fire { at: b, vel: w, ammo: n }) => {
                 a.origin == b.origin && a.proper_time == b.proper_time && v == w && m == n
             }
@@ -78,12 +81,14 @@ impl Message {
                 out.extend_from_slice(&version.to_le_bytes());
                 out.push(*player);
             }
-            Self::Track { sample, waiting } => {
+            Self::Track { sample, hull, waiting } => {
                 out.push(TAG_TRACK);
-                put_f64s(out, &[sample.t]);
-                put_f64s(out, &sample.pos);
-                put_f64s(out, &sample.vel);
-                put_f64s(out, &[sample.tau]);
+                for s in [sample, hull] {
+                    put_f64s(out, &[s.t]);
+                    put_f64s(out, &s.pos);
+                    put_f64s(out, &s.vel);
+                    put_f64s(out, &[s.tau]);
+                }
                 out.push(*waiting as u8);
             }
             Self::Fire { at, vel, ammo } => {
@@ -107,13 +112,9 @@ impl Message {
         let msg = match r.u8()? {
             TAG_HELLO => Self::Hello { version: r.u16()?, player: r.u8()? },
             TAG_TRACK => {
-                let sample = ShipSample {
-                    t: r.f64()?,
-                    pos: r.v3()?,
-                    vel: r.v3()?,
-                    tau: r.f64()?,
-                };
-                Self::Track { sample, waiting: r.u8()? != 0 }
+                let sample = r.ship_sample()?;
+                let hull = r.ship_sample()?;
+                Self::Track { sample, hull, waiting: r.u8()? != 0 }
             }
             TAG_FIRE => {
                 let at = Frontier { origin: r.vec4()?, proper_time: r.f32()? };
@@ -193,6 +194,10 @@ impl Reader<'_> {
     fn vec4(&mut self) -> Result<Vec4, DecodeError> {
         Ok(Vec4::new(self.f32()?, self.f32()?, self.f32()?, self.f32()?))
     }
+
+    fn ship_sample(&mut self) -> Result<ShipSample, DecodeError> {
+        Ok(ShipSample { t: self.f64()?, pos: self.v3()?, vel: self.v3()?, tau: self.f64()? })
+    }
 }
 
 #[cfg(test)]
@@ -210,8 +215,8 @@ mod tests {
         vec![
             Message::Hello { version: PROTOCOL_VERSION, player: 0 },
             Message::Hello { version: u16::MAX, player: 255 },
-            Message::Track { sample, waiting: false },
-            Message::Track { sample, waiting: true },
+            Message::Track { sample, hull: sample, waiting: false },
+            Message::Track { sample, hull: ShipSample { tau: -0.5, ..sample }, waiting: true },
             Message::Fire { at, vel: [0.1, -0.2, f64::EPSILON], ammo: Ammo::Puck },
             Message::Fire { at, vel: [0.0; 3], ammo: Ammo::Sticky },
             Message::Fire { at, vel: [-0.0; 3], ammo: Ammo::Spore },

@@ -22,6 +22,9 @@ pub const SHIP_MASS: f64 = 6.0;
 /// trailing side must stay in front of it (its own acceleration `a / (1 - a R)` diverges as
 /// `a R -> 1`), so `a < 1 / SHIP_RADIUS`. Thrusters and steering run at 80% of that bound.
 pub const SHIP_ACCEL: f64 = 0.8 / SHIP_RADIUS;
+/// With a control pod (`docs/SHIP_CONTROLS_CAUSALITY.md`, option C) the pilot floats up to this
+/// far from the hull's center before hitting the inner wall.
+pub const POD_RANGE: f64 = SHIP_RADIUS / 2.0;
 /// Launch speed of fired pucks in the ship's rest frame.
 pub const FIRE_SPEED: f64 = 0.6;
 /// Bodies this far from the table leave play.

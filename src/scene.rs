@@ -275,7 +275,17 @@ impl Scene4D {
                 0.025,
             )
             .with_pattern(SurfacePattern::ClockFace),
+            // 12-15: Ship hull cages, in the colors of clock bezels 1-4
+            Self::hull_material(Vec3::new(0.20, 0.72, 0.95)),
+            Self::hull_material(Vec3::new(0.96, 0.32, 0.24)),
+            Self::hull_material(Vec3::new(0.96, 0.78, 0.20)),
+            Self::hull_material(Vec3::new(0.88, 0.32, 0.88)),
         ]
+    }
+
+    /// A ship's hull cage: plain bars in the player's color.
+    const fn hull_material(color: Vec3) -> Material {
+        Material::new(color, color, 0.35, 1.0, 0.0)
     }
 
     /// Scene 1: Twin Paradox (Stay-at-Home Twin vs. Accelerated Round-Trip Twin + Light Clocks)

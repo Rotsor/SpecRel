@@ -65,8 +65,8 @@ impl Match {
                     self.problem = Some(format!("BOTH PLAYERS CLAIM PLAYER {}", player + 1));
                 }
                 Event::Joined(_) => {}
-                Event::Track { sample, waiting } => {
-                    world.record(self.remote, sample);
+                Event::Track { sample, hull, waiting } => {
+                    world.record(self.remote, sample, hull);
                     self.remote_latest = sample;
                     self.remote_waiting = waiting;
                     changed = true;
@@ -113,11 +113,12 @@ impl Match {
         self.awaiting_peer() || self.pacer.is_waiting()
     }
 
-    /// Send the local ship's latest event. Sent every frame, also while waiting (a heartbeat
-    /// that lets a stalled pair resolve as soon as both know where the other is).
-    pub fn send_track(&mut self, sample: ShipSample) {
+    /// Send the local ship's latest events, its pilot's and its hull's. Sent every frame, also
+    /// while waiting (a heartbeat that lets a stalled pair resolve as soon as both know where
+    /// the other is).
+    pub fn send_track(&mut self, sample: ShipSample, hull: ShipSample) {
         let waiting = self.is_waiting();
-        self.session.send(&Message::Track { sample, waiting });
+        self.session.send(&Message::Track { sample, hull, waiting });
     }
 
     pub fn send_fire(&mut self, at: Frontier, vel: V3, ammo: Ammo) {

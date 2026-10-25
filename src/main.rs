@@ -57,6 +57,7 @@ const KEY_ACTIONS: &[(Key, Action)] = &[
     (Key::Enter, Action::Fire),
     (Key::NumPadEnter, Action::Fire),
     (Key::Backslash, Action::CycleAmmo),
+    (Key::Semicolon, Action::CycleControls),
 ];
 
 /// Key bindings that auto-repeat while held (`KeyRepeat::Yes`).

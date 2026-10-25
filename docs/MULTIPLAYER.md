@@ -50,20 +50,27 @@ The hull's trailing point, at distance `R`, accelerates at `a / (1 − aR)`, and
 `aR → 1`. So in a match the ship's proper acceleration is capped at `SHIP_ACCEL = 0.8 / R`, which
 is 80% of the bound. The cap is measured per second of the ship's own clock (`d_tau`, so a paused
 ship cannot boost at all) and in every direction (diagonal thrust is normalized). `X` (brake to
-the lab frame) and `V` (match velocity) do not jump: they boost at `SHIP_ACCEL` toward the target
-for as long as the key is held. Releasing the key mid-brake leaves the ship coasting at whatever
-velocity it reached. Collision kicks stay instantaneous. They already reach the camera only once
-their news has crossed the hull.
+the lab frame) and `V` (match velocity) do not jump: they boost toward the target for as long as
+the key is held. Releasing the key mid-brake leaves the ship coasting at whatever velocity it
+reached. Collision kicks stay instantaneous. They already reach the hull only once their news has
+crossed it. (These rules hold for single-player Dynamic Mode too.)
 
-**The hull hears the controls at light speed.** The controls act at the ship's centre, so a body
-touching the hull at event `E` must not feel thrust applied after the centre crossed `E`'s past
-light cone. Contacts use `Ship::seen_from`: the centre's state on the past cone of the touching
-body's centre, coasted on inertially to `E`'s lab time. Coasting adds no new information, so the
-contact depends only on input in `E`'s causal past. Collisions of this kind therefore treat the
-hull as non-rigid. It responds to thrust after the light-travel time from the centre: about
-0.75 s for a puck resting against the hull, longer ahead of a fast ship. `SHIP_ACCEL` bounds how
-far the hull and the centre can drift apart in that time. The other player's ship is still *drawn* rigidly around its
-centre. That only affects what the drawing looks like; nothing in the game depends on it.
+**The hull hears the controls at light speed.** A rigid hull may only act on a command once news
+of it has reached all of it (`docs/SHIP_CONTROLS_CAUSALITY.md`, `src/dynamic/helm.rs`). The
+player picks one of two ways with `;`, before the match starts:
+
+* **Delayed controls** (option A, the default): the camera is the hull's centre, and every command
+  executes `command_delay()` (0.80 s) of ship time after it was issued; the HUD says **SPOOLING**
+  meanwhile.
+* **Control pod** (option C): the camera is a pod that accelerates at once, at `pod_accel()`
+  (0.35 c/s), and floats up to `POD_RANGE` (0.2) from the hull's centre. The hull keeps station on
+  the pod, steering by what it learned of it `pod_delay()` (0.97 s) ago and replaying that against
+  its own past (inner-wall bounces included), so it never acts on news that hasn't crossed it.
+
+Each ship therefore records two tracks: the pilot's (the camera: frontier, shots, flashes) and
+the hull centre's (contacts, kicks). Both travel in `Track` messages. The other player's ship is
+drawn as an open cage along the hull track, with the pilot's clock cube inside it on the pilot's
+track, so you can see where its decisions are made.
 
 A player with `Δt ≤ 0` never needs to stop, so at least one player can always move. Both can be
 stopped only briefly, when their information about each other is stale; heartbeats resolve that.
@@ -98,9 +105,10 @@ finalized data (single-player Phase 4). On top of that, multiplayer requires the
 ## 3. Architecture
 
 ```
-src/dynamic/ship.rs        PlayerId, ShipSample (+ proper time)
+src/dynamic/ship.rs        PlayerId, ShipSample (+ proper time); pilot and hull tracks
+src/dynamic/helm.rs        causal controls: delayed commands, or a control pod and its hull
 src/dynamic/mod.rs         DynWorld: N ships, union-of-cones frontier, per-ship tracks, kicks,
-                           and other ships drawn as clock cubes
+                           and other ships drawn as hull cages around their pilots' clocks
 src/multiplayer/protocol.rs Message + compact binary encoding
 src/multiplayer/pacing.rs   CM-frame lead, stop/resume rule (Pacer)
 src/multiplayer/link.rs     Link trait; LocalLink (in-process pair); QueueLink (frontend-driven)
@@ -122,7 +130,7 @@ Every frame is `seq: u32 LE` followed by one encoded `Message`:
 | Message | Payload |
 |---|---|
 | `Hello` | protocol version, sender's `PlayerId` |
-| `Track` | `ShipSample` (t, pos, vel, τ as `f64`) and the sender's waiting flag; sent every frame, including while waiting, as a heartbeat |
+| `Track` | the pilot's and the hull centre's `ShipSample` (t, pos, vel, τ as `f64`, at the same lab time) and the sender's waiting flag; sent every frame, including while waiting, as a heartbeat (protocol version 2) |
 | `Fire` | firing event (`Frontier`, `f32`), lab velocity (`f64` ×3), ammo |
 | `Flash` | emission event (`f32` ×4) |
 | `Bye` | sender quits |

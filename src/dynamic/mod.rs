@@ -13,6 +13,7 @@
 pub mod billiards;
 pub mod body;
 pub mod collide;
+pub mod helm;
 pub mod ship;
 
 use crate::bvh4d::Bvh4D;
@@ -125,16 +126,24 @@ impl DynWorld {
         self.t_origin + step as f64 * STEP_DT
     }
 
-    /// Move the viewer's frontier to its ship's new event (moving with 4-velocity `u`) and
-    /// finalize every step that just became decided. Returns whether anything changed.
+    /// Move the viewer's frontier to its pilot's new event (moving with 4-velocity `u`), with
+    /// the hull centered on it, and finalize every step that just became decided. Returns
+    /// whether anything changed.
     pub fn advance(&mut self, frontier: Frontier, u: Vec4) -> bool {
-        self.record(self.viewer, ShipSample::new(frontier, u));
+        let sample = ShipSample::new(frontier, u);
+        self.advance_with_hull(sample, sample)
+    }
+
+    /// [`DynWorld::advance`] for a ship whose hull center is at `hull` (at the pilot's lab time).
+    pub fn advance_with_hull(&mut self, pilot: ShipSample, hull: ShipSample) -> bool {
+        self.record(self.viewer, pilot, hull);
         self.extend()
     }
 
-    /// Record `player`'s next ship event. Nothing is finalized until [`DynWorld::extend`].
-    pub fn record(&mut self, player: PlayerId, sample: ShipSample) {
-        self.ships[player as usize].record(sample);
+    /// Record `player`'s next ship events: their pilot's and their hull center's, at the same
+    /// lab time. Nothing is finalized until [`DynWorld::extend`].
+    pub fn record(&mut self, player: PlayerId, pilot: ShipSample, hull: ShipSample) {
+        self.ships[player as usize].record(pilot, hull);
     }
 
     /// `player` left the match: their ship ends where it was last seen.
@@ -343,7 +352,7 @@ impl DynWorld {
         for ship in &self.ships {
             let launcher = me.launcher == Some(ship.player);
             if ship.is_known_at(s.t) {
-                let at = ship.seen_from(s.t, s.pos);
+                let at = ship.hull_at(s.t);
                 let d = distance(s.pos, at.pos);
                 if launcher {
                     launcher_clear = d > reach;
@@ -352,7 +361,7 @@ impl DynWorld {
                 }
             } else if ship.is_live() && !launcher {
                 // Unknown yet: wait if it could be within reach by now.
-                let last = ship.latest();
+                let last = ship.latest_hull();
                 if distance(s.pos, last.pos) < reach + (s.t - last.t) {
                     return None;
                 }
@@ -430,7 +439,7 @@ impl DynWorld {
                 imp.t += dt;
             }
         }
-        for s in self.ships.iter_mut().flat_map(|ship| &mut ship.track) {
+        for s in self.ships.iter_mut().flat_map(|ship| ship.track.iter_mut().chain(&mut ship.hull)) {
             s.t += dt;
         }
         for kick in &mut self.ship_kicks {
@@ -485,14 +494,19 @@ impl DynWorld {
             }
         }
 
-        // The other players' ships, up to their last known events.
-        let ship_mesh = Ship::mesh();
+        // The other players' ships, up to their last known events: an open hull cage, and the
+        // pilot's clock inside it, where the decisions are made.
+        let (hull_mesh, pilot_mesh) = (Ship::hull_mesh(), Ship::pilot_mesh());
         for ship in self.ships.iter().filter(|s| s.player != self.viewer) {
-            let samples: Vec<_> =
-                ship.render_indices(MAX_SEGMENT_DT).iter().map(|&i| ship.track[i].sample()).collect();
-            let m = ship.material();
-            simplices.extend(build_worldtube_simplices(&ship_mesh, &samples, m));
-            simplices.extend(build_worldtube_cap(&ship_mesh, samples.last().unwrap(), DECIDED_AT_STATIC, m));
+            for (track, mesh, m) in [
+                (&ship.hull, &hull_mesh, ship.hull_material()),
+                (&ship.track, &pilot_mesh, ship.material()),
+            ] {
+                let samples: Vec<_> =
+                    ship::render_indices(track, MAX_SEGMENT_DT).iter().map(|&i| track[i].sample()).collect();
+                simplices.extend(build_worldtube_simplices(mesh, &samples, m));
+                simplices.extend(build_worldtube_cap(mesh, samples.last().unwrap(), DECIDED_AT_STATIC, m));
+            }
         }
 
         Scene4D {
@@ -923,6 +937,7 @@ mod tests {
         // The parked ship's worldline over the puck's approach.
         let parked = ShipSample { t: t - 1.0, pos: [o.x as f64, o.y as f64, o.z as f64], vel: [0.0; 3], tau: 0.0 };
         world.ships[0].track.insert(0, parked);
+        world.ships[0].hull.insert(0, parked);
         run_parked(&mut world, 10.0);
 
         assert_eq!(world.ship_kicks.len(), 1, "exactly one collision");
@@ -1041,7 +1056,7 @@ mod match_tests {
 
     fn apply(world: &mut DynWorld, player: PlayerId, input: Input) {
         match input {
-            Input::Sample(s) => world.record(player, s),
+            Input::Sample(s) => world.record(player, s, s),
             Input::Fire(at, vel, ammo) => world.launch(player, at, vel, ammo),
         }
     }
@@ -1122,16 +1137,18 @@ mod match_tests {
         assert!(lag < 3.0, "lag {lag}");
     }
 
-    /// Each player sees the other's ship as a clock cube, up to its last known event, and
-    /// not their own.
+    /// Each player sees the other's ship as a hull cage with the pilot's clock inside, up to its
+    /// last known event, and not their own.
     #[test]
     fn other_ships_are_drawn_up_to_their_last_known_event() {
         let streams = streams();
         let world = replica(0, &streams, 5);
         let scene = world.build_scene();
         let has = |m: usize| scene.bvh.simplices.iter().any(|s| s.material_id == m);
-        assert!(has(world.ships[1].material()), "the other ship is drawn");
+        assert!(has(world.ships[1].material()), "the other pilot is drawn");
+        assert!(has(world.ships[1].hull_material()), "and their hull");
         assert!(!has(world.ships[0].material()), "your own ship is not");
+        assert!(!has(world.ships[0].hull_material()));
         let tip = world.ships[1].latest().t as f32;
         let latest = scene
             .bvh

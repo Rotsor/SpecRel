@@ -58,7 +58,7 @@ Switch scenes at any time with keys **`1`–`5`** or **`N` / `B`**:
 
 ### Two-player causal multiplayer
 
-Two players each fly a ship over the billiards table, and both see the same causally simulated world, each through their own past light cone (see [`docs/MULTIPLAYER.md`](docs/MULTIPLAYER.md)). An event is decided only once it has left **both** players' future light cones. Your past cone can be drawn only while you stay out of the future cone of the last event you know of the other player. Fly away fast and come back, and you have aged less but covered more lab time than a player who stayed put (the twin paradox, played for real). The game then holds you with **WAITING FOR THE OTHER PLAYER** until the other player catches up in your common centre-of-momentum frame. The other ship is drawn as a clock cube, so you can read their proper time. Shots, flashes and collisions are shared, and both players' replicas of the world agree bit for bit.
+Two players each fly a ship over the billiards table, and both see the same causally simulated world, each through their own past light cone (see [`docs/MULTIPLAYER.md`](docs/MULTIPLAYER.md)). An event is decided only once it has left **both** players' future light cones. Your past cone can be drawn only while you stay out of the future cone of the last event you know of the other player. Fly away fast and come back, and you have aged less but covered more lab time than a player who stayed put (the twin paradox, played for real). The game then holds you with **WAITING FOR THE OTHER PLAYER** until the other player catches up in your common centre-of-momentum frame. The other ship is drawn as an open hull cage with its pilot's clock inside, so you can read their proper time and see where their decisions are made. The ship is rigid, so it can only act on a command once news of it has crossed the hull: pick delayed controls or a lag-free control pod that the hull follows with `;` (see [`docs/SHIP_CONTROLS_CAUSALITY.md`](docs/SHIP_CONTROLS_CAUSALITY.md)). Shots, flashes and collisions are shared, and both players' replicas of the world agree bit for bit.
 
 * **Desktop:** `cargo run --release -- --host [PORT]` (player 1; port 7777 by default) and `cargo run --release -- --join HOST:PORT` (player 2).
 * **Desktop, peer to peer through NATs:** both players run `cargo run --release -- --p2p`, then paste each other's code (each player's public address comes from STUN). To skip the pasting, someone with a public IP runs `cargo run --release -- --rendezvous`, and both players run `--p2p ROOM@SERVER` with the same room name.
@@ -125,12 +125,13 @@ On touch screens, the **Thrust** and **Teleport** button rows under the viewport
 | **`1` – `6`** / **`N`**, **`B`** | Switch between the 5 Special Relativity demo scenes and the Dynamic Mode billiards scene |
 | **`W` `A` `S` `D`** / **`Space`** / **`C`** | Fire proper-acceleration thrusters (Lorentz boost in local frame) |
 | **`V`** | Toggle velocity match with the scene's moving object (Pole / Train / Traveler) |
-| **`X`** | Brake immediately to the Lab rest frame ($\boldsymbol{\beta} = 0$). In a multiplayer match, `X` and `V` steer gradually while held (see below) |
+| **`X`** | Brake immediately to the Lab rest frame ($\boldsymbol{\beta} = 0$). In Dynamic Mode, `X` and `V` steer gradually while held (see below) |
 | **`Arrow Keys`** / **`Q` `E`** | Rotate local camera look direction (Yaw / Pitch / Roll) |
 | **`G`** | Cycle Spacetime View: **Real Camera ($ds^2 = 0$)** $\to$ **God's Eye ($dt' = 0$)** $\to$ **Frontier (future cone)** $\to$ **Prophecy ($dt' = +\Delta$)** |
 | **`PageUp`** / **`PageDown`** | Push the Prophecy slice further into / back from the future ($\Delta$ = 0.5 .. 20 s) |
 | **`/`** | Emit a spherical light flash from the camera |
 | **`Enter`** / **`\`** | Dynamic Mode: fire the current ammo / cycle ammo (elastic puck, sticky puck, spore) |
+| **`;`** | Dynamic Mode: switch between delayed controls and a control pod (alone this restarts the table; in a match, only before it starts) |
 | **`H`** | Cycle Shadow Mode: **Lorentz-Invariant (Null)** $\to$ **Camera-Slice Faked** $\to$ **Off** |
 | **`M`** | Cycle Render Mode: **Shaded** $\to$ **Lookback Isochrones** $\to$ **4D Tetrahedral Mesh** $\to$ **Causal Decision Age** |
 | **`P`** | Pause / Resume observer worldline evolution |

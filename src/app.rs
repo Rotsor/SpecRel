@@ -3,9 +3,10 @@
 //! translate their own key events into [`Action`]s and [`HeldInput`], and keep only what is
 //! genuinely theirs (rendering backend, resolution, HUD visibility, presentation).
 
-use crate::dynamic::billiards::{self, Ammo, FIRE_SPEED, SHIP_ACCEL, SHIP_MASS, SHIP_RADIUS};
+use crate::dynamic::billiards::{self, Ammo, FIRE_SPEED, SHIP_RADIUS};
 use crate::dynamic::body::{BodyState, Impulse};
 use crate::dynamic::collide::P4;
+use crate::dynamic::helm::{self, CommandQueue, ControlMode, Hull, Order};
 use crate::dynamic::{DynWorld, PlayerId, ShipSample};
 use crate::minkowski::{Vec3, Vec4};
 use crate::renderer::{
@@ -59,6 +60,9 @@ pub enum Action {
     Fire,
     /// Dynamic Mode: cycle what [`Action::Fire`] launches.
     CycleAmmo,
+    /// Dynamic Mode: switch between delayed controls and a control pod ([`ControlMode`]).
+    /// Alone this restarts the table; in a match it only works before the match starts.
+    CycleControls,
 }
 
 /// Keys held down during a frame (continuous controls).
@@ -90,9 +94,10 @@ pub struct HeldInput {
     pub move_down: bool,
 }
 
-/// Multiplayer: an [`Action::Brake`] or [`Action::MatchVelocity`] in progress. The ship is a
+/// Dynamic Mode: an [`Action::Brake`] or [`Action::MatchVelocity`] in progress. The ship is a
 /// rigid body of radius [`SHIP_RADIUS`], so it cannot change velocity at once: it boosts toward
-/// `target` at [`SHIP_ACCEL`] for as long as its key stays down.
+/// `target` at its pilot's acceleration ([`ControlMode::pilot_accel`]) for as long as its key
+/// stays down.
 #[derive(Clone, Copy)]
 struct Steer {
     target: Vec4,
@@ -111,6 +116,13 @@ pub struct App {
     pub world: Option<DynWorld>,
     /// What [`Action::Fire`] launches in Dynamic Mode.
     pub ammo: Ammo,
+    /// Dynamic Mode: how the ship's controls reach its hull.
+    pub controls: ControlMode,
+    /// [`ControlMode::Delayed`]: commands on their way across the hull.
+    commands: CommandQueue,
+    /// The ship's hull. With delayed controls it is centered on the camera; with a control pod
+    /// the camera is the pod, and the hull follows it.
+    hull: Hull,
     /// Ship collision impulses whose news has not crossed the hull yet.
     kicks_in_flight: Vec<Impulse>,
     steer: Option<Steer>,
@@ -143,6 +155,9 @@ impl App {
             time_scale_idx: DEFAULT_TIME_SCALE_IDX,
             world: None,
             ammo: Ammo::Puck,
+            controls: ControlMode::default(),
+            commands: CommandQueue::default(),
+            hull: Hull::around(Frontier { origin: camera.position, proper_time: 0.0 }, camera.tetrad.e[0]),
             kicks_in_flight: Vec::new(),
             steer: None,
             scene_generation: 0,
@@ -259,7 +274,7 @@ impl App {
                         (Vec4::four_velocity_from_beta(beta), |i| i.match_velocity)
                     }
                 };
-                if multiplayer {
+                if self.is_dynamic() {
                     self.steer = Some(Steer { target, held });
                 } else {
                     self.camera.tetrad.boost_to(target);
@@ -275,6 +290,19 @@ impl App {
             Action::ProphecyDeltaDown => self.cfg.step_prophecy_delta(-1.0),
             Action::Fire => self.fire(),
             Action::CycleAmmo => self.ammo = self.ammo.next(),
+            // The pilot and the hull's center only coincide again when nothing has moved yet.
+            Action::CycleControls if multiplayer => {
+                if self.camera.proper_time == 0.0 {
+                    self.controls = self.controls.next();
+                    self.reset_helm();
+                }
+            }
+            Action::CycleControls => {
+                self.controls = self.controls.next();
+                if self.is_dynamic() {
+                    self.enter_scene(self.scene_idx);
+                }
+            }
         }
     }
 
@@ -302,6 +330,7 @@ impl App {
             rot_speed * axis(input.roll_right, input.roll_left),
         );
         let looked = self.camera;
+        let helm = (self.commands.clone(), self.hull);
 
         // 2. Proper acceleration thrusters (Lorentz boost in observer's local rest frame)
         let d_tau = if self.paused { 0.0 } else { dt_wall * self.time_scale() };
@@ -310,20 +339,34 @@ impl App {
             axis(input.thrust_up, input.thrust_down),
             axis(input.thrust_forward, input.thrust_back),
         );
-        if self.multiplayer.is_some() {
-            // The ship is rigid: its proper acceleration stays below the Rindler bound in any
-            // direction (see `SHIP_ACCEL`), per second of its own clock. Steering (`X` / `V`)
-            // takes over the thrusters while its key is held.
-            let max_boost = SHIP_ACCEL as f32 * d_tau;
+        if self.is_dynamic() {
+            // The ship is rigid, and it learns of the controls no faster than light (see
+            // `dynamic::helm`). Thrust is per second of the pilot's own clock, below the
+            // Rindler bound in any direction. Steering (`X` / `V`) takes over the thrusters
+            // while its key is held.
+            let rapidity = self.controls.pilot_accel() * d_tau;
             self.steer = self.steer.filter(|s| (s.held)(input));
-            match self.steer {
-                Some(s) => {
-                    self.camera.tetrad.boost_toward(s.target, max_boost);
-                }
+            let order = match self.steer {
+                Some(s) => Some(Order::Steer(s.target)),
                 None if thrust != Vec3::default() => {
-                    self.camera.tetrad.boost_local(thrust.normalized() * max_boost)
+                    Some(Order::Thrust(self.camera.tetrad.local_spatial_to_world(thrust.normalized())))
                 }
-                None => {}
+                None => None,
+            };
+            match self.controls {
+                ControlMode::Delayed => {
+                    if let Some(order) = order.filter(|_| d_tau > 0.0) {
+                        self.commands.issue(self.camera.proper_time, order, rapidity);
+                    }
+                    self.commands.execute_due(self.camera.proper_time, &mut self.camera.tetrad);
+                }
+                ControlMode::Pod => {
+                    // A pod that drifted into the inner wall bounces off it first.
+                    self.hull.bounce(self.camera.position, &mut self.camera.tetrad);
+                    if let Some(order) = order {
+                        order.execute(&mut self.camera.tetrad, rapidity);
+                    }
+                }
             }
         } else {
             let boost_rate = 1.25 * dt_wall; // Rapidity per second
@@ -354,15 +397,20 @@ impl App {
             self.camera.position += self.camera.tetrad.e[0] * d_tau;
             time_changed = true;
         }
+        if self.is_dynamic() {
+            self.move_hull();
+        }
 
         // 5. Multiplayer: never move into the other player's future light cone. If this frame's
-        // thrust and motion would, undo them and wait for the other player to catch up.
+        // thrust and motion would, undo them (commands already issued or executed included) and
+        // wait for the other player to catch up.
         if let Some(m) = self.multiplayer.as_mut() {
             let sample = |c: &Camera4D| {
                 ShipSample::new(Frontier { origin: c.position, proper_time: c.proper_time }, c.tetrad.e[0])
             };
             if !m.may_advance(&sample(&looked), &sample(&self.camera)) {
                 self.camera = looked;
+                (self.commands, self.hull) = helm;
             }
         }
 
@@ -382,6 +430,25 @@ impl App {
         self.dynamics.retire_flashes(self.camera.position.t);
     }
 
+    /// Bring the hull to the camera's lab time. With delayed controls it is centered on the
+    /// camera; a control pod's hull steers by what has crossed it so far.
+    fn move_hull(&mut self) {
+        match self.controls {
+            ControlMode::Delayed => self.hull = Hull::around(self.camera_frontier(), self.camera.tetrad.e[0]),
+            ControlMode::Pod => {
+                let world = self.world.as_ref().expect("dynamic scene has a world");
+                let accel = self.hull.steering(&world.ships[world.viewer as usize]);
+                self.hull.advance_to(self.camera.position.t, accel);
+            }
+        }
+    }
+
+    /// Put the hull back around the camera, with no commands under way.
+    fn reset_helm(&mut self) {
+        self.commands.clear();
+        self.hull = Hull::around(self.camera_frontier(), self.camera.tetrad.e[0]);
+    }
+
     /// Dynamic Mode: move the causal frontier to the camera and finalize what it uncovered,
     /// snapshotting the geometry at most every [`DYNAMIC_REBUILD_INTERVAL`].
     fn step_world(&mut self, dt_wall: f32) {
@@ -390,6 +457,7 @@ impl App {
         if self.multiplayer.is_none() && self.camera.position.t > DYNAMIC_REBASE_AFTER_T {
             let shift = -DYNAMIC_REBASE_AFTER_T;
             self.camera.position.t += shift;
+            self.hull.event.t += shift;
             self.dynamics.shift_time(shift);
             for kick in &mut self.kicks_in_flight {
                 kick.t += shift as f64;
@@ -403,16 +471,18 @@ impl App {
         let frontier = self.camera_frontier();
         self.dynamics.frontier = Some(frontier);
         let world = self.world.as_mut().expect("dynamic scene has a world");
-        self.world_grew |= world.advance(frontier, self.camera.tetrad.e[0]);
+        let pilot = ShipSample::new(frontier, self.camera.tetrad.e[0]);
+        self.world_grew |= world.advance_with_hull(pilot, self.hull.sample());
         self.dynamics.frontier_lag = world.frontier_lag(self.camera.tetrad.e[0]);
         if let Some(m) = self.multiplayer.as_mut() {
-            m.send_track(*world.ships[m.local() as usize].latest());
+            let ship = &world.ships[m.local() as usize];
+            m.send_track(*ship.latest(), *ship.latest_hull());
         }
 
-        // Collisions with the ship push back on it. The camera is the ship's center: it feels a
-        // kick once news of the contact has crossed the hull, like any other body.
+        // Collisions with the hull push back on it once news of the contact has crossed it,
+        // like any other body.
         self.kicks_in_flight.append(&mut world.ship_kicks);
-        let p = self.camera.position;
+        let p = self.hull.event;
         let ship = BodyState {
             step: 0,
             t: p.t as f64,
@@ -452,30 +522,41 @@ impl App {
         }
     }
 
-    /// Add collision 4-momentum `kick` to the ship (rest mass [`SHIP_MASS`]) and re-point the
-    /// camera's 4-velocity along the result.
+    /// Add collision 4-momentum `kick` to the hull. With delayed controls the camera is the
+    /// hull's center and moves with it; a control pod floats on, until the hull catches it.
     fn kick_ship(&mut self, kick: P4) {
-        let u = self.camera.tetrad.e[0];
-        let p = [
-            SHIP_MASS * u.t as f64 + kick[0],
-            SHIP_MASS * u.x as f64 + kick[1],
-            SHIP_MASS * u.y as f64 + kick[2],
-            SHIP_MASS * u.z as f64 + kick[3],
-        ];
-        let m = (p[0] * p[0] - p[1] * p[1] - p[2] * p[2] - p[3] * p[3]).sqrt();
-        let [t, x, y, z] = p.map(|c| (c / m) as f32);
-        self.camera.tetrad.boost_to(Vec4::new(t, x, y, z));
+        match self.controls {
+            ControlMode::Delayed => self.camera.tetrad.boost_to(helm::kicked(self.camera.tetrad.e[0], kick)),
+            ControlMode::Pod => self.hull.kick(kick),
+        }
     }
 
-    /// The HUD's second line: the scene description, plus the ammo in Dynamic Mode.
+    /// The HUD's second line: the scene description, plus the ammo and controls in Dynamic
+    /// Mode.
     pub fn scene_description(&self) -> String {
         let desc = self.scene().demo.description();
+        let ammo = format!("[ENTER] FIRE {} | [\\] AMMO", self.ammo.name());
         if let Some(m) = &self.multiplayer {
-            format!("[ENTER] FIRE {} | [\\] AMMO | {}", self.ammo.name(), m.status())
+            format!("{ammo} | {} | {}", self.controls_status(), m.status())
         } else if self.is_dynamic() {
-            format!("[ENTER] FIRE {} | [\\] AMMO | {desc}", self.ammo.name())
+            format!("{ammo} | {} | {desc}", self.controls_status())
         } else {
             desc.to_string()
+        }
+    }
+
+    /// The controls, for the HUD: the command lag (and whether the engines are spooling up), or
+    /// how far the pod is from the hull's center.
+    fn controls_status(&self) -> String {
+        match self.controls {
+            ControlMode::Delayed => {
+                let spooling = if self.commands.pending() > 0 { " SPOOLING" } else { "" };
+                format!("[;] DELAYED CONTROLS {:.2}S{spooling}", helm::command_delay())
+            }
+            ControlMode::Pod => {
+                let offset = self.hull.offset(self.camera.position).minkowski_norm_sq().max(0.0).sqrt();
+                format!("[;] CONTROL POD, {offset:.2} OFF CENTER")
+            }
         }
     }
 
@@ -504,6 +585,7 @@ impl App {
         self.dynamics.flashes.clear();
         self.kicks_in_flight.clear();
         self.steer = None;
+        self.reset_helm();
 
         self.world = demo.is_dynamic().then(|| match player {
             Some(p) => DynWorld::new_match(demo, &game::spawns(), p),
@@ -733,63 +815,130 @@ mod tests {
         app.camera.tetrad.gamma().acosh()
     }
 
-    /// In a match the ship is rigid: thrust in any direction (diagonals included) stays below
-    /// the Rindler bound `1 / SHIP_RADIUS` per second of the ship's clock, and a paused ship
-    /// cannot change velocity at all.
+    /// Step both players `frames` times, player 0 holding `held`.
+    fn play(p0: &mut App, p1: &mut App, frames: usize, dt: f32, held: &HeldInput) {
+        for _ in 0..frames {
+            p0.step(dt, held);
+            p1.step(dt, &HeldInput::default());
+        }
+    }
+
+    /// Frames of `dt` for delayed commands to cross the hull, with one to spare.
+    fn delay_frames(dt: f32) -> usize {
+        (helm::command_delay() / dt).ceil() as usize + 1
+    }
+
+    /// The ship is rigid and hears of its controls at light speed. With delayed controls,
+    /// thrust takes effect [`helm::command_delay`] later; then thrust in any direction
+    /// (diagonals included) stays below the Rindler bound `1 / SHIP_RADIUS` per second of the
+    /// ship's clock, and a paused ship cannot change velocity at all.
     #[test]
-    fn match_thrust_respects_the_rindler_bound() {
-        let (mut p0, _p1) = match_apps();
+    fn match_thrust_is_delayed_and_respects_the_rindler_bound() {
+        let (mut p0, mut p1) = match_apps();
+        assert_eq!(p0.controls, ControlMode::Delayed);
         let all = HeldInput {
             thrust_forward: true,
             thrust_right: true,
             thrust_up: true,
             ..Default::default()
         };
-        p0.step(0.1, &all);
-        let accel = rapidity(&p0) / 0.1;
-        assert!((accel - SHIP_ACCEL as f32).abs() < 1e-3, "proper acceleration {accel}");
-        assert!(accel * SHIP_RADIUS as f32 <= 0.8 + 1e-4);
+        let (dt, a) = (0.05, billiards::SHIP_ACCEL as f32);
+        let mut before = 0.0;
+        for frame in 0..40 {
+            let tau = p0.camera.proper_time;
+            play(&mut p0, &mut p1, 1, dt, &all);
+            let r = rapidity(&p0);
+            if tau < helm::command_delay() {
+                assert_eq!(r, 0.0, "frame {frame}: the command has not crossed the hull yet");
+                assert!(p0.scene_description().contains("SPOOLING"));
+            } else {
+                let accel = (r - before) / dt;
+                assert!((accel - a).abs() < 1e-2, "frame {frame}: proper acceleration {accel}");
+                assert!(accel * SHIP_RADIUS as f32 <= 0.8 + 1e-3);
+            }
+            before = r;
+        }
 
-        p0.apply(Action::Slower); // half as much proper time per frame: half the boost
-        let before = rapidity(&p0);
-        p0.step(0.1, &all);
-        assert!((rapidity(&p0) - before - 0.05 * SHIP_ACCEL as f32).abs() < 1e-3);
-
+        // Paused, the clock stands still: the command due right now still executes, then
+        // nothing more is issued or comes due.
         p0.apply(Action::TogglePause);
+        play(&mut p0, &mut p1, 1, dt, &all);
         let u = p0.camera.tetrad.e[0];
-        p0.step(0.1, &all);
+        play(&mut p0, &mut p1, 3, dt, &all);
         assert_eq!(p0.camera.tetrad.e[0], u, "no proper time, no boost");
     }
 
-    /// In a match `X` brakes gradually while held, and releasing it mid-brake coasts on.
+    /// `X` brakes gradually while held, and releasing it mid-brake coasts on (once the
+    /// commands have crossed the hull).
     #[test]
     fn match_brake_is_gradual_and_stops_on_release() {
-        let (mut p0, _p1) = match_apps();
-        let dt = 0.05;
-        let forward = HeldInput { thrust_forward: true, ..Default::default() };
-        for _ in 0..10 {
-            p0.step(dt, &forward);
-        }
+        let (mut p0, mut p1) = match_apps();
+        let (dt, a) = (0.05, billiards::SHIP_ACCEL as f32);
+        let wait = delay_frames(dt);
+        let idle = HeldInput::default();
+        play(&mut p0, &mut p1, 10, dt, &HeldInput { thrust_forward: true, ..Default::default() });
+        play(&mut p0, &mut p1, wait, dt, &idle);
         let cruise = rapidity(&p0);
-        assert!((cruise - 10.0 * dt * SHIP_ACCEL as f32).abs() < 1e-3);
+        assert!((cruise - 10.0 * dt * a).abs() < 1e-3, "{cruise}");
 
         let brake = HeldInput { brake: true, ..Default::default() };
         p0.apply(Action::Brake);
-        p0.step(dt, &brake);
-        p0.step(dt, &brake);
+        play(&mut p0, &mut p1, 2, dt, &brake);
+        play(&mut p0, &mut p1, 1, dt, &idle); // released: coast
+        play(&mut p0, &mut p1, 1, dt, &brake); // held again without a new press: still coasting
+        play(&mut p0, &mut p1, wait, dt, &idle);
         let braked = rapidity(&p0);
-        assert!((cruise - braked - 2.0 * dt * SHIP_ACCEL as f32).abs() < 1e-3, "{cruise} -> {braked}");
-
-        p0.step(dt, &HeldInput::default()); // released: coast
-        assert!((rapidity(&p0) - braked).abs() < 1e-4);
-        p0.step(dt, &brake); // held again without a new press: still coasting
-        assert!((rapidity(&p0) - braked).abs() < 1e-4);
+        assert!((cruise - braked - 2.0 * dt * a).abs() < 1e-3, "{cruise} -> {braked}");
 
         p0.apply(Action::Brake);
-        for _ in 0..20 {
-            p0.step(dt, &brake);
-        }
+        play(&mut p0, &mut p1, 20, dt, &brake);
+        play(&mut p0, &mut p1, wait, dt, &idle);
         assert_eq!(p0.camera.tetrad.beta(), Vec3::default(), "came to rest in the lab");
+    }
+
+    /// With a control pod the pilot accelerates at once; the hull only follows once news of it
+    /// has crossed the hull, and the other player sees the two apart.
+    #[test]
+    fn a_control_pod_responds_at_once_and_its_hull_follows() {
+        let (mut p0, mut p1) = match_apps();
+        p0.apply(Action::CycleControls); // before the match starts
+        assert_eq!(p0.controls, ControlMode::Pod);
+        let dt = 0.05;
+        let forward = HeldInput { thrust_forward: true, ..Default::default() };
+        play(&mut p0, &mut p1, 2, dt, &forward);
+        assert!(p0.camera.proper_time > 0.0);
+        assert!(rapidity(&p0) > 0.9 * helm::pod_accel() * dt, "no lag");
+        assert_eq!(p0.hull.u, Vec4::new(1.0, 0.0, 0.0, 0.0), "the hull hasn't heard yet");
+
+        p0.apply(Action::CycleControls); // too late now
+        assert_eq!(p0.controls, ControlMode::Pod);
+
+        play(&mut p0, &mut p1, 40, dt, &forward);
+        assert!(p0.hull.u.z > 0.1, "the hull follows: {:?}", p0.hull.u);
+        let offset = p0.hull.offset(p0.camera.position).minkowski_norm_sq().sqrt();
+        assert!(offset > 0.02 && offset < SHIP_RADIUS as f32, "pod off center by {offset}");
+        assert!(p0.scene_description().contains("CONTROL POD"));
+
+        // Player 1 has player 0's hull and pilot tracks, apart, exactly as player 0 recorded them.
+        play(&mut p0, &mut p1, 5, dt, &HeldInput::default());
+        let (mine, seen) = (&p0.world.as_ref().unwrap().ships[0], &p1.world.as_ref().unwrap().ships[0]);
+        let last = *seen.latest();
+        let i = mine.track.iter().position(|s| *s == last).expect("player 1 heard player 0's track");
+        assert_eq!(mine.hull[i], *seen.latest_hull());
+        assert!((last.pos[2] - seen.latest_hull().pos[2]).abs() > 0.02, "pilot and hull apart");
+    }
+
+    /// Alone, switching the controls restarts the table.
+    #[test]
+    fn switching_controls_alone_restarts_the_table() {
+        let mut app = billiards_app();
+        app.step(0.5, &HeldInput::default());
+        assert!(app.camera.proper_time > 0.0);
+        app.apply(Action::CycleControls);
+        assert_eq!(app.controls, ControlMode::Pod);
+        assert_eq!(app.camera.proper_time, 0.0);
+        app.apply(Action::CycleControls);
+        assert_eq!(app.controls, ControlMode::Delayed);
     }
 
     /// A match starts paused: nothing moves, and the ship can't thrust or fire, until the

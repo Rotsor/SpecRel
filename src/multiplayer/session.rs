@@ -18,7 +18,7 @@ use crate::renderer::Frontier;
 pub enum Event {
     /// The peer said hello with a compatible protocol.
     Joined(PlayerId),
-    Track { sample: ShipSample, waiting: bool },
+    Track { sample: ShipSample, hull: ShipSample, waiting: bool },
     Fire { at: Frontier, vel: [f64; 3], ammo: Ammo },
     Flash(Vec4),
     /// The peer quit or the link closed. Emitted once; nothing follows it.
@@ -150,7 +150,7 @@ impl Session {
                 events.push(Event::Joined(player));
             }
             _ if !self.joined => events.push(Event::Error(format!("{msg:?} before Hello"))),
-            Message::Track { sample, waiting } => events.push(Event::Track { sample, waiting }),
+            Message::Track { sample, hull, waiting } => events.push(Event::Track { sample, hull, waiting }),
             Message::Fire { at, vel, ammo } => events.push(Event::Fire { at, vel, ammo }),
             Message::Flash { at } => events.push(Event::Flash(at)),
             Message::Bye => self.peer_gone(events),
@@ -178,7 +178,7 @@ mod tests {
 
     fn track(i: u32) -> Message {
         let sample = ShipSample { t: i as f64, pos: [0.0; 3], vel: [0.0; 3], tau: i as f64 };
-        Message::Track { sample, waiting: false }
+        Message::Track { sample, hull: sample, waiting: false }
     }
 
     /// The `t` of every `Track`, `-1` for `Joined`; panics on anything else.

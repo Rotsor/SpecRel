@@ -48,6 +48,7 @@ pub const KEY_PAGE_DOWN: u32 = 23;
 pub const KEY_6: u32 = 24;
 pub const KEY_ENTER: u32 = 25;
 pub const KEY_BACKSLASH: u32 = 26;
+pub const KEY_SEMICOLON: u32 = 19;
 
 // Continuous held-key bitflags (100 + bit index)
 pub const HOLD_LEFT: u32 = 100;
@@ -82,6 +83,7 @@ fn key_action(code: u32) -> Option<Action> {
         KEY_6 => Action::SelectScene(5),
         KEY_ENTER => Action::Fire,
         KEY_BACKSLASH => Action::CycleAmmo,
+        KEY_SEMICOLON => Action::CycleControls,
         KEY_N => Action::NextScene,
         KEY_B => Action::PrevScene,
         KEY_M => Action::CycleRenderMode,

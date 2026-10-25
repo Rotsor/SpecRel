@@ -1,7 +1,7 @@
 # Ship controls are still faster than light
 
-**Status:** open. This note describes the problem and the options for fixing it. Nothing here is
-implemented yet.
+**Status:** options A and C are implemented (`src/dynamic/helm.rs`); the player switches between
+them with `;`. See [What was built](#what-was-built) at the end. Option B is not implemented.
 
 ## The problem
 
@@ -149,3 +149,53 @@ for much less code.
 * Ships are drawn with `phi = 0` and `proper_accel_local = 0` (`ShipSample::sample`), so the
   other player's clock faces don't show the Born-rigid proper-time gradient while that player
   accelerates. Option A makes it straightforward to fill these in from the executed commands.
+
+## What was built
+
+Both options run in every Dynamic Mode game, single-player included (`ControlMode` in
+`src/dynamic/helm.rs`; `;` switches it, restarting the table when alone and only before the start
+in a match). `SHIP_RADIUS` and `SHIP_ACCEL` are unchanged, so the numbers are the ones for today's
+ship; shrinking the ship is the lever for less lag, as the tables above show.
+
+**Every ship has two tracks** (`Ship::track`, `Ship::hull`). The pilot's track is the camera: it
+bounds the frontier, and shots and flashes leave from it. The hull centre's track, at the same lab
+times, is what bodies collide with (`Ship::hull_at`). `Ship::seen_from` is gone: the hull moves
+causally, so contacts use the rigid hull as it is. Kicks reach the hull once their news has
+crossed it, as before.
+
+**Option A (`ControlMode::Delayed`, the default).** The camera is the hull's centre, and the two
+tracks coincide. Each frame's thrust or steering becomes an `Order` stamped with the ship's clock
+and queued (`CommandQueue`), and executes `command_delay()` = 0.80 s of ship time later. A thrust
+order keeps its lab-frame direction and is re-projected onto the rest frame at execution time;
+steering boosts toward its target from the velocity then. When the multiplayer pacer holds the
+ship back, the frame's queue changes are undone with the rest of the frame. The HUD shows
+**SPOOLING** while commands are on their way.
+
+**Option C (`ControlMode::Pod`).** The camera is the pod. It thrusts at once at `pod_accel()`
+(0.35 c/s, the formula above with `POD_RANGE` = R/2 and the corrected delay below) and floats
+inside the hull. The hull (`Hull`) steers with a critically damped controller (2 rad/s), capped at
+`SHIP_ACCEL`, toward its best knowledge of the pod (`Hull::predict_pilot`): the pod's state on
+the hull's own simultaneity slice `pod_delay()` ago, flown on with the acceleration it had then,
+and bounced off the inner wall wherever the hull's own recorded track put it. The hull's own past
+is known to all of it, so this uses nothing that hasn't crossed the hull. The wall replay
+matters: without it the hull steered by bounces it heard of a second late, overshot, and the pod
+rattled between the walls with growing amplitude. With it, bursts, reversals and coasting all
+settle (`station_keeping_settles_after_any_burst`); the pod peaks about 0.2 off centre. A pod that
+outruns the hull hits the inner wall at `POD_RANGE` and loses its outward speed relative to the
+hull (`WALL_RESTITUTION` = 0). The hull ignores the push: it is much heavier.
+
+Two corrections to the sketch above:
+
+* **The pod's delay.** Light from a pod `s` ahead of the centre to the rear wall takes
+  `ln((1 + a s) / (1 − a R)) / a` of the centre's time, not the Option A formula at `R + s`
+  (which would put the rear past the horizon here). With `s` = 0.2 that is `pod_delay()` = 0.97 s
+  (`signal_delay`, checked against the Rindler worldlines in a test).
+* **The protocol changes.** Instead of each replica recomputing the hull from the pod's track (which
+  would need bit-identical `f32` transcendental functions on every platform), the owner sends both
+  samples in each `Track` message (protocol version 2).
+
+**Seeing the decision centre.** Other players' ships are drawn as an open cage of bars along the
+hull track (`Ship::hull_mesh`, materials 12–15 in the player's colour), with the pilot's clock cube
+inside it on the pilot's track (`Ship::pilot_mesh`). With delayed controls the clock sits at the
+centre; with a pod it visibly drifts toward the wall the pilot is thrusting at, and the cage
+catches up about a second later.
