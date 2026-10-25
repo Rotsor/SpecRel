@@ -81,6 +81,62 @@ by roughly `a·R²`, and its shape relaxes back afterwards. This needs per-verte
 rendering (`build_worldtube_simplices` assumes a rigid extrusion), a hull shape for contacts that
 isn't a sphere, and a rule for how the hull relaxes. That isn't a small change.
 
+## Option C: a control pod with no lag inside a delayed hull
+
+The pilot sits in a small control pod that can move inside the hull. The camera is the pod, and
+it accelerates at once. The pod pushes off the ship's inner structure, and that push spreads
+outward no faster than light, so the push itself is the command signal. The hull is rigid and
+fires its engines once the signal has reached all of it. From outside this is Option A: a rigid
+hull obeying causal commands. In the cockpit the controls have no lag. The pod is tiny, so the
+Rindler limit barely constrains it.
+
+**The hull can't replay the pod's manoeuvres late.** If the hull flew the pod's exact
+acceleration history `D` later, its path would be the pod's path shifted by `D` in time in the
+original rest frame (Bell's spaceship paradox). Seen from the ship's current frame, that shift
+includes a distance of `D·γv` between the hull's centre and the pod. At `D = 0.8`, `v = 0.6c`
+that is 0.6, more than the hull radius of 0.4, so the pilot would leave through the front of the
+ship. The hull has to keep station on the pod instead: steer toward where the pod now is, judging
+from information `D` old, with spare acceleration beyond the pod's own.
+
+**How hard the pod can push.** Suppose the pod accelerates at `a_c` and the hull at up to `a_h`.
+The pod drifts furthest from the centre when the hull reacts `D` late and then burns harder to
+stop the relative motion. A rough non-relativistic estimate, ignoring the extra overshoot from
+the hull's own delay (so leave a margin):
+
+```
+max offset ≈ ½ · a_c · D² · a_h / (a_h − a_c)
+```
+
+If the pod may use half the hull's radius:
+
+| hull R | hull a_h (fraction of the limit) | delay D | lag-free pod accel a_c |
+| ---: | ---: | ---: | ---: |
+| 0.4 (now) | 2.0 (0.8) | 0.80 s | ≈ 0.5 c/s |
+| 0.1 | 8.0 (0.8) | 0.20 s | ≈ 1.9 c/s |
+| 0.1 | 3.0 (0.3) | 0.12 s | ≈ 2.1 c/s |
+
+The allowed `a_c` scales like `1/R`, the same as the rigidity limit. Keeping today's 2 c/s with
+no lag needs a ship of about R = 0.1. At that size Option A lags only about 0.11 s. So Option C
+saves about 0.1 s of lag, which is a few frames. At today's size it would cost three quarters of
+the acceleration.
+
+**Implementation sketch (fairly contained):**
+* **Hull track:** a station-keeping controller, capped at `a_h`, that sees the pod's track only
+  after delay `D`. The hull's track is a fixed function of the pod's track, so every replica
+  computes it locally and the network protocol doesn't change. `D` must cover the distance to the
+  far wall plus the pod's offset (`R + s`), using the formula in Option A.
+* **Contacts and drawing:** pucks collide with the hull track, and the other player's ship is
+  drawn from it, not from the pod's track. This replaces `Ship::seen_from`.
+* **The pod hitting the wall:** a pod that outruns the hull hits the inner wall and gets kicked.
+  That's a local, causal hull–pod contact, and it plays like hitting your own bulkhead.
+* **Shots and flashes** still leave from the pod, which is where the pilot is.
+* **Frontier:** the hull's motion at an event depends only on pod events in that event's causal
+  past, so the "outside every player's future cone" rule needs no change.
+
+**Verdict:** the most elegant of the three options, and physically sound. But it only feels
+clearly better than Option A for small ships, and there Option A's lag nearly disappears anyway,
+for much less code.
+
 ## What doesn't help
 
 * **Moving the control point.** The centre already minimises the distance to the farthest part.
