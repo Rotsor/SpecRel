@@ -72,8 +72,29 @@ the hull centre's (contacts, kicks). Both travel in `Track` messages. The other 
 drawn as an open cage along the hull track, with the pilot's clock cube inside it on the pilot's
 track, so you can see where its decisions are made.
 
+**God's eye shows what is still open.** In single player the God's-eye slice (`dt' = 0` in the
+camera frame) lies wholly outside the camera's future cone, so all of it is decided. In a match
+the slice can reach into `I⁺(O_remote)` when the other player lags behind in the camera's frame.
+Those parts are drawn in the same violet haze as the Prophecy slice: the renderers haze every
+event inside the future cone of the latest known event of any other live ship
+(`FrameDynamics::remote_origins`), plus, on the Prophecy slice, the camera's own.
+
 A player with `Δt ≤ 0` never needs to stop, so at least one player can always move. Both can be
 stopped only briefly, when their information about each other is stale; heartbeats resolve that.
+**Latency figures.** In a match the HUD's time-controls line shows, once the other player has
+joined:
+
+* `NET RTT`: the wall-clock round trip, from a `Ping` (sent every 0.5 s) to its `Pong`, smoothed.
+  Both sides' frame times are included, since messages are read once per frame.
+* `CM LEAD`: the CM time `Δt` by which my latest event leads the other ship's latest known one
+  (what the pacer compares against).
+* `INTERVAL`: the invariant interval between those two events, as a distance. The pacer keeps it
+  spacelike, except that a ship within one step of the other may poke one step into its cone;
+  it then shows `TIMELIKE` and a proper time.
+* `CM DIST`: the distance between the two ships in the CM frame at equal CM time (the other ship
+  coasted inertially to my event's CM time).
+* `WAITING`: the share of the last ~5 s of wall time this player spent waiting.
+
 Until the other player has joined (their `Hello` has arrived), the match is paused: the ship
 cannot move or fire, so the world does not advance either, and the HUD shows **WAITING FOR A
 PLAYER TO JOIN**. Their ship is then taken to be at its spawn event, at rest, until their first
@@ -120,7 +141,7 @@ src/multiplayer/rendezvous.rs  UDP rendezvous server (--rendezvous) and its clie
 src/multiplayer/session.rs  Session: Hello handshake, sequencing, log replay, events
 src/app.rs                  App::new_multiplayer; applies remote events; paces the local ship
 src/main.rs, src/web.rs, web/index.html   transports, CLI/URL, "waiting" banner
-server/signal.mjs           HTTP signalling server for web matches (rooms, offer/answer long-poll)
+rendezvous/server.mjs       generic HTTP rendezvous server (rooms of write-once slots, long-poll)
 ```
 
 ### Session protocol
@@ -130,10 +151,11 @@ Every frame is `seq: u32 LE` followed by one encoded `Message`:
 | Message | Payload |
 |---|---|
 | `Hello` | protocol version, sender's `PlayerId` |
-| `Track` | the pilot's and the hull centre's `ShipSample` (t, pos, vel, τ as `f64`, at the same lab time) and the sender's waiting flag; sent every frame, including while waiting, as a heartbeat (protocol version 2) |
+| `Track` | the pilot's and the hull centre's `ShipSample` (t, pos, vel, τ as `f64`, at the same lab time) and the sender's waiting flag; sent every frame, including while waiting, as a heartbeat (protocol version 3) |
 | `Fire` | firing event (`Frontier`, `f32`), lab velocity (`f64` ×3), ammo |
 | `Flash` | emission event (`f32` ×4) |
 | `Bye` | sender quits |
+| `Ping` / `Pong` | the sender's wall clock (`f64` seconds); `Pong` echoes a `Ping`'s, timing the round trip |
 
 Links are reliable and ordered once open (TCP, reliable UDP, BroadcastChannel, WebRTC), but frames sent
 before the peer was listening are lost. A session therefore keeps a log of everything it has sent
@@ -196,33 +218,36 @@ The players carry the SDP offer and answer by hand. The host's page shows an inv
 joiner pastes it and gets a reply code, and the host pastes that. The data channel is reliable
 and ordered, and both sides pre-negotiate it as id 0.
 
-**Web with a signalling server (`?p2p=host&room=NAME`).** To skip the pasting, run
-`node server/signal.mjs` (no dependencies, Node 18+, HTTP port 8787 by default) on any host the
-two browsers can reach. Both players open the game with the same `room`, and with
-`&signal=https://server.example.com` when the game is not served by that same server. The host
-posts its offer to `/rooms/NAME/offer` and long-polls `/rooms/NAME/answer`. The joiner long-polls
-the offer and posts its answer. The SDP is the same one the codes carry, with every candidate in
-it, so the server sees just these two messages and no game traffic. A room takes one host and one
-joiner. It is dropped 30 s after the host fetches the answer, or after 10 minutes. With
-`--static web` the server also serves the game itself, so `signal=` is not needed:
+**Web with a rendezvous server (`?p2p=host&room=NAME`).** To skip the pasting, the browsers swap
+the offer and answer through `rendezvous/server.mjs`, a generic rendezvous server that knows
+nothing about this game (no dependencies, Node 18+, HTTP port 8787 by default). Both players open
+the game with the same `room`. The server is found at the page's own origin, or at
+`&signal=https://server.example.com`. The game uses the room `/v1/specrel-4d/VERSION/NAME`, where
+VERSION is the first 16 hex digits of the SHA-256 of `spec-rel.wasm`: the host puts its offer in
+the slot `offer` and long-polls `answer`, the joiner long-polls `offer` and puts `answer`, and
+the host then deletes the room. The SDP is the same one the codes carry, with every candidate in
+it, so the server sees just these two messages and no game traffic. A player on another build
+gets a version mismatch at once (the server pins each room to the version that first used it),
+instead of a match whose worlds drift apart. Locally:
 
 ```
-node server/signal.mjs --port 8787 --static web
-# player 1: http://server:8787/?p2p=host&room=myroom
-# player 2: http://server:8787/?p2p=join&room=myroom
+node rendezvous/server.mjs                  # rendezvous on :8787
+python3 -m http.server 8000                 # the repo root, so the page finds target/…/spec-rel.wasm
+# player 1: http://localhost:8000/web/?p2p=host&room=myroom&signal=http://localhost:8787
+# player 2: http://localhost:8000/web/?p2p=join&room=myroom&signal=http://localhost:8787
 ```
 
 The **Create online lobby** button does the same with a fresh random room name (`k7m-q2xp`) and
 shows the host the joiner's link to share. A lobby stays open while its host keeps polling for an
 answer.
 
-The page needs a secure context (`https://` or `localhost`) for WebGPU, so on a public host put
-the server behind a TLS reverse proxy (Caddy, nginx and so on). See [`HOSTING.md`](HOSTING.md).
+The page needs a secure context (`https://` or `localhost`) for WebGPU, so on a public host the
+game and the server sit behind a TLS reverse proxy. See [`HOSTING.md`](HOSTING.md).
 
 **Relay.** When ICE finds no direct path (both players behind symmetric NATs, or UDP blocked),
 the data channel goes through a TURN relay instead. The page fetches its ICE servers from the
-signalling server's `/turn`, which, when `TURN_SECRET` and `TURN_URLS` are set, adds a TURN
-server with time-limited credentials (the TURN REST API scheme: username `EXPIRY:specrel`,
+rendezvous server's `/v1/ice-servers`, which, when `TURN_SECRET` and `TURN_URLS` are set, adds a TURN
+server with time-limited credentials (the TURN REST API scheme: username `EXPIRY`,
 password `base64(HMAC-SHA1(secret, username))`, valid 24 h). coturn checks them with
 `use-auth-secret`. The browser still prefers a direct path, so the relay carries only the
 matches that need it.

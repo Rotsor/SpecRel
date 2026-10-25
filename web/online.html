@@ -93,7 +93,7 @@
     </div>
 
     <h2>The easy way: a lobby link</h2>
-    <p>If this game is served by a SpecRel lobby server, press <b>Create online lobby</b> under the game. A
+    <p>If this game is served next to a rendezvous server, press <b>Create online lobby</b> under the game. A
       panel shows a link: copy it and send it to the other player. When they open it you are both in, and the
       game starts. Until then the game stays paused. If no direct path exists between your two networks, the
       server also relays the game traffic, so this works on almost any network.</p>
@@ -142,11 +142,10 @@
 
     <h2>Other ways to play together</h2>
     <ul>
-      <li><b>With a room name of your choice:</b> if someone runs the SpecRel lobby server
-        (<code>node server/signal.mjs --static web</code>), open the game from it with
+      <li><b>With a room name of your choice:</b> open the game with
         <code>?p2p=host&amp;room=NAME</code> and <code>?p2p=join&amp;room=NAME</code>. The browsers then swap the
-        codes through the server and nobody has to paste anything. If the game page is hosted somewhere else, add
-        <code>&amp;signal=https://your-server</code>.</li>
+        codes through the rendezvous server and nobody has to paste anything. If the game page is not served
+        next to a rendezvous server, add <code>&amp;signal=https://your-server</code>.</li>
       <li><b>On one computer:</b> <a href="./?mp=0">player 1</a> and <a href="./?mp=1" target="_blank">player 2</a>
         in two tabs (or the <i>Start 2-player match</i> button in the game). The tabs talk to each other
         directly, with no codes.</li>

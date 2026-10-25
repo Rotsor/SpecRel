@@ -199,6 +199,19 @@ impl App {
         self.multiplayer.as_ref().and_then(Match::banner)
     }
 
+    /// Multiplayer: `secs` of real wall-clock time passed (unclamped, unlike `step`'s
+    /// `dt_wall`). Times the round trip to the other player.
+    pub fn tick_wall_clock(&mut self, secs: f64) {
+        if let Some(m) = self.multiplayer.as_mut() {
+            m.tick(secs);
+        }
+    }
+
+    /// Multiplayer: the HUD's line of latency figures (see [`Match::metrics`]).
+    pub fn net_metrics(&self) -> Option<String> {
+        self.multiplayer.as_ref().and_then(Match::metrics)
+    }
+
     /// Tell the other player we are leaving (call before quitting).
     pub fn leave_match(&mut self) {
         if let Some(m) = self.multiplayer.as_mut() {
@@ -474,6 +487,7 @@ impl App {
         let pilot = ShipSample::new(frontier, self.camera.tetrad.e[0]);
         self.world_grew |= world.advance_with_hull(pilot, self.hull.sample());
         self.dynamics.frontier_lag = world.frontier_lag(self.camera.tetrad.e[0]);
+        self.dynamics.remote_origins = world.remote_origins();
         if let Some(m) = self.multiplayer.as_mut() {
             let ship = &world.ships[m.local() as usize];
             m.send_track(*ship.latest(), *ship.latest_hull());
@@ -594,6 +608,8 @@ impl App {
         self.dynamics.frontier = self.world.as_ref().map(|w| w.frontier);
         let u = self.camera.tetrad.e[0];
         self.dynamics.frontier_lag = self.world.as_ref().map_or(0.0, |w| w.frontier_lag(u));
+        self.dynamics.remote_origins =
+            self.world.as_ref().map_or(Vec::new(), DynWorld::remote_origins);
         if self.is_dynamic() {
             self.time_scale_idx = self.time_scale_idx.max(FIRST_FORWARD_TIME_SCALE_IDX);
             self.rebuild_dynamic_scene();
@@ -968,6 +984,25 @@ mod tests {
         }
         assert!(p0.camera.proper_time > 0.5 && p1.camera.proper_time > 0.5);
         assert_eq!(p0.banner(), None);
+    }
+
+    /// The HUD's latency line: the wall-clock round trip, and the two ships' separation.
+    #[test]
+    fn a_match_reports_its_latency() {
+        let (mut p0, mut p1) = match_apps();
+        assert_eq!(p0.net_metrics(), None, "nobody has joined yet");
+        for _ in 0..2 {
+            p0.step(0.05, &HeldInput::default());
+            p1.step(0.05, &HeldInput::default());
+        }
+        assert!(p0.net_metrics().unwrap().starts_with("NET RTT -- | CM LEAD "));
+        p0.tick_wall_clock(1.0); // pings
+        p1.step(0.05, &HeldInput::default()); // answers
+        p0.tick_wall_clock(0.25);
+        p0.step(0.05, &HeldInput::default()); // hears the answer
+        let line = p0.net_metrics().unwrap();
+        assert!(line.starts_with("NET RTT 250MS | CM LEAD "), "{line}");
+        assert!(line.contains("| INTERVAL 25.00LS | CM DIST 25.00LS |"), "{line}"); // the spawns
     }
 
     /// Shots, flashes and the worlds they shape are shared: both replicas agree.

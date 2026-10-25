@@ -99,6 +99,7 @@ pub fn draw_hud(
     fb: &mut [u32],
     demo: DemoScene,
     desc: &str,
+    net: Option<&str>,
     camera: &Camera4D,
     cfg: &RenderConfig,
     paused: bool,
@@ -117,6 +118,7 @@ pub fn draw_hud(
         0,
         demo,
         desc,
+        net,
         camera,
         cfg,
         paused,
@@ -134,6 +136,7 @@ pub fn draw_hud_overlay(
     overlay: &mut [u32],
     demo: DemoScene,
     desc: &str,
+    net: Option<&str>,
     camera: &Camera4D,
     cfg: &RenderConfig,
     paused: bool,
@@ -162,6 +165,7 @@ pub fn draw_hud_overlay(
         0xFF00_0000,
         demo,
         desc,
+        net,
         camera,
         cfg,
         paused,
@@ -180,6 +184,7 @@ fn draw_hud_lines(
     alpha_mask: u32,
     demo: DemoScene,
     desc: &str,
+    net: Option<&str>,
     camera: &Camera4D,
     cfg: &RenderConfig,
     paused: bool,
@@ -225,7 +230,11 @@ fn draw_hud_lines(
         view_name,
         cfg.shadow_mode.name(),
     );
-    let line4 = "TIME: [P] PAUSE | [T] REWIND | [-/=] SPEED | [ / ] SCRUB T | [R] RESET | [/] FLASH | [PGUP/DN] DELTA";
+    // In a match the latency figures take the place of the time controls, most of which are
+    // disabled there anyway.
+    let line4 = net.unwrap_or(
+        "TIME: [P] PAUSE | [T] REWIND | [-/=] SPEED | [ / ] SCRUB T | [R] RESET | [/] FLASH | [PGUP/DN] DELTA",
+    );
     let line5 =
         "THRUST: WASD/SPC/C | MATCH VEL: [V] | BRAKE: [X] | LOOK: ARROWS/QE | MOVE: IJKL/UO";
 

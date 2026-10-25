@@ -13,7 +13,7 @@ use crate::mesh4d::SurfacePattern;
 use crate::minkowski::Vec4;
 use crate::renderer::{
     gamma_lut, Camera4D, FrameDynamics, RenderConfig, RenderMode, ShadowMode, SliceMode,
-    MAX_FLASHES,
+    MAX_FLASHES, MAX_HAZE_ORIGINS,
 };
 use crate::scene::Scene4D;
 use bytemuck::{Pod, Zeroable};
@@ -97,6 +97,9 @@ pub(crate) struct GpuUniforms {
     pub(crate) num_flashes: u32,
     pub(crate) frontier_tau: f32,
     pub(crate) prophecy_delta: f32,
+    pub(crate) num_haze: u32,
+    pub(crate) _pad: [u32; 3],
+    pub(crate) haze_origin: [[f32; 4]; MAX_HAZE_ORIGINS],
     pub(crate) flash_at: [[f32; 4]; MAX_FLASHES],
     pub(crate) flash_col_width: [[f32; 4]; MAX_FLASHES],
 }
@@ -123,6 +126,11 @@ impl GpuUniforms {
             flash_col_width[i] = [c.x, c.y, c.z, f.width];
         }
         let frontier = dynamics.frontier_or_camera(camera);
+        let haze = dynamics.haze_origins(camera, cfg.slice_mode);
+        let mut haze_origin = [[0.0; 4]; MAX_HAZE_ORIGINS];
+        for (slot, &o) in haze_origin.iter_mut().zip(&haze) {
+            *slot = v4(o);
+        }
 
         Self {
             cam_pos: v4(camera.position),
@@ -153,6 +161,9 @@ impl GpuUniforms {
             num_flashes: flashes.len() as u32,
             frontier_tau: frontier.proper_time,
             prophecy_delta: cfg.prophecy_delta,
+            num_haze: haze.len().min(MAX_HAZE_ORIGINS) as u32,
+            _pad: [0; 3],
+            haze_origin,
             flash_at,
             flash_col_width,
         }
@@ -657,6 +668,8 @@ mod tests {
                 ("frontier_view_offset", offset_of!(GpuUniforms, frontier_view_offset)),
                 ("num_flashes", offset_of!(GpuUniforms, num_flashes)),
                 ("frontier_tau", offset_of!(GpuUniforms, frontier_tau)),
+                ("num_haze", offset_of!(GpuUniforms, num_haze)),
+                ("haze_origin", offset_of!(GpuUniforms, haze_origin)),
                 ("flash_at", offset_of!(GpuUniforms, flash_at)),
                 ("flash_col_width", offset_of!(GpuUniforms, flash_col_width)),
             ],
@@ -701,6 +714,7 @@ mod tests {
             let dynamics = FrameDynamics {
                 frontier: None,
                 frontier_lag: 0.0,
+                remote_origins: Vec::new(),
                 flashes: vec![
                     crate::renderer::FlashEvent {
                         at: flash_at(3.0),
@@ -766,6 +780,7 @@ mod tests {
             frontier: Some(world.frontier),
             flashes: Vec::new(),
             frontier_lag: world.frontier_lag(cam.tetrad.e[0]),
+            remote_origins: Vec::new(),
         };
         let mut gpu = match GpuRenderer::new(std::slice::from_ref(&scene)) {
             Ok(g) => g,
@@ -863,9 +878,13 @@ mod tests {
                 proper_time: 24.0,
             }),
             frontier_lag: 0.0,
+            // Another player 3 s behind: its cone reaches the God's-eye slice.
+            remote_origins: vec![cam.position + Vec4::new(-3.0, 2.0, 0.0, 6.0)],
             flashes: Vec::new(),
         };
-        for slice_mode in [SliceMode::PastLightCone, SliceMode::ProphecySlice] {
+        for slice_mode in
+            [SliceMode::PastLightCone, SliceMode::CameraSimultaneity, SliceMode::ProphecySlice]
+        {
             let cfg = RenderConfig {
                 width: w,
                 height: h,

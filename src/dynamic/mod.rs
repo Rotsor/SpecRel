@@ -412,6 +412,16 @@ impl DynWorld {
         }
     }
 
+    /// The latest known events of the other live ships: the apexes of the cones that, besides
+    /// the viewer's own, keep the world undecided.
+    pub fn remote_origins(&self) -> Vec<Vec4> {
+        self.ships
+            .iter()
+            .filter(|s| s.is_live() && s.player != self.viewer)
+            .map(|s| s.latest().event())
+            .collect()
+    }
+
     /// How far (in the camera's proper time, for a camera moving with 4-velocity `u`) the live
     /// bodies' finalized tips trail the frontier: the largest decision age of a tip, plus one
     /// step so the last prism is in view. The Frontier view looks back by this much so that

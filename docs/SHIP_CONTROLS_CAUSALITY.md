@@ -192,7 +192,7 @@ Two corrections to the sketch above:
   (`signal_delay`, checked against the Rindler worldlines in a test).
 * **The protocol changes.** Instead of each replica recomputing the hull from the pod's track (which
   would need bit-identical `f32` transcendental functions on every platform), the owner sends both
-  samples in each `Track` message (protocol version 2).
+  samples in each `Track` message (protocol version 3).
 
 **Seeing the decision centre.** Other players' ships are drawn as an open cage of bars along the
 hull track (`Ship::hull_mesh`, materials 12–15 in the player's colour), with the pilot's clock cube

@@ -74,6 +74,8 @@ pub enum ViewMode {
     /// Strips away light-travel delay in the camera's own frame so you see pure Lorentz contraction
     /// and simultaneity as defined by the camera's current velocity!
     /// (Press `X` to brake to `v = 0` if you want the unboosted World Lab slice!)
+    /// In a match, the parts of the slice inside another player's future cone are not decided
+    /// yet and are drawn as undetermined haze (see [`FrameDynamics::remote_origins`]).
     CameraSimultaneity,
     /// Causal frontier: rays run down the *future* null cone `k^mu = +e_0 + n^a e_a` from
     /// `O' = O - FrameDynamics::frontier_view_offset() * e_0`, landing just outside `I+(O)` (and,
@@ -208,7 +210,17 @@ pub struct FrameDynamics {
     /// Bodies are only finalized once *all* of them is decided, so the Frontier view looks back
     /// this much further to see them. Zero for static scenes.
     pub frontier_lag: f32,
+    /// In a match: the latest known events of the other live players' ships. Everything in
+    /// their open future cones is still undecided too, even outside the camera's own; only
+    /// the first [`MAX_REMOTE_FRONTIERS`] are rendered.
+    pub remote_origins: Vec<Vec4>,
 }
+
+/// Maximum number of other players' frontiers uploaded to the GPU uniform block per frame.
+pub const MAX_REMOTE_FRONTIERS: usize = 4;
+
+/// Maximum number of cones a view draws as undetermined haze: the camera's and the others'.
+pub const MAX_HAZE_ORIGINS: usize = MAX_REMOTE_FRONTIERS + 1;
 
 /// Flashes are dropped once their shell is this far (light-seconds) past the emission event:
 /// beyond the renderers' maximum ray length, nothing they light can be seen any more.
@@ -223,6 +235,26 @@ impl FrameDynamics {
     /// The flashes the renderers actually evaluate (both backends cap at [`MAX_FLASHES`]).
     pub fn active_flashes(&self) -> &[FlashEvent] {
         &self.flashes[..self.flashes.len().min(MAX_FLASHES)]
+    }
+
+    /// The other players' frontiers the renderers actually evaluate (both backends cap at
+    /// [`MAX_REMOTE_FRONTIERS`]).
+    pub fn active_remote_origins(&self) -> &[Vec4] {
+        &self.remote_origins[..self.remote_origins.len().min(MAX_REMOTE_FRONTIERS)]
+    }
+
+    /// The apexes of the cones whose insides a view draws as undetermined haze. The Prophecy
+    /// slice lies in the camera's future, so its own cone counts there. The God's-eye slice
+    /// lies outside the camera's cone, so only the other players' can reach it.
+    pub fn haze_origins(&self, camera: &Camera4D, slice_mode: SliceMode) -> Vec<Vec4> {
+        let remote = self.active_remote_origins().iter().copied();
+        match slice_mode {
+            SliceMode::ProphecySlice => {
+                std::iter::once(self.frontier_or_camera(camera).origin).chain(remote).collect()
+            }
+            SliceMode::CameraSimultaneity => remote.collect(),
+            SliceMode::PastLightCone | SliceMode::Frontier => Vec::new(),
+        }
     }
 
     /// The decision frontier the renderers measure against: the Dynamic Mode frontier if one
@@ -287,6 +319,7 @@ pub fn render_frame(
     let half_h = (0.5 * camera.fov_y_rad).tan();
     let half_w = aspect * half_h;
     let lut = gamma_lut();
+    let haze_origins = dynamics.haze_origins(camera, cfg.slice_mode);
 
     let ray_origin = match cfg.slice_mode {
         SliceMode::PastLightCone | SliceMode::CameraSimultaneity => camera.position,
@@ -324,10 +357,10 @@ pub fn render_frame(
                 let color = if let Some(hit) = scene.bvh.trace(ray_origin, ray_dir, 1e-3, 180.0)
                 {
                     let shaded = shade_hit(scene, camera, cfg, dynamics, ray_dir, &hit);
-                    if cfg.slice_mode == SliceMode::ProphecySlice {
-                        apply_undecided_haze(shaded, hit.event, dynamics.frontier_or_camera(camera))
-                    } else {
+                    if haze_origins.is_empty() {
                         shaded
+                    } else {
+                        apply_undecided_haze(shaded, hit.event, &haze_origins)
                     }
                 } else {
                     shade_sky(ray_dir)
@@ -435,14 +468,20 @@ fn decision_age_color(age: f32) -> Vec3 {
 
 const HAZE_COLOR: Vec3 = Vec3::new(0.32, 0.18, 0.62);
 
-/// Prophecy-slice overlay: events inside the open future light cone `I+(O)` of the frontier
-/// are still undetermined and get an animated violet haze; a cyan shell marks where geometry
-/// crosses the frontier `dJ+(O)` itself.
-fn apply_undecided_haze(base: Vec3, event: Vec4, frontier: Frontier) -> Vec3 {
+/// Prophecy and God's-eye overlay: events inside the open future light cone `I+(O)` of any of
+/// `origins` (the frontier, and the other players' in a match) are still undetermined and get
+/// an animated violet haze; a cyan shell marks where geometry crosses the boundary of their union.
+fn apply_undecided_haze(base: Vec3, event: Vec4, origins: &[Vec4]) -> Vec3 {
     const SHELL: f32 = 0.18;
-    let d = event - frontier.origin;
-    // > 0 inside `I+(O)`, 0 on the frontier (sign is frame-independent; magnitude is lab-frame).
-    let inside = d.t - d.spatial().length();
+    // > 0 inside some `I+(O)`, 0 on the frontier (sign is frame-independent; magnitude is
+    // lab-frame).
+    let inside = origins
+        .iter()
+        .map(|&o| {
+            let d = event - o;
+            d.t - d.spatial().length()
+        })
+        .fold(f32::NEG_INFINITY, f32::max);
     if inside <= -SHELL {
         return base;
     }
@@ -1104,6 +1143,31 @@ mod tests {
         d.retire_flashes(110.0);
         assert!(d.flashes.iter().all(|f| 110.0 - f.at.t < FLASH_MAX_RADIUS));
         assert_eq!(d.flashes.len(), 8);
+    }
+
+    /// In a match the God's-eye slice is hazed inside the other player's future cone only;
+    /// the Prophecy slice inside the camera's too. Single player has no haze on God's eye.
+    #[test]
+    fn haze_covers_every_undecided_cone() {
+        let cam = Camera4D::new(Vec4::new(10.0, 0.0, 0.0, 0.0), 60.0);
+        let mut d = FrameDynamics::default();
+        assert!(d.haze_origins(&cam, ViewMode::CameraSimultaneity).is_empty());
+        assert_eq!(d.haze_origins(&cam, ViewMode::ProphecySlice), vec![cam.position]);
+
+        // The other player was last heard of 4 s ago (lab time), 6 ls away.
+        let remote = Vec4::new(6.0, 6.0, 0.0, 0.0);
+        d.remote_origins = vec![remote];
+        let origins = d.haze_origins(&cam, ViewMode::CameraSimultaneity);
+        assert_eq!(origins, vec![remote]);
+        assert!(d.haze_origins(&cam, ViewMode::PastLightCone).is_empty());
+
+        let base = Vec3::new(0.5, 0.5, 0.5);
+        let at = |x: f32| Vec4::new(10.0, x, 0.0, 0.0);
+        // On the slice t = 10, the remote cone covers |x - 6| < 4.
+        assert_eq!(apply_undecided_haze(base, at(-1.0), &origins), base);
+        let hazed = apply_undecided_haze(base, at(6.0), &origins);
+        assert!(hazed.z > hazed.x && hazed.z > hazed.y, "violet inside the cone: {hazed:?}");
+        assert_eq!(apply_undecided_haze(base, at(11.0), &origins), base);
     }
 
     #[test]
