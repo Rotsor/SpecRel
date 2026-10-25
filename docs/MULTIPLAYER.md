@@ -67,13 +67,6 @@ centre. That only affects what the drawing looks like; nothing in the game depen
 
 A player with `Δt ≤ 0` never needs to stop, so at least one player can always move. Both can be
 stopped only briefly, when their information about each other is stale; heartbeats resolve that.
-Until the other player has joined (their `Hello` has arrived), the match is paused: the ship
-cannot move or fire, so the world does not advance either, and the HUD shows **WAITING FOR A
-PLAYER TO JOIN**. Their ship is then taken to be at its spawn event, at rest, until their first
-track arrives. If the connection fails before they join, the local player is released and flies
-alone.
-
-## 2. Determinism
 **Latency figures.** In a match the HUD's time-controls line shows, once the other player has
 joined:
 
@@ -88,6 +81,13 @@ joined:
   coasted inertially to my event's CM time).
 * `WAITING`: the share of the last ~5 s of wall time this player spent waiting.
 
+Until the other player has joined (their `Hello` has arrived), the match is paused: the ship
+cannot move or fire, so the world does not advance either, and the HUD shows **WAITING FOR A
+PLAYER TO JOIN**. Their ship is then taken to be at its spawn event, at rest, until their first
+track arrives. If the connection fails before they join, the local player is released and flies
+alone.
+
+## 2. Determinism
 
 Both replicas must agree bit for bit. Billiards is chaotic, so any drift would eventually show one
 player a collision that the other never sees. Each body's next state is already a pure function of
@@ -140,6 +140,7 @@ Every frame is `seq: u32 LE` followed by one encoded `Message`:
 | `Fire` | firing event (`Frontier`, `f32`), lab velocity (`f64` ×3), ammo |
 | `Flash` | emission event (`f32` ×4) |
 | `Bye` | sender quits |
+| `Ping` / `Pong` | the sender's wall clock (`f64` seconds); `Pong` echoes a `Ping`'s, timing the round trip |
 
 Links are reliable and ordered once open (TCP, reliable UDP, BroadcastChannel, WebRTC), but frames sent
 before the peer was listening are lost. A session therefore keeps a log of everything it has sent
@@ -147,7 +148,6 @@ until the peer's `Hello` arrives. It then replays the whole log, and the receive
 numbers it has already seen. When the peer leaves (`Bye`, or the link closes), its ship stops
 being an input source: its track ends and its cone is removed from the frontier.
 
-| `Ping` / `Pong` | the sender's wall clock (`f64` seconds); `Pong` echoes a `Ping`'s, timing the round trip |
 ### Transports
 
 * **Native, TCP:** `cargo run --release -- --host 7777` and `cargo run --release -- --join 127.0.0.1:7777`.

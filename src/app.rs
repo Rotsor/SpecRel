@@ -834,9 +834,6 @@ mod tests {
         assert_eq!(p0.banner(), None);
     }
 
-    /// Shots, flashes and the worlds they shape are shared: both replicas agree.
-    #[test]
-    fn a_match_shares_shots_and_flashes() {
     /// The HUD's latency line: the wall-clock round trip, and the two ships' separation.
     #[test]
     fn a_match_reports_its_latency() {
@@ -856,6 +853,9 @@ mod tests {
         assert!(line.contains("| INTERVAL 25.00LS | CM DIST 25.00LS |"), "{line}"); // the spawns
     }
 
+    /// Shots, flashes and the worlds they shape are shared: both replicas agree.
+    #[test]
+    fn a_match_shares_shots_and_flashes() {
         let (mut p0, mut p1) = match_apps();
         p0.apply(Action::SelectScene(0)); // ignored in a match
         assert!(p0.is_dynamic());
