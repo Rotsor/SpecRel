@@ -10,9 +10,16 @@ rendezvous.example.com {
 	# Optional: static files of an app that uses this server (here, the SpecRel game), so its
 	# pages and the rendezvous share an origin. Deploying the app is copying files in; nothing
 	# restarts. Leave this out if the app is hosted elsewhere.
+	# The two Cross-Origin headers make the pages cross-origin isolated, which gets them a
+	# finer performance.now() (about 1 ms otherwise) for the game's frame timings. The price:
+	# the pages can only embed cross-origin resources that opt in with CORS or CORP headers.
 	handle {
 		root * /var/www/app
-		header Cache-Control no-cache
+		header {
+			Cache-Control no-cache
+			Cross-Origin-Opener-Policy same-origin
+			Cross-Origin-Embedder-Policy require-corp
+		}
 		file_server
 	}
 }

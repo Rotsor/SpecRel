@@ -92,7 +92,9 @@ It restarts if it crashes and starts at boot. Logs: `journalctl -u rendezvous -f
 ## 5. HTTPS (Caddy)
 
 Put [`rendezvous/Caddyfile`](../rendezvous/Caddyfile) in `/etc/caddy/Caddyfile` with your domain.
-It sends `/v1/*` to the rendezvous server and serves everything else from `/var/www/app`. Then:
+It sends `/v1/*` to the rendezvous server and serves everything else from `/var/www/app`, with
+the headers that make the game's pages cross-origin isolated, which sharpens `performance.now()`
+for the frame timings in the HUD (`F5`). Then:
 
 ```bash
 systemctl restart caddy
