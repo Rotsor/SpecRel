@@ -406,16 +406,21 @@ fn state_at(track: &[ShipSample], t: f64) -> ShipSample {
 /// Indices of `track` samples worth drawing: the ends, the last sample of every straight
 /// (coasting) stretch, and while thrusting at most one sample per [`THRUST_SAMPLE_DT`] (a ship
 /// records one sample per frame), plus one every `max_segment_dt`.
+///
+/// "Straight" allows a velocity drift of [`STRAIGHT_DV`]: a control pod's hull settles onto
+/// its pilot only asymptotically, so its velocity never repeats exactly, and an exact test
+/// would draw a coasting hull as if it thrusted throughout the history window.
 pub fn render_indices(track: &[ShipSample], max_segment_dt: f64) -> Vec<usize> {
+    let straight = |a: &ShipSample, b: &ShipSample| (0..3).all(|c| (a.vel[c] - b.vel[c]).abs() <= STRAIGHT_DV);
     let mut keep = vec![0];
     for i in 1..track.len() {
         let last = *keep.last().unwrap();
-        let turned = track[i].vel != track[i - 1].vel;
-        if turned && last != i - 1 && track[i - 1].vel == track[last].vel {
+        let turned = !straight(&track[i], &track[last]);
+        if turned && last != i - 1 && straight(&track[i - 1], &track[last]) {
             keep.push(i - 1); // end of a straight stretch
         }
         let dt = track[i].t - track[*keep.last().unwrap()].t;
-        let bent = track[i].vel != track[*keep.last().unwrap()].vel;
+        let bent = !straight(&track[i], &track[*keep.last().unwrap()]);
         if i == track.len() - 1 || (bent && dt >= THRUST_SAMPLE_DT) || dt >= max_segment_dt {
             keep.push(i);
         }
@@ -425,6 +430,11 @@ pub fn render_indices(track: &[ShipSample], max_segment_dt: f64) -> Vec<usize> {
 
 /// Lab-time spacing of a thrusting ship's rendered samples.
 const THRUST_SAMPLE_DT: f64 = 0.25;
+
+/// Velocity drift (per component, `c = 1`) still drawn as one straight segment. Over the
+/// longest segment (`MAX_SEGMENT_DT`, 50) the drawn worldline strays at most 0.005 from the
+/// recorded one, well within the hull's 0.036-thick bars.
+const STRAIGHT_DV: f64 = 1e-4;
 
 #[cfg(test)]
 mod tests {
@@ -456,6 +466,25 @@ mod tests {
         let s = ship.hull_at_tau(10.0 + 2.0 * 0.75f64.sqrt());
         assert!((s.t - 12.0).abs() < 1e-9, "{s:?}");
         assert_eq!(ship.hull_at_tau(-5.0), ship.hull[0], "before the track: where it started");
+    }
+
+    /// A hull settling onto a coasting pod: its velocity creeps toward the pod's forever,
+    /// never repeating exactly. Once the drift is negligible it is drawn as one straight
+    /// stretch, not sampled every `THRUST_SAMPLE_DT` across the whole history.
+    #[test]
+    fn a_settling_hull_is_drawn_straight() {
+        let mut t = 0.0;
+        let track: Vec<_> = (0..12_000)
+            .map(|i| {
+                t += 1.0 / 60.0;
+                let v = 0.3 + 0.1 * (-(i as f64) / 60.0).exp();
+                ShipSample { t, pos: [0.3 * t, 0.0, 0.0], vel: [v, 0.0, 0.0], tau: t }
+            })
+            .collect();
+        let keep = render_indices(&track, 50.0);
+        // Sampling the 200 s throughout would keep 800; settling takes the first ~7 s.
+        assert!(keep.len() < 100, "{} samples drawn", keep.len());
+        assert_eq!(*keep.last().unwrap(), track.len() - 1);
     }
 
     #[test]
