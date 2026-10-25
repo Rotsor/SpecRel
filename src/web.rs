@@ -14,8 +14,11 @@
 use crate::app::{Action, App, HeldInput};
 use crate::gpu::{build_tables_data, GpuUniforms, PackedSceneGpuData, RENDER_WGSL};
 use crate::dynamic::PlayerId;
-use crate::hud::{draw_hud, draw_hud_overlay, draw_reticle, HUD_BASE_WIDTH, HUD_OVERLAY_HEIGHT};
+use crate::hud::{
+    draw_hud, draw_hud_overlay, draw_reticle, HudSections, HUD_BASE_WIDTH, HUD_OVERLAY_HEIGHT,
+};
 use crate::multiplayer::link::{LinkState, QueueLink, QueueLinkHandle};
+use crate::perf::{self, now_ms, since};
 use crate::renderer::render_frame;
 use crate::scene::{DemoScene, Scene4D};
 use std::cell::UnsafeCell;
@@ -48,6 +51,15 @@ pub const KEY_PAGE_DOWN: u32 = 23;
 pub const KEY_6: u32 = 24;
 pub const KEY_ENTER: u32 = 25;
 pub const KEY_SEMICOLON: u32 = 19;
+/// `F1`..`F5` (toggle the HUD's sections) are `KEY_F1..=KEY_F5`.
+pub const KEY_F1: u32 = 26;
+pub const KEY_F5: u32 = 30;
+
+/// Phases JS times and reports through `web_perf_record` (by index).
+const JS_PERF_PHASES: [&str; 4] = ["GPU SCENE UPLOAD", "GPU ENCODE+SUBMIT", "CANVAS2D PUT", "KERNEL (GPU TIMER)"];
+/// The index in [`JS_PERF_PHASES`] of the kernel's own time, a sample within the frame's idle
+/// time (JS never waits for the GPU).
+const JS_PERF_KERNEL: usize = 3;
 
 // Continuous held-key bitflags (100 + bit index)
 pub const HOLD_LEFT: u32 = 100;
@@ -132,10 +144,12 @@ struct WebState {
     packed_scenes: Vec<PackedSceneGpuData>,
     tables: Vec<u32>,
     show_hud: bool,
+    hud_sections: HudSections,
+    /// Rows of `hud_overlay` the last HUD used.
+    hud_rows: usize,
     gpu_available: bool,
     use_gpu: bool,
     res_scale: usize,
-    fps_smooth: f32,
     held_keys: u32,
     uniforms: GpuUniforms,
     /// `App::scene_generation` last packed into `packed_scenes`.
@@ -204,10 +218,11 @@ pub extern "C" fn web_init(gpu_available: u32, mp_player: i32) {
         packed_scenes,
         tables,
         show_hud: true,
+        hud_sections: HudSections::default(),
+        hud_rows: 0,
         gpu_available: has_gpu,
         use_gpu: has_gpu,
         res_scale: 1,
-        fps_smooth: 60.0,
         held_keys: 0,
         uniforms,
         packed_generation,
@@ -260,6 +275,7 @@ pub extern "C" fn web_key_event(code: u32, pressed: u32, repeat: u32) {
         // Frontend-only toggles: HUD, rendering backend and resolution.
         match code {
             KEY_TAB => s.show_hud = !s.show_hud,
+            KEY_F1..=KEY_F5 => s.hud_sections.toggle((code - KEY_F1 + 1) as usize),
             KEY_F => {
                 if s.gpu_available {
                     s.use_gpu = !s.use_gpu;
@@ -296,12 +312,14 @@ pub extern "C" fn web_blur() {
 pub extern "C" fn web_step(dt_secs: f32) {
     with_state(|s| {
         s.app.tick_wall_clock(dt_secs as f64);
+        s.app.perf.end_frame(dt_secs * 1000.0);
         let dt_wall = dt_secs.clamp(0.001, 0.1);
-        s.fps_smooth = s.fps_smooth * 0.9 + (1.0 / dt_wall) * 0.1;
 
         s.app.step(dt_wall, &held_input(s.held_keys));
         if s.app.scene_generation != s.packed_generation {
+            let start = now_ms();
             s.packed_scenes[s.app.scene_idx] = PackedSceneGpuData::from_scene(s.app.scene());
+            s.app.perf.record("GPU SCENE PACK", since(start));
             s.packed_generation = s.app.scene_generation;
             s.dirty_scene = Some(s.app.scene_idx);
         }
@@ -316,89 +334,66 @@ pub extern "C" fn web_step(dt_secs: f32) {
             packed.light_pos,
         );
 
-        let backend = if s.gpu_available && s.use_gpu {
-            "GPU"
-        } else {
-            "CPU"
-        };
-        let demo = app.scene().demo;
-        let desc = app.scene_description();
-        let score = app.scoreboard();
-        let net = app.net_metrics();
-
-        if s.gpu_available && s.use_gpu {
-            if s.show_hud {
-                draw_hud_overlay(
-                    &mut s.hud_overlay,
-                    demo,
-                    &desc,
-                    score.as_deref(),
-                    net.as_deref(),
-                    &app.camera,
-                    &app.cfg,
-                    app.paused,
-                    app.time_scale(),
-                    s.fps_smooth,
-                    backend,
-                );
-            }
-        } else {
-            let total_px = app.cfg.width * app.cfg.height;
+        let use_gpu = s.gpu_available && s.use_gpu;
+        let backend = if use_gpu { "GPU" } else { "CPU" };
+        if !use_gpu {
+            let total_px = s.app.cfg.width * s.app.cfg.height;
             if s.cpu_fb.len() != total_px {
                 s.cpu_fb.resize(total_px, 0);
             }
+            let start = now_ms();
+            let app = &s.app;
             render_frame(app.scene(), &app.camera, &app.cfg, &app.dynamics, &mut s.cpu_fb);
+            s.app.perf.record("CPU RAYTRACE", since(start));
+        }
+        // The kernel runs asynchronously; its own time is the best measure of the GPU's work.
+        let render_ms = if use_gpu {
+            s.app.perf.avg_ms(JS_PERF_PHASES[JS_PERF_KERNEL])
+        } else {
+            s.app.perf.avg_ms("CPU RAYTRACE")
+        };
 
-            if s.gpu_available {
-                // WebGPU is presenting the canvas; composite the HUD in the blit shader.
-                if s.show_hud {
-                    draw_hud_overlay(
-                        &mut s.hud_overlay,
-                        demo,
-                        &desc,
-                        score.as_deref(),
-                        net.as_deref(),
-                        &app.camera,
-                        &app.cfg,
-                        app.paused,
-                        app.time_scale(),
-                        s.fps_smooth,
-                        backend,
-                    );
-                }
-            } else {
-                // Canvas2D fallback: bake the reticle and HUD directly into `cpu_fb` and
-                // swizzle to RGBA bytes.
-                if app.is_dynamic() {
-                    draw_reticle(&mut s.cpu_fb, app.cfg.width, app.cfg.height);
-                }
-                if s.show_hud {
-                    draw_hud(
-                        &mut s.cpu_fb,
-                        demo,
-                        &desc,
-                        score.as_deref(),
-                        net.as_deref(),
-                        &app.camera,
-                        &app.cfg,
-                        app.paused,
-                        app.time_scale(),
-                        s.fps_smooth,
-                        backend,
-                    );
-                }
-                if s.cpu_rgba.len() != total_px {
-                    s.cpu_rgba.resize(total_px, 0);
-                }
-                for (dst, &px) in s.cpu_rgba.iter_mut().zip(s.cpu_fb.iter()) {
-                    let r = (px >> 16) & 0xFF;
-                    let g = (px >> 8) & 0xFF;
-                    let b = px & 0xFF;
-                    *dst = 0xFF00_0000 | (b << 16) | (g << 8) | r;
-                }
+        let start = now_ms();
+        let app = &s.app;
+        if s.gpu_available {
+            // WebGPU is presenting the canvas; composite the HUD (and reticle) in the blit
+            // shader.
+            if s.show_hud {
+                let info = app.hud_info(backend, s.hud_sections, render_ms);
+                s.hud_rows = draw_hud_overlay(&mut s.hud_overlay, &info);
+            }
+        } else {
+            // Canvas2D fallback: bake the reticle and HUD directly into `cpu_fb` and swizzle
+            // to RGBA bytes.
+            if app.is_dynamic() {
+                draw_reticle(&mut s.cpu_fb, app.cfg.width, app.cfg.height);
+            }
+            if s.show_hud {
+                draw_hud(&mut s.cpu_fb, &app.hud_info(backend, s.hud_sections, render_ms));
+            }
+            let total_px = app.cfg.width * app.cfg.height;
+            if s.cpu_rgba.len() != total_px {
+                s.cpu_rgba.resize(total_px, 0);
+            }
+            for (dst, &px) in s.cpu_rgba.iter_mut().zip(s.cpu_fb.iter()) {
+                let r = (px >> 16) & 0xFF;
+                let g = (px >> 8) & 0xFF;
+                let b = px & 0xFF;
+                *dst = 0xFF00_0000 | (b << 16) | (g << 8) | r;
             }
         }
+        s.app.perf.record("HUD DRAW", since(start));
     });
+}
+
+/// JS reports `ms` spent in its phase `JS_PERF_PHASES[phase]` (see `web/index.html`).
+#[no_mangle]
+pub extern "C" fn web_perf_record(phase: u32, ms: f32) {
+    with_state(|s| match JS_PERF_PHASES.get(phase as usize) {
+        Some(&label) if phase as usize == JS_PERF_KERNEL => s.app.perf.sample(label, perf::OTHER, ms),
+        Some(&label) => s.app.perf.record(label, ms),
+        None => {}
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -517,9 +512,10 @@ pub extern "C" fn web_hud_width() -> usize {
     HUD_BASE_WIDTH
 }
 
+/// Rows of the HUD overlay in use (JS uploads and composites only these).
 #[no_mangle]
 pub extern "C" fn web_hud_height() -> usize {
-    HUD_OVERLAY_HEIGHT
+    with_state(|s| s.hud_rows)
 }
 
 #[no_mangle]
@@ -537,8 +533,15 @@ pub extern "C" fn web_hud_overlay_ptr() -> *const u8 {
     with_state(|s| bytemuck::cast_slice::<u32, u8>(&s.hud_overlay).as_ptr())
 }
 
+/// Bytes of the HUD overlay in use (`web_hud_height` rows).
 #[no_mangle]
 pub extern "C" fn web_hud_overlay_byte_len() -> usize {
+    with_state(|s| s.hud_rows * HUD_BASE_WIDTH * 4)
+}
+
+/// Bytes of the whole HUD overlay, however many rows are in use.
+#[no_mangle]
+pub extern "C" fn web_hud_overlay_capacity() -> usize {
     with_state(|s| bytemuck::cast_slice::<u32, u8>(&s.hud_overlay).len())
 }
 

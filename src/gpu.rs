@@ -303,6 +303,30 @@ struct FrameBuffers {
     bind_group: wgpu::BindGroup,
 }
 
+/// Where [`GpuRenderer::render`]'s time went, in milliseconds of wall-clock time.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuTimings {
+    /// Writing the uniforms, encoding and submitting the commands.
+    pub submit_ms: f32,
+    /// Waiting for the GPU to run the kernel and copy its output to the readback buffer.
+    pub wait_ms: f32,
+    /// The kernel alone, on the GPU's own clock (if the adapter supports timestamp queries).
+    pub kernel_ms: Option<f32>,
+    /// Copying the mapped pixels into the caller's framebuffer.
+    pub readback_ms: f32,
+}
+
+/// Timestamp queries around the render pass, read back with the frame.
+#[cfg(not(target_arch = "wasm32"))]
+struct Timestamps {
+    query_set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    /// Nanoseconds per timestamp tick.
+    period_ns: f32,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub struct GpuRenderer {
     device: wgpu::Device,
@@ -315,6 +339,9 @@ pub struct GpuRenderer {
     scenes: Vec<SceneBuffers>,
     frame: Option<FrameBuffers>,
     adapter_name: String,
+    timestamps: Option<Timestamps>,
+    /// Timings of the last [`render`](GpuRenderer::render).
+    pub last_timings: GpuTimings,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -353,9 +380,11 @@ impl GpuRenderer {
         let info = adapter.get_info();
         let adapter_name = format!("{} ({:?})", info.name, info.backend);
 
+        let timestamp_feature = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("spec-rel device"),
+                required_features: timestamp_feature,
                 required_limits: adapter.limits(),
                 ..Default::default()
             })
@@ -428,6 +457,30 @@ impl GpuRenderer {
             .map(|s| Self::upload_scene(&device, &scene_layout, s))
             .collect();
 
+        let timestamps = (!timestamp_feature.is_empty()).then(|| {
+            let size = 2 * std::mem::size_of::<u64>() as u64;
+            Timestamps {
+                query_set: device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("render pass timestamps"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: 2,
+                }),
+                resolve: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("timestamp resolve"),
+                    size,
+                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                }),
+                readback: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("timestamp readback"),
+                    size,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                period_ns: queue.get_timestamp_period(),
+            }
+        });
+
         Ok(Self {
             device,
             queue,
@@ -439,6 +492,8 @@ impl GpuRenderer {
             scenes,
             frame: None,
             adapter_name,
+            timestamps,
+            last_timings: GpuTimings::default(),
         })
     }
 
@@ -549,6 +604,7 @@ impl GpuRenderer {
 
     /// Render `scenes[scene_idx]` (as passed to [`GpuRenderer::new`]) into `framebuffer`
     /// (`cfg.width * cfg.height` packed `0x00RRGGBB` pixels), matching `renderer::render_frame`.
+    /// Its timings are left in [`last_timings`](GpuRenderer::last_timings).
     pub fn render(
         &mut self,
         scene_idx: usize,
@@ -557,6 +613,7 @@ impl GpuRenderer {
         dynamics: &FrameDynamics,
         framebuffer: &mut [u32],
     ) {
+        let start = crate::perf::now_ms();
         let (w, h) = (cfg.width, cfg.height);
         assert_eq!(framebuffer.len(), w * h, "framebuffer size mismatch");
         self.ensure_frame_buffers(w, h);
@@ -576,7 +633,11 @@ impl GpuRenderer {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("render pass"),
-                timestamp_writes: None,
+                timestamp_writes: self.timestamps.as_ref().map(|ts| wgpu::ComputePassTimestampWrites {
+                    query_set: &ts.query_set,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: Some(1),
+                }),
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &scene.bind_group, &[]);
@@ -589,18 +650,29 @@ impl GpuRenderer {
         }
         let size = (w * h * 4) as u64;
         encoder.copy_buffer_to_buffer(&frame.output, 0, &frame.readback, 0, size);
+        if let Some(ts) = &self.timestamps {
+            encoder.resolve_query_set(&ts.query_set, 0..2, &ts.resolve, 0);
+            encoder.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, ts.resolve.size());
+        }
         self.queue.submit(Some(encoder.finish()));
 
         let slice = frame.readback.slice(..);
         slice.map_async(wgpu::MapMode::Read, |r| {
             r.expect("failed to map GPU readback buffer")
         });
+        if let Some(ts) = &self.timestamps {
+            ts.readback.slice(..).map_async(wgpu::MapMode::Read, |r| {
+                r.expect("failed to map GPU timestamp buffer")
+            });
+        }
+        let submitted = crate::perf::now_ms();
         self.device
             .poll(wgpu::PollType::Wait {
                 submission_index: None,
                 timeout: None,
             })
             .expect("GPU poll failed");
+        let done = crate::perf::now_ms();
         {
             let view = slice
                 .get_mapped_range()
@@ -608,6 +680,21 @@ impl GpuRenderer {
             framebuffer.copy_from_slice(bytemuck::cast_slice(&view));
         }
         frame.readback.unmap();
+        let kernel_ms = self.timestamps.as_ref().map(|ts| {
+            let ticks = {
+                let view = ts.readback.slice(..).get_mapped_range().expect("timestamps not mapped");
+                let t: &[u64] = bytemuck::cast_slice(&view);
+                t[1].saturating_sub(t[0])
+            };
+            ts.readback.unmap();
+            (ticks as f64 * ts.period_ns as f64 / 1e6) as f32
+        });
+        self.last_timings = GpuTimings {
+            submit_ms: (submitted - start) as f32,
+            wait_ms: (done - submitted) as f32,
+            kernel_ms,
+            readback_ms: crate::perf::since(done),
+        };
     }
 }
 

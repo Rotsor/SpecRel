@@ -6,6 +6,7 @@ pub mod hud;
 pub mod mesh4d;
 pub mod minkowski;
 pub mod multiplayer;
+pub mod perf;
 pub mod renderer;
 pub mod scene;
 #[cfg(target_arch = "wasm32")]
@@ -16,9 +17,11 @@ use app::{Action, App, HeldInput};
 #[cfg(not(target_arch = "wasm32"))]
 use gpu::GpuRenderer;
 #[cfg(not(target_arch = "wasm32"))]
-use hud::{draw_banner, draw_hud, draw_reticle};
+use hud::{draw_banner, draw_hud, draw_reticle, HudSections};
 #[cfg(not(target_arch = "wasm32"))]
 use minifb::{Key, KeyRepeat, Window, WindowOptions};
+#[cfg(not(target_arch = "wasm32"))]
+use perf::{now_ms, since};
 #[cfg(not(target_arch = "wasm32"))]
 use renderer::{render_frame, Camera4D, FrameDynamics};
 #[cfg(not(target_arch = "wasm32"))]
@@ -58,6 +61,10 @@ const KEY_ACTIONS: &[(Key, Action)] = &[
     (Key::NumPadEnter, Action::Fire),
     (Key::Semicolon, Action::CycleControls),
 ];
+
+/// `F1`..`F5`: toggle the HUD's sections (see [`HudSections`]).
+#[cfg(not(target_arch = "wasm32"))]
+const HUD_SECTION_KEYS: [Key; 5] = [Key::F1, Key::F2, Key::F3, Key::F4, Key::F5];
 
 /// Key bindings that auto-repeat while held (`KeyRepeat::Yes`).
 #[cfg(not(target_arch = "wasm32"))]
@@ -367,9 +374,9 @@ fn main() {
     window.set_target_fps(60);
 
     let mut show_hud = true;
+    let mut hud_sections = HudSections::default();
     let mut uploaded_generation = app.scene_generation;
     let mut last_frame = Instant::now();
-    let mut fps_smooth = 60.0f32;
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
@@ -377,7 +384,7 @@ fn main() {
         let dt_wall = (elapsed as f32).clamp(0.001, 0.1);
         last_frame = now;
         app.tick_wall_clock(elapsed);
-        fps_smooth = fps_smooth * 0.9 + (1.0 / dt_wall) * 0.1;
+        app.perf.end_frame((elapsed * 1000.0) as f32);
 
         for &(key, action) in KEY_ACTIONS {
             if window.is_key_pressed(key, KeyRepeat::No) {
@@ -394,6 +401,11 @@ fn main() {
         if window.is_key_pressed(Key::Tab, KeyRepeat::No) {
             show_hud = !show_hud;
         }
+        for (i, &key) in HUD_SECTION_KEYS.iter().enumerate() {
+            if window.is_key_pressed(key, KeyRepeat::No) {
+                hud_sections.toggle(i + 1);
+            }
+        }
         if window.is_key_pressed(Key::F, KeyRepeat::No) && gpu.is_some() {
             use_gpu = !use_gpu;
             res_scale = if use_gpu { 2 } else { 1 };
@@ -409,48 +421,52 @@ fn main() {
         app.step(dt_wall, &held_input(&window));
         if app.scene_generation != uploaded_generation {
             if let Some(g) = gpu.as_mut() {
+                let start = now_ms();
                 g.update_scene(app.scene_idx, app.scene());
+                app.perf.record("GPU SCENE UPLOAD", since(start));
             }
             uploaded_generation = app.scene_generation;
         }
 
-        match gpu.as_mut() {
-            Some(g) if use_gpu => g.render(
-                app.scene_idx,
-                &app.camera,
-                &app.cfg,
-                &app.dynamics,
-                &mut framebuffer,
-            ),
-            _ => render_frame(app.scene(), &app.camera, &app.cfg, &app.dynamics, &mut framebuffer),
-        }
+        let render_labels: &[&str] = match gpu.as_mut() {
+            Some(g) if use_gpu => {
+                g.render(app.scene_idx, &app.camera, &app.cfg, &app.dynamics, &mut framebuffer);
+                let t = g.last_timings;
+                app.perf.record("GPU SUBMIT", t.submit_ms);
+                app.perf.record("GPU WAIT", t.wait_ms);
+                if let Some(kernel_ms) = t.kernel_ms {
+                    app.perf.sample("KERNEL (GPU TIMER)", "GPU WAIT", kernel_ms);
+                }
+                app.perf.record("GPU READBACK COPY", t.readback_ms);
+                &["GPU SUBMIT", "GPU WAIT", "GPU READBACK COPY"]
+            }
+            _ => {
+                let start = now_ms();
+                render_frame(app.scene(), &app.camera, &app.cfg, &app.dynamics, &mut framebuffer);
+                app.perf.record("CPU RAYTRACE", since(start));
+                &["CPU RAYTRACE"]
+            }
+        };
 
+        let start = now_ms();
         if app.is_dynamic() {
             draw_reticle(&mut framebuffer, app.cfg.width, app.cfg.height);
         }
         if show_hud {
             let backend = if gpu.is_some() && use_gpu { "GPU" } else { "CPU" };
-            draw_hud(
-                &mut framebuffer,
-                app.scene().demo,
-                &app.scene_description(),
-                app.scoreboard().as_deref(),
-                app.net_metrics().as_deref(),
-                &app.camera,
-                &app.cfg,
-                app.paused,
-                app.time_scale(),
-                fps_smooth,
-                backend,
-            );
+            let render_ms = render_labels.iter().map(|l| app.perf.avg_ms(l)).sum();
+            draw_hud(&mut framebuffer, &app.hud_info(backend, hud_sections, render_ms));
         }
         if let Some(banner) = app.banner() {
             draw_banner(&mut framebuffer, app.cfg.width, app.cfg.height, banner);
         }
+        app.perf.record("HUD DRAW", since(start));
 
+        let start = now_ms();
         window
             .update_with_buffer(&framebuffer, app.cfg.width, app.cfg.height)
             .expect("Failed to update window buffer");
+        app.perf.record("PRESENT + FPS CAP", since(start));
     }
     app.leave_match();
 }

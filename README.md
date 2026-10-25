@@ -141,6 +141,8 @@ On touch screens, the **Thrust** and **Teleport** button rows under the viewport
 | **`I` `J` `K` `L`** / **`U` `O`** | Scrub 3D spatial position $(x, y, z)$ while keeping coordinate time $t$ fixed |
 | **`R`** | Reset camera to initial scene event and rest frame |
 | **`Tab`** | Show / Hide HUD overlay |
+| **`F1`–`F4`** | Show / Hide HUD sections: key help, observer telemetry, render settings, network latency |
+| **`F5`** | Show / Hide the performance breakdown: average and worst (last second) milliseconds per frame phase — simulation, scene + BVH rebuilds, GPU submit / wait / readback (with the kernel's own time from GPU timestamp queries where supported) or CPU raytracing, HUD, presenting — and what the render cost scales with (pixels, simplices, BVH nodes) |
 | **`Esc`** | Quit |
 
 ---

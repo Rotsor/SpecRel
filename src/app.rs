@@ -6,6 +6,7 @@
 use crate::dynamic::billiards;
 use crate::dynamic::helm::{self, CommandQueue, ControlMode, Hull, Order};
 use crate::dynamic::{DynWorld, PlayerId, ShipSample};
+use crate::hud::{HudInfo, HudSections};
 use crate::minkowski::{Vec3, Vec4};
 use crate::renderer::{
     Camera4D, FrameDynamics, Frontier, RenderConfig, RenderMode, ShadowMode, ViewMode,
@@ -13,6 +14,7 @@ use crate::renderer::{
 };
 use crate::multiplayer::game::{self, Match};
 use crate::multiplayer::link::Link;
+use crate::perf::{self, PerfStats};
 use crate::scene::Scene4D;
 
 pub const TIME_SCALES: [f32; 10] = [-4.0, -2.0, -1.0, -0.5, -0.25, 0.25, 0.5, 1.0, 2.0, 4.0];
@@ -126,6 +128,8 @@ pub struct App {
     /// The two-player match this app plays in, if any (see `docs/MULTIPLAYER.md`). It pins the
     /// app to the Dynamic Mode scene.
     pub multiplayer: Option<Match>,
+    /// Frame timings for the HUD; the app records its own phases, the frontend the rest.
+    pub perf: PerfStats,
 }
 
 impl App {
@@ -155,6 +159,7 @@ impl App {
             rebuild_timer: 0.0,
             rebuild_interval: DYNAMIC_REBUILD_INTERVAL,
             multiplayer: None,
+            perf: PerfStats::default(),
         };
         app.enter_scene(0);
         app
@@ -321,6 +326,13 @@ impl App {
 
     /// Advance one frame of `dt_wall` wall-clock seconds.
     pub fn step(&mut self, dt_wall: f32, input: &HeldInput) {
+        let start = perf::now_ms();
+        let rebuild_ms = self.step_untimed(dt_wall, input);
+        self.perf.record("SIMULATION", perf::since(start) - rebuild_ms);
+    }
+
+    /// [`step`](App::step); returns the milliseconds it spent rebuilding the scene.
+    fn step_untimed(&mut self, dt_wall: f32, input: &HeldInput) -> f32 {
         let axis = |pos: bool, neg: bool| (pos as i32 - neg as i32) as f32;
 
         // 0. Multiplayer: what the other player did since the last frame.
@@ -415,8 +427,9 @@ impl App {
             }
         }
 
+        let mut rebuild_ms = 0.0;
         if self.is_dynamic() {
-            self.step_world(dt_wall);
+            rebuild_ms = self.step_world(dt_wall);
         } else {
             // Loop lab time seamlessly within [scene.t_min, scene.t_max]
             let (t_min, t_max) = (self.scene().t_min, self.scene().t_max);
@@ -429,6 +442,7 @@ impl App {
             }
         }
         self.dynamics.retire_flashes(self.camera.position.t);
+        rebuild_ms
     }
 
     /// Dynamic Mode: the hull's center at the camera's lab time, as the pilot knows it (the world
@@ -440,7 +454,8 @@ impl App {
 
     /// Dynamic Mode: move the causal frontier to the camera and finalize what it uncovered,
     /// snapshotting the geometry at most every [`rebuild_interval`](App::rebuild_interval).
-    fn step_world(&mut self, dt_wall: f32) {
+    /// Returns the milliseconds spent snapshotting.
+    fn step_world(&mut self, dt_wall: f32) -> f32 {
         // A match never rebases: the two replicas would do it at different moments, and their
         // `f64` rounding would part ways (docs/MULTIPLAYER.md §2).
         if self.multiplayer.is_none() && self.camera.position.t > DYNAMIC_REBASE_AFTER_T {
@@ -471,7 +486,9 @@ impl App {
 
         self.rebuild_timer += dt_wall;
         if self.world_grew && self.rebuild_timer >= self.rebuild_interval {
-            self.rebuild_dynamic_scene();
+            self.rebuild_dynamic_scene()
+        } else {
+            0.0
         }
     }
 
@@ -536,12 +553,41 @@ impl App {
         }
     }
 
-    fn rebuild_dynamic_scene(&mut self) {
-        if let Some(world) = &self.world {
-            self.scenes[self.scene_idx] = world.build_scene();
-            self.scene_generation += 1;
-            self.world_grew = false;
-            self.rebuild_timer = 0.0;
+    /// Snapshot the dynamic world's geometry (and its BVH). Returns the milliseconds it took.
+    fn rebuild_dynamic_scene(&mut self) -> f32 {
+        let Some(world) = &self.world else {
+            return 0.0;
+        };
+        let start = perf::now_ms();
+        self.scenes[self.scene_idx] = world.build_scene();
+        self.scene_generation += 1;
+        self.world_grew = false;
+        self.rebuild_timer = 0.0;
+        let ms = perf::since(start);
+        self.perf.record("SCENE+BVH REBUILD", ms);
+        ms
+    }
+
+    /// What the HUD shows this frame. `render_ms` is the average time the frontend spends
+    /// producing the image (for the performance section's cost per pixel).
+    pub fn hud_info<'a>(&'a self, backend: &'a str, sections: HudSections, render_ms: f32) -> HudInfo<'a> {
+        HudInfo {
+            demo: self.scene().demo,
+            desc: self.scene_description(),
+            score: self.scoreboard(),
+            net: self.net_metrics(),
+            camera: &self.camera,
+            cfg: &self.cfg,
+            paused: self.paused,
+            time_scale: self.time_scale(),
+            backend,
+            sections,
+            perf: &self.perf,
+            perf_context: if sections.perf {
+                perf::render_context(self.scene(), &self.cfg, render_ms)
+            } else {
+                Vec::new()
+            },
         }
     }
 

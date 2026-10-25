@@ -353,6 +353,7 @@
       <button data-key="17"><kbd>[Z]</kbd>1X/2X Res</button>
       <button data-key="18"><kbd>[R]</kbd>Reset</button>
       <button data-key="15"><kbd>[Tab]</kbd>HUD</button>
+      <button data-key="30"><kbd>[F5]</kbd>Perf</button>
     </div>
     <div class="btn-row">
       <span class="row-label">Thrust:</span>
@@ -489,7 +490,16 @@
       Slash: 21, NumpadDivide: 21,
       PageUp: 22,
       PageDown: 23,
+      // HUD sections: keys, observer, render, net, perf.
+      F1: 26, F2: 27, F3: 28, F4: 29, F5: 30,
     };
+
+    // Phases this page times for the HUD's performance section (`JS_PERF_PHASES` in
+    // src/web.rs).
+    const PERF_SCENE_UPLOAD = 0;
+    const PERF_ENCODE_SUBMIT = 1;
+    const PERF_CANVAS_PUT = 2;
+    const PERF_GPU_KERNEL = 3;
 
     const HELD_KEY_MAP = {
       ArrowLeft: 100,
@@ -541,7 +551,9 @@
           if (!resp.ok) continue;
           const bytes = await resp.arrayBuffer();
           buildVersion = await hashVersion(bytes);
-          const { instance } = await WebAssembly.instantiate(bytes, {});
+          const { instance } = await WebAssembly.instantiate(bytes, {
+            env: { perf_now: () => performance.now() },
+          });
           return instance.exports;
         } catch (_) {}
       }
@@ -557,7 +569,11 @@
           powerPreference: "high-performance",
         });
         if (!adapter) return null;
-        const device = await adapter.requestDevice();
+        // Timestamp queries time the render kernel for the HUD's performance section.
+        const timestamps = adapter.features.has("timestamp-query");
+        const device = await adapter.requestDevice({
+          requiredFeatures: timestamps ? ["timestamp-query"] : [],
+        });
         const context = canvas.getContext("webgpu");
         if (!context) return null;
         const format = navigator.gpu.getPreferredCanvasFormat();
@@ -568,7 +584,7 @@
         });
         const info = adapter.info || {};
         const adapterLabel = info.description || info.device || info.vendor || "WebGPU";
-        return { adapter, device, context, format, adapterLabel };
+        return { adapter, device, context, format, adapterLabel, timestamps };
       } catch (e) {
         console.warn("WebGPU initialization failed, falling back to CPU:", e);
         return null;
@@ -1033,7 +1049,7 @@
 
           const hudBuf = device.createBuffer({
             label: "hud overlay",
-            size: wasm.web_hud_overlay_byte_len(),
+            size: wasm.web_hud_overlay_capacity(),
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
           });
 
@@ -1076,6 +1092,24 @@
               ],
             });
           };
+          // The render pass's start and end timestamps, resolved and read back while no earlier
+          // readback is in flight.
+          const kernelTimer = gpu.timestamps
+            ? {
+                querySet: device.createQuerySet({ type: "timestamp", count: 2 }),
+                resolveBuf: device.createBuffer({
+                  size: 16,
+                  usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+                }),
+                readBuf: device.createBuffer({
+                  size: 16,
+                  usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+                }),
+                pending: false,
+                busy: false,
+              }
+            : null;
+
           const sceneCount = wasm.web_scene_count();
           const sceneBindGroups = [];
           for (let i = 0; i < sceneCount; i++) {
@@ -1096,6 +1130,7 @@
             blitParamsBuf,
             sceneBindGroups,
             uploadScene,
+            kernelTimer,
             frameWidth: 0,
             frameHeight: 0,
             outputBuf: null,
@@ -1239,7 +1274,9 @@
           }
           const dirtyScene = wasm.web_take_dirty_scene();
           if (dirtyScene >= 0 && gpuResources) {
+            const t0 = performance.now();
             gpuResources.sceneBindGroups[dirtyScene] = gpuResources.uploadScene(dirtyScene);
+            wasm.web_perf_record(PERF_SCENE_UPLOAD, performance.now() - t0);
           }
 
           const w = wasm.web_width();
@@ -1258,14 +1295,18 @@
           }
 
           if (gpuResources) {
+            const t0 = performance.now();
             const g = gpuResources;
+            const timer = g.kernelTimer;
             ensureGpuFrameBuffers(g, w, h);
 
-            if (showHud) {
+            // Only the rows the HUD used (it grows with the sections shown).
+            const hudBytes = wasm.web_hud_overlay_byte_len();
+            if (showHud && hudBytes > 0) {
               g.device.queue.writeBuffer(
                 g.hudBuf,
                 0,
-                wasmBytes(wasm, wasm.web_hud_overlay_ptr(), wasm.web_hud_overlay_byte_len())
+                wasmBytes(wasm, wasm.web_hud_overlay_ptr(), hudBytes)
               );
             }
 
@@ -1289,7 +1330,13 @@
                 0,
                 wasmBytes(wasm, wasm.web_uniforms_ptr(), wasm.web_uniforms_byte_len())
               );
-              const cpass = encoder.beginComputePass();
+              const cpass = encoder.beginComputePass(timer ? {
+                timestampWrites: {
+                  querySet: timer.querySet,
+                  beginningOfPassWriteIndex: 0,
+                  endOfPassWriteIndex: 1,
+                },
+              } : {});
               cpass.setPipeline(g.computePipeline);
               cpass.setBindGroup(0, g.sceneBindGroups[sceneIdx]);
               cpass.setBindGroup(1, g.frameBindGroup);
@@ -1299,6 +1346,11 @@
                 1
               );
               cpass.end();
+              if (timer && !timer.busy) {
+                encoder.resolveQuerySet(timer.querySet, 0, 2, timer.resolveBuf, 0);
+                encoder.copyBufferToBuffer(timer.resolveBuf, 0, timer.readBuf, 0, 16);
+                timer.pending = true;
+              }
             } else {
               // CPU Reference mode selected via [F]: upload CPU-rendered pixels to outputBuf
               g.device.queue.writeBuffer(
@@ -1325,6 +1377,18 @@
             rpass.end();
 
             g.device.queue.submit([encoder.finish()]);
+            wasm.web_perf_record(PERF_ENCODE_SUBMIT, performance.now() - t0);
+            if (timer && timer.pending) {
+              timer.pending = false;
+              timer.busy = true;
+              timer.readBuf.mapAsync(GPUMapMode.READ).then(() => {
+                const [start, end] = new BigUint64Array(timer.readBuf.getMappedRange());
+                timer.readBuf.unmap();
+                timer.busy = false;
+                // Nanoseconds; some browsers quantize or zero them for privacy.
+                if (end > start) wasm.web_perf_record(PERF_GPU_KERNEL, Number(end - start) / 1e6);
+              }, () => { timer.busy = false; });
+            }
             statusBadge.textContent = useGpu
               ? `WebGPU Compute (${g.adapterLabel}) · ${w}×${h}`
               : `WASM CPU Reference · ${w}×${h}`;
@@ -1338,8 +1402,10 @@
               wasm.web_cpu_rgba_ptr(),
               wasm.web_cpu_rgba_byte_len()
             );
+            const t0 = performance.now();
             const imgData = new ImageData(rgba, w, h);
             ctx2d.putImageData(imgData, 0, 0);
+            wasm.web_perf_record(PERF_CANVAS_PUT, performance.now() - t0);
             statusBadge.textContent = `WASM CPU Reference (WebGPU unavailable) · ${w}×${h}`;
           }
 
