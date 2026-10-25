@@ -6,13 +6,13 @@ with SpecRel, so the host runs a generic **rendezvous server** that any app can 
 itself and its version in every request, and peers only meet when both match. Shipping a new build
 of the game, or of any other app, never needs the server to change or restart.
 
-## What runs on the host, and why
+## What runs on the host
 
-| Component | Port | Why it is needed |
+| Component | Port | Role |
 |---|---|---|
-| [`rendezvous/server.mjs`](../rendezvous/server.mjs) (Node, no dependencies) | 8787, localhost only | Before two browsers can talk directly they must swap a WebRTC offer and answer, and neither can reach the other yet. The server holds those messages in short-lived rooms, and hands out relay credentials. |
-| coturn | 3478 (UDP, TCP), 49160–49999 (UDP) | Some networks (symmetric NATs, blocked UDP) leave no direct path between two players. A TURN relay tunnels their traffic. TURN is a standard protocol that browsers speak natively, so we run the standard server instead of writing one. |
-| Caddy | 80, 443 (TCP) | Browsers only run WebGPU on HTTPS pages, and an HTTPS page can only call an HTTPS server. Caddy gets and renews the Let's Encrypt certificate by itself, and also serves the game's static files. |
+| [`rendezvous/server.mjs`](../rendezvous/server.mjs) (Node, no dependencies) | 8787, localhost only | Runs the rooms where peers swap their connection messages (each pair's WebRTC offer and answer), hands out relay credentials at `/v1/ice-servers` |
+| coturn | 3478 (UDP, TCP), 49160–49999 (UDP) | TURN relay for peers with no direct path between them |
+| Caddy | 80, 443 (TCP) | HTTPS in front of the server, with an automatic Let's Encrypt certificate; serves the game's files |
 
 Game traffic goes straight between the browsers whenever it can, and the relay carries only the
 matches that can't connect directly. A match uses a few kB/s, so a small VPS (1 vCPU, 1 GB RAM)
