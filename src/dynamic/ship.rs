@@ -407,22 +407,29 @@ fn state_at(track: &[ShipSample], t: f64) -> ShipSample {
 /// (coasting) stretch, and while thrusting at most one sample per [`THRUST_SAMPLE_DT`] (a ship
 /// records one sample per frame), plus one every `max_segment_dt`.
 ///
-/// "Straight" allows a velocity drift of [`STRAIGHT_DV`]: a control pod's hull settles onto
-/// its pilot only asymptotically, so its velocity never repeats exactly, and an exact test
-/// would draw a coasting hull as if it thrusted throughout the history window.
+/// "Straight" means the drawn segment strays at most about [`MAX_STRAY`] from the track: a
+/// control pod's hull settles onto its pilot only asymptotically, so its velocity never
+/// repeats exactly, and an exact test would draw it as if it thrusted all along. (Each drawn
+/// segment of the hull's cage costs ~400 simplices.)
 pub fn render_indices(track: &[ShipSample], max_segment_dt: f64) -> Vec<usize> {
-    let straight = |a: &ShipSample, b: &ShipSample| (0..3).all(|c| (a.vel[c] - b.vel[c]).abs() <= STRAIGHT_DV);
+    let dv = |a: &ShipSample, b: &ShipSample| (0..3).map(|c| (a.vel[c] - b.vel[c]).abs()).fold(0.0, f64::max);
     let mut keep = vec![0];
+    // The largest velocity change (per component) since the last kept sample: past it, the
+    // track strays from that sample's straight line by at most `drift * dt`.
+    let mut drift = 0.0;
     for i in 1..track.len() {
         let last = *keep.last().unwrap();
-        let turned = !straight(&track[i], &track[last]);
-        if turned && last != i - 1 && straight(&track[i - 1], &track[last]) {
+        drift = f64::max(drift, dv(&track[i], &track[last]));
+        let strays = drift * (track[i].t - track[last].t) > MAX_STRAY;
+        if strays && last != i - 1 && track[i - 1].t - track[last].t >= THRUST_SAMPLE_DT {
             keep.push(i - 1); // end of a straight stretch
+            drift = dv(&track[i], &track[i - 1]);
         }
         let dt = track[i].t - track[*keep.last().unwrap()].t;
-        let bent = !straight(&track[i], &track[*keep.last().unwrap()]);
-        if i == track.len() - 1 || (bent && dt >= THRUST_SAMPLE_DT) || dt >= max_segment_dt {
+        let strays = drift * dt > MAX_STRAY;
+        if i == track.len() - 1 || (strays && dt >= THRUST_SAMPLE_DT) || dt >= max_segment_dt {
             keep.push(i);
+            drift = 0.0;
         }
     }
     keep
@@ -431,10 +438,9 @@ pub fn render_indices(track: &[ShipSample], max_segment_dt: f64) -> Vec<usize> {
 /// Lab-time spacing of a thrusting ship's rendered samples.
 const THRUST_SAMPLE_DT: f64 = 0.25;
 
-/// Velocity drift (per component, `c = 1`) still drawn as one straight segment. Over the
-/// longest segment (`MAX_SEGMENT_DT`, 50) the drawn worldline strays at most 0.005 from the
-/// recorded one, well within the hull's 0.036-thick bars.
-const STRAIGHT_DV: f64 = 1e-4;
+/// How far (`c = 1` units) a drawn ship segment may stray from the recorded track, give or
+/// take a factor of two: well within the hull's 0.036-thick bars.
+const MAX_STRAY: f64 = 0.005;
 
 #[cfg(test)]
 mod tests {
@@ -469,8 +475,8 @@ mod tests {
     }
 
     /// A hull settling onto a coasting pod: its velocity creeps toward the pod's forever,
-    /// never repeating exactly. Once the drift is negligible it is drawn as one straight
-    /// stretch, not sampled every `THRUST_SAMPLE_DT` across the whole history.
+    /// never repeating exactly. Once the drift is negligible it is drawn in long straight
+    /// segments, not sampled every `THRUST_SAMPLE_DT` across the whole history.
     #[test]
     fn a_settling_hull_is_drawn_straight() {
         let mut t = 0.0;
@@ -482,9 +488,13 @@ mod tests {
             })
             .collect();
         let keep = render_indices(&track, 50.0);
-        // Sampling the 200 s throughout would keep 800; settling takes the first ~7 s.
-        assert!(keep.len() < 100, "{} samples drawn", keep.len());
+        // Sampling the 200 s throughout would keep 800; settling takes the first few seconds.
+        assert!(keep.len() < 30, "{} samples drawn", keep.len());
         assert_eq!(*keep.last().unwrap(), track.len() - 1);
+        // Never a burst of samples as the drift crosses the tolerance (save the track's end).
+        for w in keep[..keep.len() - 1].windows(2) {
+            assert!(track[w[1]].t - track[w[0]].t >= THRUST_SAMPLE_DT, "{w:?}");
+        }
     }
 
     #[test]
