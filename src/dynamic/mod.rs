@@ -343,7 +343,7 @@ impl DynWorld {
         for ship in &self.ships {
             let launcher = me.launcher == Some(ship.player);
             if ship.is_known_at(s.t) {
-                let at = ship.at(s.t);
+                let at = ship.seen_from(s.t, s.pos);
                 let d = distance(s.pos, at.pos);
                 if launcher {
                     launcher_clear = d > reach;

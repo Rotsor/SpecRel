@@ -55,6 +55,15 @@ for as long as the key is held. Releasing the key mid-brake leaves the ship coas
 velocity it reached. Collision kicks stay instantaneous. They already reach the camera only once
 their news has crossed the hull.
 
+**The hull hears the controls at light speed.** The controls act at the ship's centre, so a body
+touching the hull at event `E` must not feel thrust applied after the centre crossed `E`'s past
+light cone. Contacts use `Ship::seen_from`: the centre's state on the past cone of the touching
+body's centre, coasted on inertially to `E`'s lab time. Coasting adds no new information, so the
+contact depends only on input in `E`'s causal past. Collisions of this kind therefore treat the
+hull as non-rigid: it lags the centre by up to a few tenths of a second while thrusting, and
+`SHIP_ACCEL` keeps that lag small. The other player's ship is still *drawn* rigidly around its
+centre. That only affects what the drawing looks like; nothing in the game depends on it.
+
 A player with `Δt ≤ 0` never needs to stop, so at least one player can always move. Both can be
 stopped only briefly, when their information about each other is stale; heartbeats resolve that.
 Before the other player has connected, they are taken to be at their spawn event, at rest. This

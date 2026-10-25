@@ -3,6 +3,7 @@
 //! ship's latest event is the apex of a future light cone the world may not grow into.
 
 use super::billiards::SHIP_RADIUS;
+use super::body::distance;
 use super::collide::{self, V3};
 use crate::mesh4d::{Mesh3D, WorldlineSample};
 use crate::minkowski::{Tetrad, Vec3, Vec4};
@@ -130,6 +131,39 @@ impl Ship {
         ShipSample { t, pos, vel: b.vel, tau: a.tau + (b.tau - a.tau) * f }
     }
 
+    /// The ship as known at the event `(t, point)`: its center's state at the latest event on
+    /// that event's past light cone, coasted on to lab time `t`. Thrust the player applied after
+    /// that center event has not reached `point` yet, so a body touching the hull there must not
+    /// feel it: the hull is not perfectly rigid, it learns of the controls at light speed.
+    pub fn seen_from(&self, t: f64, point: V3) -> ShipSample {
+        let in_past_cone = |s: &ShipSample| t - s.t >= distance(point, s.pos);
+        let i = self.track.partition_point(in_past_cone);
+        let seen = match i {
+            0 => self.track[0], // older than the pruned history: the best known
+            _ if i == self.track.len() => *self.latest(),
+            _ => {
+                // The center crosses the past cone on the straight segment between samples.
+                let (mut lo, mut hi) = (self.track[i - 1].t, self.track[i].t);
+                for _ in 0..40 {
+                    let mid = 0.5 * (lo + hi);
+                    if in_past_cone(&self.at(mid)) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                self.at(lo)
+            }
+        };
+        let dt = t - seen.t;
+        ShipSample {
+            t,
+            pos: [0, 1, 2].map(|c| seen.pos[c] + seen.vel[c] * dt),
+            vel: seen.vel,
+            tau: seen.tau + dt / collide::gamma(seen.vel),
+        }
+    }
+
     /// Drop samples older than `horizon`, keeping at least the latest.
     pub fn prune(&mut self, horizon: f64) {
         let stale = self.track.partition_point(|s| s.t < horizon);
@@ -171,3 +205,36 @@ impl Ship {
 
 /// Lab-time spacing of a thrusting ship's rendered samples.
 const THRUST_SAMPLE_DT: f64 = 0.25;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A ship at rest at the origin until `t = 10`, then at 0.5c along `+x`.
+    fn kicked_ship() -> Ship {
+        let mut ship = Ship::new(0, ShipSample { t: 0.0, pos: [0.0; 3], vel: [0.0; 3], tau: 0.0 });
+        for i in 1..=200 {
+            let t = i as f64 * 0.1;
+            let x = 0.5 * (t - 10.0).max(0.0);
+            let vel = if t > 10.0 + 1e-9 { [0.5, 0.0, 0.0] } else { [0.0; 3] };
+            ship.record(ShipSample { t, pos: [x, 0.0, 0.0], vel, tau: 0.0 });
+        }
+        ship
+    }
+
+    #[test]
+    fn the_hull_learns_of_thrust_at_light_speed() {
+        let ship = kicked_ship();
+        // One light-second away, half a second after the thrust: news has not arrived.
+        let seen = ship.seen_from(10.5, [1.0, 0.0, 0.0]);
+        assert_eq!(seen.vel, [0.0; 3]);
+        assert!(seen.pos[0].abs() < 1e-9);
+        assert!(ship.at(10.5).pos[0] > 0.2, "the center itself has moved");
+
+        // Behind the ship, two seconds on: the center is seen at t' = 32/3, and coasting from
+        // there lands exactly where the ship is.
+        let seen = ship.seen_from(12.0, [-1.0, 0.0, 0.0]);
+        assert_eq!(seen.vel, [0.5, 0.0, 0.0]);
+        assert!((seen.pos[0] - 1.0).abs() < 1e-6, "{seen:?}");
+    }
+}
