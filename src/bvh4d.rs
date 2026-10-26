@@ -1,5 +1,6 @@
 use crate::mesh4d::{Aabb4D, HitRecord4D, Simplex4D, SimplexGeom4D};
 use crate::minkowski::Vec4;
+use crate::par::{self, join};
 use std::ops::Range;
 
 /// The SAH's measure of a box: its spatial surface area, plus its extent in time weighted
@@ -14,7 +15,8 @@ fn box_measure(b: Aabb4D) -> f32 {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BvhNode4D {
     pub(crate) aabb: Aabb4D,
-    /// For leaf nodes (`count > 0`): start index into `simplices` / `hot_geoms`.
+    /// For leaf nodes (`count > 0`): start index into `hot_geoms` (and the leaf order of
+    /// `simplices`, see [`Bvh4D::leaf_simplex`]).
     /// For internal nodes (`count == 0`): index of the right child node.
     pub(crate) right_or_first: u32,
     pub(crate) count: u32,
@@ -67,6 +69,10 @@ fn new_layout() -> u64 {
 pub struct Bvh4D {
     nodes: Vec<BvhNode4D>,
     hot_geoms: Vec<SimplexGeom4D>,
+    /// Leaf order: `order[i]` is the index in `simplices` of the primitive at leaf slot `i`.
+    order: Vec<u32>,
+    /// The primitives, in the order they were given (moving ~300 B each into leaf order would
+    /// cost more than the rest of the build). An arena keeps them in leaf order.
     pub simplices: Vec<Simplex4D>,
     version: BvhVersion,
     /// The node and simplex ranges the latest edit wrote.
@@ -74,22 +80,69 @@ pub struct Bvh4D {
     dirty_prims: Vec<Range<usize>>,
 }
 
+/// A primitive as the builder sees it: its box, the box's center, and its index in the input.
+/// The builder reorders these (52 B each) instead of the ~300 B simplices, which stay put.
+#[derive(Clone, Copy)]
+struct BuildRef {
+    aabb: Aabb4D,
+    centroid: Vec4,
+    index: u32,
+}
+
+/// Subtrees with at least this many primitives build their two children in parallel (native
+/// only: on wasm everything builds on the calling thread, into the same tree).
+const PARALLEL_MIN: usize = 4096;
+
+/// Slices of refs at most this long are folded on one thread.
+const FOLD_CHUNK: usize = 16384;
+
+/// `merge` of `f` over chunks of `refs`, in parallel (native only) for large nodes near the
+/// root, whose passes would otherwise run alone. `merge` here is exact (box unions, counts),
+/// so the result does not depend on the chunking.
+fn fold<T: Send>(
+    refs: &[BuildRef],
+    f: &(impl Fn(&[BuildRef]) -> T + Sync),
+    merge: &(impl Fn(T, T) -> T + Sync),
+) -> T {
+    if refs.len() <= FOLD_CHUNK {
+        return f(refs);
+    }
+    let (l, r) = refs.split_at(refs.len() / 2);
+    let (a, b) = join(|| fold(l, f, merge), || fold(r, f, merge));
+    merge(a, b)
+}
+
+/// What [`Bvh4D::split`] chose for a node.
+enum Split {
+    Leaf,
+    /// The node's first `mid` primitives go left.
+    At(usize),
+}
+
 impl Bvh4D {
-    pub fn build(mut simplices: Vec<Simplex4D>) -> Self {
+    pub fn build(simplices: Vec<Simplex4D>) -> Self {
         let n = simplices.len();
-        let mut nodes = Vec::with_capacity(n * 2);
-        if n > 0 {
-            Self::build_recursive(&mut nodes, &mut simplices, 0, n);
+        let mut refs: Vec<BuildRef> = par::map(&simplices, |s| BuildRef { aabb: s.aabb, centroid: s.aabb.center(), index: 0 });
+        for (i, r) in refs.iter_mut().enumerate() {
+            r.index = i as u32;
         }
-        let hot_geoms = simplices.iter().map(SimplexGeom4D::from_simplex).collect();
+        let nodes = if n > 0 { Self::build_subtree(&mut refs, 0) } else { Vec::new() };
+        let order: Vec<u32> = refs.iter().map(|r| r.index).collect();
+        let hot_geoms = par::map(&order, |&i| SimplexGeom4D::from_simplex(&simplices[i as usize]));
         Self {
             nodes,
             hot_geoms,
+            order,
             simplices,
             version: BvhVersion { layout: new_layout(), edit: 0 },
             dirty_nodes: Vec::new(),
             dirty_prims: Vec::new(),
         }
+    }
+
+    /// The primitive at leaf slot `i` (indexed like `hot_geoms`).
+    pub(crate) fn leaf_simplex(&self, i: usize) -> &Simplex4D {
+        &self.simplices[self.order[i] as usize]
     }
 
     /// A BVH over nothing.
@@ -117,6 +170,7 @@ impl Bvh4D {
     pub(crate) fn reset_arena(&mut self) {
         self.nodes.clear();
         self.hot_geoms.clear();
+        self.order.clear();
         self.simplices.clear();
         self.nodes.push(BvhNode4D::NOTHING);
         self.version = BvhVersion { layout: new_layout(), edit: 0 };
@@ -133,7 +187,8 @@ impl Bvh4D {
 
     /// Write `src`'s nodes `nodes` and simplices `prims` (a whole subtree and the simplices
     /// under it) to nodes from `node_at` and simplices from `prim_at`, moving its links with
-    /// it. The ranges written to must be free, or just past the arrays' ends.
+    /// it. The ranges written to must be free, or just past the arrays' ends. The simplices
+    /// are written in leaf order.
     pub(crate) fn write_part(
         &mut self,
         src: &Bvh4D,
@@ -147,7 +202,8 @@ impl Bvh4D {
         let moved = src.nodes[nodes.clone()].iter().map(|n| n.moved(dn, dp));
         put(&mut self.nodes, node_at, nodes.len(), moved);
         put(&mut self.hot_geoms, prim_at, prims.len(), src.hot_geoms[prims.clone()].iter().copied());
-        put(&mut self.simplices, prim_at, prims.len(), src.simplices[prims.clone()].iter().cloned());
+        put(&mut self.order, prim_at, prims.len(), (prim_at as u32..).take(prims.len()));
+        put(&mut self.simplices, prim_at, prims.len(), prims.clone().map(|i| src.leaf_simplex(i).clone()));
         self.dirty_nodes.push(node_at..node_at + nodes.len());
         self.dirty_prims.push(prim_at..prim_at + prims.len());
     }
@@ -177,7 +233,7 @@ impl Bvh4D {
             nodes += 1;
             if n.count > 0 {
                 let first = n.right_or_first as usize;
-                prims.extend(&self.simplices[first..first + n.count as usize]);
+                prims.extend((first..first + n.count as usize).map(|i| self.leaf_simplex(i)));
             } else if n.aabb.min.t <= n.aabb.max.t {
                 stack.extend([n.left as usize, n.right_or_first as usize]);
             }
@@ -190,68 +246,129 @@ impl Bvh4D {
         &self.nodes
     }
 
-    /// Compact hot intersection records, indexed identically to `simplices`.
+    /// Compact hot intersection records, in leaf order (see [`Bvh4D::leaf_simplex`]).
     pub(crate) fn hot_geoms(&self) -> &[SimplexGeom4D] {
         &self.hot_geoms
     }
 
-    fn build_recursive(
-        nodes: &mut Vec<BvhNode4D>,
-        simplices: &mut [Simplex4D],
-        start: usize,
-        end: usize,
-    ) -> u32 {
-        let node_idx = nodes.len() as u32;
-        nodes.push(BvhNode4D::NOTHING);
-
-        let mut bounds = Aabb4D::empty();
-        let mut centroid_bounds = Aabb4D::empty();
-        for s in &simplices[start..end] {
-            bounds = bounds.union(s.aabb);
-            centroid_bounds.grow_point(s.aabb.center());
+    /// The subtree over `refs` (which start at primitive `first`), as its own node array (root
+    /// first, child links relative to it). Large subtrees build their children in parallel and
+    /// splice them together; the tree is the same as a serial build's.
+    fn build_subtree(refs: &mut [BuildRef], first: usize) -> Vec<BvhNode4D> {
+        if refs.len() < PARALLEL_MIN {
+            let mut nodes = Vec::with_capacity(refs.len());
+            Self::build_recursive(&mut nodes, refs, first);
+            return nodes;
         }
+        let (bounds, split) = Self::split(refs);
+        let mid = match split {
+            Split::Leaf => return vec![Self::leaf(bounds, first, refs.len())],
+            Split::At(mid) => mid,
+        };
+        let (left_refs, right_refs) = refs.split_at_mut(mid);
+        let (left, right) = join(
+            || Self::build_subtree(left_refs, first),
+            || Self::build_subtree(right_refs, first + mid),
+        );
+        let right_idx = 1 + left.len() as u32;
+        let mut nodes = Vec::with_capacity(1 + left.len() + right.len());
+        nodes.push(BvhNode4D { aabb: bounds, right_or_first: right_idx, count: 0, left: 1 });
+        nodes.extend(left.into_iter().map(|n| n.moved(1, 0)));
+        nodes.extend(right.into_iter().map(|n| n.moved(right_idx, 0)));
+        nodes
+    }
 
-        let count = end - start;
+    fn leaf(bounds: Aabb4D, first: usize, count: usize) -> BvhNode4D {
+        BvhNode4D { aabb: bounds, right_or_first: first as u32, count: count as u32, left: 0 }
+    }
+
+    /// Serial build of the subtree over `refs` (starting at primitive `first`), appended to
+    /// `nodes` depth-first with absolute child links. Returns its root's index.
+    fn build_recursive(nodes: &mut Vec<BvhNode4D>, refs: &mut [BuildRef], first: usize) -> u32 {
+        let node_idx = nodes.len() as u32;
+        let (bounds, split) = Self::split(refs);
+        let mid = match split {
+            Split::Leaf => {
+                nodes.push(Self::leaf(bounds, first, refs.len()));
+                return node_idx;
+            }
+            Split::At(mid) => mid,
+        };
+        nodes.push(BvhNode4D { aabb: bounds, right_or_first: 0, count: 0, left: node_idx + 1 });
+        let (left, right) = refs.split_at_mut(mid);
+        Self::build_recursive(nodes, left, first);
+        let right_idx = Self::build_recursive(nodes, right, first + mid);
+        nodes[node_idx as usize].right_or_first = right_idx;
+        node_idx
+    }
+
+    /// The node over `refs`: its bounds, and whether to make it a leaf or split it (reordering
+    /// `refs` so the left child's come first), by an 8-bin SAH across all 4 spacetime axes.
+    fn split(refs: &mut [BuildRef]) -> (Aabb4D, Split) {
+        let (bounds, centroid_bounds) = fold(
+            refs,
+            &|refs| {
+                let (mut bounds, mut centroid_bounds) = (Aabb4D::empty(), Aabb4D::empty());
+                for r in refs {
+                    bounds = bounds.union(r.aabb);
+                    centroid_bounds.grow_point(r.centroid);
+                }
+                (bounds, centroid_bounds)
+            },
+            &|(a, ca), (b, cb)| (a.union(b), ca.union(cb)),
+        );
+
+        let count = refs.len();
         if count <= 3 {
-            nodes[node_idx as usize] = BvhNode4D {
-                aabb: bounds,
-                right_or_first: start as u32,
-                count: count as u32,
-                left: 0,
-            };
-            return node_idx;
+            return (bounds, Split::Leaf);
         }
 
         let ext = centroid_bounds.extent();
 
-        // 8-bin 4D SAH across all 4 spacetime axes (t, x, y, z)
         const BINS: usize = 8;
         let mut best_axis = 0usize;
         let mut best_split_pos = 0.0f32;
         let mut best_cost = f32::INFINITY;
 
-        for a in 0..4 {
+        // Bin along all four axes in one pass over the refs.
+        let live: [bool; 4] = std::array::from_fn(|a| ext.axis(a) >= 1e-4);
+        let axis_min: [f32; 4] = std::array::from_fn(|a| centroid_bounds.min.axis(a));
+        let inv_ext: [f32; 4] = std::array::from_fn(|a| (BINS as f32) / ext.axis(a));
+        let (bin_bounds, bin_counts) = fold(
+            refs,
+            &|refs| {
+                let mut bin_bounds = [[Aabb4D::empty(); BINS]; 4];
+                let mut bin_counts = [[0u32; BINS]; 4];
+                for r in refs {
+                    for a in 0..4 {
+                        if live[a] {
+                            let c = r.centroid.axis(a);
+                            let b = (((c - axis_min[a]) * inv_ext[a]) as usize).min(BINS - 1);
+                            bin_bounds[a][b] = bin_bounds[a][b].union(r.aabb);
+                            bin_counts[a][b] += 1;
+                        }
+                    }
+                }
+                (bin_bounds, bin_counts)
+            },
+            &|(mut bounds, mut counts), (b, c)| {
+                for a in 0..4 {
+                    for i in 0..BINS {
+                        bounds[a][i] = bounds[a][i].union(b[a][i]);
+                        counts[a][i] += c[a][i];
+                    }
+                }
+                (bounds, counts)
+            },
+        );
+
+        for a in (0..4).filter(|&a| live[a]) {
             let axis_ext = ext.axis(a);
-            if axis_ext < 1e-4 {
-                continue;
-            }
-            let axis_min = centroid_bounds.min.axis(a);
-            let inv_ext = (BINS as f32) / axis_ext;
-
-            let mut bin_bounds = [Aabb4D::empty(); BINS];
-            let mut bin_counts = [0usize; BINS];
-
-            for s in &simplices[start..end] {
-                let c = s.aabb.center().axis(a);
-                let b = (((c - axis_min) * inv_ext) as usize).min(BINS - 1);
-                bin_bounds[b] = bin_bounds[b].union(s.aabb);
-                bin_counts[b] += 1;
-            }
-
+            let (bin_bounds, bin_counts) = (&bin_bounds[a], &bin_counts[a]);
             let mut left_box = [Aabb4D::empty(); BINS - 1];
-            let mut left_cnt = [0usize; BINS - 1];
+            let mut left_cnt = [0u32; BINS - 1];
             let mut cur_b = Aabb4D::empty();
-            let mut cur_c = 0usize;
+            let mut cur_c = 0u32;
             for i in 0..(BINS - 1) {
                 cur_b = cur_b.union(bin_bounds[i]);
                 cur_c += bin_counts[i];
@@ -260,7 +377,7 @@ impl Bvh4D {
             }
 
             let mut right_b = Aabb4D::empty();
-            let mut right_c = 0usize;
+            let mut right_c = 0u32;
             for i in (0..(BINS - 1)).rev() {
                 right_b = right_b.union(bin_bounds[i + 1]);
                 right_c += bin_counts[i + 1];
@@ -270,8 +387,7 @@ impl Bvh4D {
                     if cost < best_cost {
                         best_cost = cost;
                         best_axis = a;
-                        best_split_pos =
-                            axis_min + ((i + 1) as f32 / BINS as f32) * axis_ext;
+                        best_split_pos = axis_min[a] + ((i + 1) as f32 / BINS as f32) * axis_ext;
                     }
                 }
             }
@@ -286,45 +402,28 @@ impl Bvh4D {
                 }
             }
             if max_e < 1e-5 {
-                nodes[node_idx as usize] = BvhNode4D {
-                    aabb: bounds,
-                    right_or_first: start as u32,
-                    count: count as u32,
-                    left: 0,
-                };
-                return node_idx;
+                return (bounds, Split::Leaf);
             }
             best_split_pos = centroid_bounds.center().axis(best_axis);
         }
 
-        let mut mid = start;
-        for i in start..end {
-            if simplices[i].aabb.center().axis(best_axis) < best_split_pos {
-                simplices.swap(i, mid);
+        let mut mid = 0;
+        for i in 0..count {
+            if refs[i].centroid.axis(best_axis) < best_split_pos {
+                refs.swap(i, mid);
                 mid += 1;
             }
         }
 
-        if mid == start || mid == end {
-            mid = (start + end) / 2;
-            simplices[start..end].select_nth_unstable_by(mid - start, |a, b| {
-                let ca = a.aabb.center().axis(best_axis);
-                let cb = b.aabb.center().axis(best_axis);
+        if mid == 0 || mid == count {
+            mid = count / 2;
+            refs.select_nth_unstable_by(mid, |a, b| {
+                let ca = a.centroid.axis(best_axis);
+                let cb = b.centroid.axis(best_axis);
                 ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
             });
         }
-
-        let left_idx = Self::build_recursive(nodes, simplices, start, mid);
-        let right_idx = Self::build_recursive(nodes, simplices, mid, end);
-
-        nodes[node_idx as usize] = BvhNode4D {
-            aabb: bounds,
-            right_or_first: right_idx,
-            count: 0,
-            left: left_idx,
-        };
-
-        node_idx
+        (bounds, Split::At(mid))
     }
 
     #[inline]
@@ -417,7 +516,7 @@ impl Bvh4D {
         }
 
         let (idx, lambda, event, tet_bary) = best_hit?;
-        Some(self.simplices[idx].interpolate_hit(lambda, event, tet_bary))
+        Some(self.leaf_simplex(idx).interpolate_hit(lambda, event, tet_bary))
     }
 
     /// Fast shadow / occlusion query along a 4D ray `origin + lambda * dir` for `lambda in (t_min, t_max)`.

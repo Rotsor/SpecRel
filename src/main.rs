@@ -8,6 +8,7 @@ pub mod hud;
 pub mod mesh4d;
 pub mod minkowski;
 pub mod multiplayer;
+pub mod par;
 pub mod perf;
 pub mod renderer;
 pub mod scene;

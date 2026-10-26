@@ -222,7 +222,7 @@ impl PackedSceneGpuData {
         let nodes: Vec<GpuNode> = bvh.nodes().iter().map(GpuNode::pack).collect();
         let num_nodes = nodes.len() as u32;
         let geoms: Vec<GpuGeom> = bvh.hot_geoms().iter().map(GpuGeom::pack).collect();
-        let attrs: Vec<GpuAttr> = bvh.simplices.iter().map(GpuAttr::pack).collect();
+        let attrs: Vec<GpuAttr> = (0..bvh.hot_geoms().len()).map(|i| GpuAttr::pack(bvh.leaf_simplex(i))).collect();
 
         let materials: Vec<GpuMaterial> = scene
             .materials
@@ -272,9 +272,10 @@ impl PackedSceneGpuData {
             return false;
         }
         let (nodes, prims) = bvh.dirty();
-        patch(&mut self.nodes, bvh.nodes(), nodes, GpuNode::pack);
-        patch(&mut self.geoms, bvh.hot_geoms(), prims, GpuGeom::pack);
-        patch(&mut self.attrs, &bvh.simplices, prims, GpuAttr::pack);
+        let (n, p) = bvh.lens();
+        patch(&mut self.nodes, n, nodes, |i| GpuNode::pack(&bvh.nodes()[i]));
+        patch(&mut self.geoms, p, prims, |i| GpuGeom::pack(&bvh.hot_geoms()[i]));
+        patch(&mut self.attrs, p, prims, |i| GpuAttr::pack(bvh.leaf_simplex(i)));
         self.num_nodes = bvh.nodes().len() as u32;
         self.version = v;
         true
@@ -286,24 +287,26 @@ fn follows(copy: BvhVersion, now: BvhVersion) -> bool {
     copy.layout == now.layout && copy.edit + 1 == now.edit
 }
 
-/// Pack `src`'s `ranges` and write them to the same places in `buf`.
+/// Pack the items at `ranges` (`pack` packs the item at an index) and write them to the same
+/// places in `buf`.
 #[cfg(not(target_arch = "wasm32"))]
-fn write_ranges<S, T: Pod>(queue: &wgpu::Queue, buf: &wgpu::Buffer, src: &[S], ranges: &[Range<usize>], pack: impl Fn(&S) -> T) {
+fn write_ranges<T: Pod>(queue: &wgpu::Queue, buf: &wgpu::Buffer, ranges: &[Range<usize>], pack: impl Fn(usize) -> T) {
     for r in ranges.iter().filter(|r| !r.is_empty()) {
-        let packed: Vec<T> = src[r.clone()].iter().map(&pack).collect();
+        let packed: Vec<T> = r.clone().map(&pack).collect();
         queue.write_buffer(buf, (r.start * size_of::<T>()) as u64, bytemuck::cast_slice(&packed));
     }
 }
 
-/// Pack `src`'s `ranges` into `dst` (grown to `src`'s length).
+/// Pack the items at `ranges` into the same places in `dst` (grown to `len` items; `pack`
+/// packs the item at an index).
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-fn patch<S, T: Pod + Zeroable>(dst: &mut Vec<T>, src: &[S], ranges: &[Range<usize>], pack: impl Fn(&S) -> T) {
-    if dst.len() < src.len() {
-        dst.resize(src.len(), T::zeroed());
+fn patch<T: Pod + Zeroable>(dst: &mut Vec<T>, len: usize, ranges: &[Range<usize>], pack: impl Fn(usize) -> T) {
+    if dst.len() < len {
+        dst.resize(len, T::zeroed());
     }
     for r in ranges {
-        for (d, s) in dst[r.clone()].iter_mut().zip(&src[r.clone()]) {
-            *d = pack(s);
+        for (d, i) in dst[r.clone()].iter_mut().zip(r.clone()) {
+            *d = pack(i);
         }
     }
 }
@@ -645,9 +648,9 @@ impl GpuRenderer {
             && fits(&bufs.attrs, p, size_of::<GpuAttr>())
         {
             let (nodes, prims) = bvh.dirty();
-            write_ranges(&self.queue, &bufs.nodes, bvh.nodes(), nodes, GpuNode::pack);
-            write_ranges(&self.queue, &bufs.geoms, bvh.hot_geoms(), prims, GpuGeom::pack);
-            write_ranges(&self.queue, &bufs.attrs, &bvh.simplices, prims, GpuAttr::pack);
+            write_ranges(&self.queue, &bufs.nodes, nodes, |i| GpuNode::pack(&bvh.nodes()[i]));
+            write_ranges(&self.queue, &bufs.geoms, prims, |i| GpuGeom::pack(&bvh.hot_geoms()[i]));
+            write_ranges(&self.queue, &bufs.attrs, prims, |i| GpuAttr::pack(bvh.leaf_simplex(i)));
             bufs.num_nodes = n as u32;
             bufs.version = bvh.version();
             return;
