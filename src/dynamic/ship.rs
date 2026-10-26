@@ -313,16 +313,23 @@ impl Ship {
 
     /// What other players see of the hull: an open cage of bars along the edges of a cube whose
     /// corners reach the contact radius, so the pilot inside stays visible.
+    ///
+    /// The bars' end faces are left out: the three bars meeting at a corner overlap in a cube
+    /// there, and each bar's end face lies within the side faces of the other two, so the cage
+    /// looks the same without them. That saves a third of its triangles, and of the simplices
+    /// of its worldtube, the bulk of a scene with another ship in it.
     pub fn hull_mesh() -> Mesh3D {
         let mut cage = Mesh3D::default();
-        for (bar, _) in Self::hull_bars() {
+        for (axis, (mut bar, _)) in Self::hull_bars().into_iter().enumerate().map(|(i, b)| (i / 4, b)) {
+            bar.triangles.retain(|tri| [tri.normal.x, tri.normal.y, tri.normal.z][axis] == 0.0);
             append(&mut cage, &bar, Vec3::default());
         }
         cage
     }
 
-    /// The cage's bars, in place in the hull, each with its center. The cage is not convex, so
-    /// its tube's end is capped bar by bar, each fanned to its own center.
+    /// The cage's bars, in place in the hull, each with its center: four along each axis in
+    /// turn (x, y, z). The cage is not convex, so its tube's end is capped bar by bar, each
+    /// fanned to its own center (with its end faces: the fan to them fills the corners).
     pub fn hull_bars() -> Vec<(Mesh3D, Vec3)> {
         let h = SHIP_RADIUS as f32 / 3f32.sqrt();
         let b = 0.018;
@@ -604,12 +611,41 @@ mod tests {
     #[test]
     fn the_hull_cage_is_open() {
         let cage = Ship::hull_mesh();
-        assert_eq!(cage.triangles.len(), 12 * 12);
+        assert_eq!(cage.triangles.len(), 12 * 8, "the bars' sides only");
         let h = SHIP_RADIUS as f32 / 3f32.sqrt();
         // No vertex near a face center: you can see through every face.
         for v in &cage.vertices {
             let on_axis = [v.x, v.y, v.z].iter().filter(|c| c.abs() < 0.5 * h).count();
             assert!(on_axis <= 1, "{v:?}");
         }
+    }
+
+    /// The bars' end faces, left out of the cage, are covered by the side faces of the bars
+    /// they meet: from outside the corners look the same.
+    #[test]
+    fn the_cage_needs_no_bar_ends() {
+        use crate::mesh4d::Triangle3D;
+        let cage = Ship::hull_mesh();
+        let tri = |m: &Mesh3D, t: &Triangle3D| t.indices.map(|i| m.vertices[i]);
+        // `p` on the triangle `[a, b, c]` with normal `n`, up to rounding.
+        let on = |p: Vec3, [a, b, c]: [Vec3; 3], n: Vec3| {
+            let edge = |u: Vec3, v: Vec3| (v - u).cross(p - u).dot(n);
+            let e = [edge(a, b), edge(b, c), edge(c, a)];
+            (p - a).dot(n).abs() < 1e-6 && (e.iter().all(|&e| e > -1e-7) || e.iter().all(|&e| e < 1e-7))
+        };
+        let mut ends = 0;
+        for (axis, (bar, _)) in Ship::hull_bars().iter().enumerate().map(|(i, b)| (i / 4, b)) {
+            for end in bar.triangles.iter().filter(|t| [t.normal.x, t.normal.y, t.normal.z][axis] != 0.0) {
+                ends += 1;
+                let [a, b, c] = tri(bar, end);
+                for (i, j) in (0..=8).flat_map(|i| (0..=8 - i).map(move |j| (i, j))) {
+                    let (u, v) = (i as f32 / 8.0, j as f32 / 8.0);
+                    let p = a + (b - a) * u + (c - a) * v;
+                    let covered = cage.triangles.iter().any(|t| t.normal == end.normal && on(p, tri(&cage, t), t.normal));
+                    assert!(covered, "{p:?} on the end of a bar along axis {axis}");
+                }
+            }
+        }
+        assert_eq!(ends, 12 * 4);
     }
 }
