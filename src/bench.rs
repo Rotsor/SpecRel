@@ -1,0 +1,297 @@
+//! Benchmarks, as ignored tests (the crate has no library target for `cargo bench`). Run them
+//! optimized, one at a time so they don't share the cores:
+//!
+//! ```text
+//! cargo test --release -- --ignored --nocapture --test-threads=1 bench_
+//! ```
+
+use std::time::Instant;
+
+use crate::dynamic::helm::{self, ControlMode, Order};
+use crate::dynamic::ship::render_indices;
+use crate::dynamic::{self, billiards, laser, DynWorld, PlayerId, ShipSample, MAX_SEGMENT_DT};
+use crate::minkowski::{Vec3, Vec4};
+use crate::renderer::{
+    render_frame, Camera4D, FrameDynamics, Frontier, RenderConfig, RenderMode, ShadowMode, ViewMode,
+    PROPHECY_DELTA_DEFAULT,
+};
+use crate::scene::{DemoScene, Scene4D};
+
+/// Frames per second of match time the pilots are simulated at.
+const SIM_FPS: f64 = 60.0;
+/// The native frontend's frame cap, and the app's `DYNAMIC_REBUILD_INTERVAL`.
+const TARGET_FPS: f64 = 60.0;
+const REBUILD_INTERVAL: f64 = 0.1;
+const BUILD_ITERS: usize = 10;
+const RENDER_ITERS: usize = 5;
+const RENDER_SIZE: (usize, usize) = (320, 200);
+/// How far behind the other ship's spawn the viewer floats, facing it and the table beyond
+/// (`c = 1` units).
+const VIEW_DISTANCE: f32 = 2.0;
+
+/// A pilot flying by hand: its event, clock and rest frame, as `App` keeps the camera.
+struct Pilot {
+    camera: Camera4D,
+}
+
+impl Pilot {
+    fn new(event: Vec4) -> Self {
+        Self { camera: Camera4D::new(event, 65.0) }
+    }
+
+    /// One frame of `dt` lab time (both pilots stay level in lab time, so neither ever enters
+    /// the other's future cone), thrusting along the lab direction `thrust` (if any) at
+    /// `accel` per second of the pilot's clock, as the app's control pod does.
+    fn fly(&mut self, dt: f32, thrust: Option<Vec3>, accel: f32) -> ShipSample {
+        let c = &mut self.camera;
+        let d_tau = dt / c.tetrad.e[0].t;
+        if let Some(dir) = thrust {
+            Order::Thrust(Vec4::new(0.0, dir.x, dir.y, dir.z)).execute(&mut c.tetrad, accel * d_tau);
+        }
+        let d_tau = dt / c.tetrad.e[0].t;
+        c.proper_time += d_tau;
+        c.position += c.tetrad.e[0] * d_tau;
+        ShipSample::new(Frontier { origin: c.position, proper_time: c.proper_time }, c.tetrad.e[0])
+    }
+}
+
+/// The pod pilot's maneuvers: legs of [`LEG`] seconds, each a push along one of [`DIRS`] for
+/// [`PUSH`] s, a coast, the opposite push (back to rest) half a leg in, and a coast. Six legs bring it
+/// back where it started, so it stays within about a light-second of its spawn. The hull
+/// keeps chasing the pod, so it is rarely flying straight.
+const LEG: f64 = 5.0;
+const PUSH: f64 = 0.7;
+const DIRS: [[f32; 3]; 6] =
+    [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0], [0.0, -1.0, 0.0]];
+
+fn pod_thrust(t: f64) -> Option<Vec3> {
+    let leg = (t / LEG).floor() as usize;
+    let s = t - leg as f64 * LEG;
+    let [x, y, z] = DIRS[leg % DIRS.len()];
+    let d = Vec3::new(x, y, z);
+    if s < PUSH {
+        Some(d)
+    } else if (0.5 * LEG..0.5 * LEG + PUSH).contains(&s) {
+        Some(d * -1.0)
+    } else {
+        None
+    }
+}
+
+/// A two-player match of the billiards scene, rendered for player 1 (the viewer, coasting
+/// [`VIEW_DISTANCE`] behind player 0's spawn and facing it), while player 0 flies a control pod
+/// through [`pod_thrust`]'s maneuvers. Both shoot a laser every few seconds: the viewer at
+/// the pod, the pod down the table.
+struct Scenario {
+    world: DynWorld,
+    pod: Pilot,
+    viewer: Pilot,
+    frames: u64,
+}
+
+const POD: PlayerId = 0;
+const VIEWER: PlayerId = 1;
+
+impl Scenario {
+    fn new() -> Self {
+        let near = billiards::spawn_event(POD);
+        let viewer_at = near - Vec4::new(0.0, 0.0, 0.0, VIEW_DISTANCE);
+        let spawns = [ShipSample::at_rest(near), ShipSample::at_rest(viewer_at)];
+        let mut world = DynWorld::new_match(DemoScene::RelativisticBilliards, &spawns, VIEWER);
+        world.set_controls(POD, ControlMode::Pod);
+        Self { world, pod: Pilot::new(near), viewer: Pilot::new(viewer_at), frames: 0 }
+    }
+
+    fn time(&self) -> f64 {
+        self.frames as f64 / SIM_FPS
+    }
+
+    /// Play on until `secs` of match time have passed.
+    fn play_until(&mut self, secs: f64) {
+        let dt = (1.0 / SIM_FPS) as f32;
+        while self.time() < secs {
+            let t = self.time();
+            let pod = self.pod.fly(dt, pod_thrust(t), helm::pod_accel());
+            self.world.record(POD, pod);
+            let me = self.viewer.fly(dt, None, 0.0);
+            self.world.advance(me.frontier(), me.u());
+            let every = |period: u64, phase: u64| self.frames % (period * SIM_FPS as u64) == phase * SIM_FPS as u64;
+            if every(4, 1) {
+                let d = (pod.event() - me.event()).spatial().normalized();
+                self.world.fire_laser(VIEWER, me, [d.x, d.y, d.z].map(|c| c as f64));
+            }
+            if every(5, 3) {
+                self.world.fire_laser(POD, pod, [0.0, 0.0, 1.0]);
+            }
+            self.frames += 1;
+        }
+    }
+
+    /// The viewer's camera and frame dynamics, as `App` would render them.
+    fn view(&self) -> (Camera4D, FrameDynamics) {
+        let u = self.viewer.camera.tetrad.e[0];
+        let dynamics = FrameDynamics {
+            frontier: Some(self.world.frontier),
+            frontier_lag: self.world.frontier_lag(u),
+            remote_origins: self.world.remote_origins(),
+            ..Default::default()
+        };
+        (self.viewer.camera, dynamics)
+    }
+}
+
+/// The share of wall time the app spends rebuilding the scene, if a rebuild takes `rebuild`
+/// ms and a render `render` ms, as `main.rs` paces them: frames capped at [`TARGET_FPS`], and a
+/// snapshot once the frames' (clamped) `dt_wall` adds up to [`REBUILD_INTERVAL`] (the world
+/// grows every frame in a match). `dt_wall` is the previous frame's length, so once a rebuild
+/// frame is that long by itself, every frame rebuilds. Also returns the rebuilds per second.
+fn rebuild_share(rebuild: f64, render: f64) -> (f64, f64) {
+    let (mut wall, mut timer, mut dt, mut rebuilding, mut rebuilds) = (0.0, 0.0, 1.0 / TARGET_FPS, 0.0, 0);
+    while wall < 10.0 {
+        timer += dt.clamp(0.001, 0.1);
+        let rebuild_ms = if timer >= REBUILD_INTERVAL { rebuild } else { 0.0 };
+        if rebuild_ms > 0.0 {
+            timer = 0.0;
+            rebuilds += 1;
+        }
+        dt = f64::max(1.0 / TARGET_FPS, (rebuild_ms + render) / 1e3);
+        wall += dt;
+        rebuilding += rebuild_ms / 1e3;
+    }
+    (rebuilding / wall, rebuilds as f64 / wall)
+}
+
+/// Median and mean of `xs`.
+fn stats(xs: &[f64]) -> (f64, f64) {
+    let mut v = xs.to_vec();
+    v.sort_by(f64::total_cmp);
+    (v[v.len() / 2], v.iter().sum::<f64>() / v.len() as f64)
+}
+
+fn ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1e3
+}
+
+/// The `SCENE+BVH REBUILD` phase with the camera close to another player's control pod (users
+/// saw it take ~90% of the frame): `DynWorld::build_scene`, broken down into the geometry it
+/// generates (per part) and the BVH build, then the CPU trace of one frame from that camera,
+/// at several lengths of match history.
+#[test]
+#[ignore = "benchmark: run with --release --ignored"]
+fn bench_scene_rebuild_near_a_control_pod() {
+    let parts = [
+        dynamic::SCENE_TABLE,
+        dynamic::SCENE_BODIES,
+        dynamic::SCENE_PULSES,
+        dynamic::SCENE_HULL_AHEAD,
+        dynamic::SCENE_HULL,
+        dynamic::SCENE_PILOT,
+    ];
+    let cfg = RenderConfig {
+        width: RENDER_SIZE.0,
+        height: RENDER_SIZE.1,
+        mode: RenderMode::RelativisticShaded,
+        shadow_mode: ShadowMode::LorentzInvariant,
+        slice_mode: ViewMode::PastLightCone,
+        prophecy_delta: PROPHECY_DELTA_DEFAULT,
+    };
+    println!(
+        "Scene rebuild near a control pod: {BUILD_ITERS} builds, {RENDER_ITERS} CPU renders at {}x{} on {} threads.",
+        cfg.width,
+        cfg.height,
+        rayon::current_num_threads()
+    );
+    println!("Times in ms, median / mean. Rebuild share: of wall time, paced as `main.rs` does ({TARGET_FPS} fps cap,");
+    println!("a rebuild every {REBUILD_INTERVAL} s), with this CPU render, and with a free render (GPU-bound users).");
+    let mut scenario = Scenario::new();
+    for history in [5.0, 20.0, 60.0, 120.0] {
+        let start = Instant::now();
+        scenario.play_until(history);
+        let play_ms = ms(start);
+        let world = &scenario.world;
+        let other = &world.ships[POD as usize];
+        let ahead = other.hull_ahead();
+        let hull: Vec<_> = other.hull.iter().chain(&ahead).copied().collect();
+        let drawn_hull = render_indices(&hull, MAX_SEGMENT_DT).len();
+        let drawn_pilot = render_indices(&other.track, MAX_SEGMENT_DT).len();
+
+        let mut part_ms = vec![vec![0.0; BUILD_ITERS]; parts.len()];
+        let mut part_simplices = vec![0; parts.len()];
+        let (mut gen_ms, mut bvh_ms, mut total_ms) = (Vec::new(), Vec::new(), Vec::new());
+        let mut scene = None;
+        for iter in 0..BUILD_ITERS {
+            let start = Instant::now();
+            let (mut lap_start, mut count) = (start, 0);
+            part_simplices.fill(0);
+            let simplices = world.scene_simplices(&mut |part, n| {
+                let i = parts.iter().position(|&p| p == part).expect("a known part");
+                part_ms[i][iter] += ms(lap_start);
+                part_simplices[i] += n - count;
+                (lap_start, count) = (Instant::now(), n);
+            });
+            gen_ms.push(ms(start));
+            let bvh_start = Instant::now();
+            scene = Some(world.scene_of(simplices));
+            bvh_ms.push(ms(bvh_start));
+            total_ms.push(ms(start));
+        }
+        let scene = scene.unwrap();
+
+        let (camera, dynamics) = scenario.view();
+        let mut fb = vec![0u32; cfg.width * cfg.height];
+        render_frame(&scene, &camera, &cfg, &dynamics, &mut fb); // warm-up
+        let mut render = |scene: &Scene4D| -> Vec<f64> {
+            (0..RENDER_ITERS)
+                .map(|_| {
+                    let start = Instant::now();
+                    render_frame(scene, &camera, &cfg, &dynamics, &mut fb);
+                    ms(start)
+                })
+                .collect()
+        };
+        // The same frame without the pod's hull cage, or without the laser pulses: how much
+        // of the trace each costs.
+        let mut render_without = |material: usize| {
+            let mut simplices = world.scene_simplices(&mut |_, _| {});
+            simplices.retain(|s| s.material_id != material);
+            render(&world.scene_of(simplices))
+        };
+        let render_hullless_ms = render_without(other.hull_material());
+        let render_pulseless_ms = render_without(laser::MATERIAL_PULSE);
+        let render_ms = render(&scene);
+        let lit = fb.iter().filter(|&&px| px != 0).count();
+
+        let (total, render) = (stats(&total_ms).0, stats(&render_ms).0);
+        let row = |label: &str, xs: &[f64], extra: String| {
+            let (median, mean) = stats(xs);
+            println!("  {label:<22} {median:>9.2} / {mean:>9.2}  {extra}");
+        };
+        println!();
+        println!(
+            "History {history:.0} s ({} frames, simulated in {play_ms:.0} ms): pod track {} samples, hull drawn \
+             in {} samples ({} ahead), pilot in {drawn_pilot}; {} bodies, {} pulses",
+            scenario.frames,
+            other.track.len(),
+            drawn_hull,
+            ahead.len(),
+            world.bodies.len(),
+            world.pulses.len(),
+        );
+        row("build_scene total", &total_ms, format!("{} simplices", scene.bvh.simplices.len()));
+        row(" simplex generation", &gen_ms, String::new());
+        for (i, part) in parts.iter().enumerate() {
+            row(&format!("   {part}"), &part_ms[i], format!("{} simplices", part_simplices[i]));
+        }
+        row(" Bvh4D::build", &bvh_ms, format!("{} nodes", scene.bvh.nodes().len()));
+        row("render (CPU)", &render_ms, format!("{lit} lit px of {}", fb.len()));
+        row(" without the hull", &render_hullless_ms, String::new());
+        row(" without the pulses", &render_pulseless_ms, String::new());
+        let ((cpu, cpu_rate), (free, free_rate)) = (rebuild_share(total, render), rebuild_share(total, 0.0));
+        println!(
+            "  rebuild share of wall time: {:.0}% with the CPU render ({cpu_rate:.1} rebuilds/s), {:.0}% with a free \
+             render ({free_rate:.1} rebuilds/s)",
+            100.0 * cpu,
+            100.0 * free
+        );
+    }
+}

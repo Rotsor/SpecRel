@@ -22,7 +22,7 @@ pub mod ship;
 use crate::bvh4d::Bvh4D;
 use crate::mesh4d::{
     build_worldtube_cap, build_worldtube_cap_about, build_worldtube_simplices, build_worldtube_simplices_with_decided,
-    sample_inertial_worldline, Mesh3D, DECIDED_AT_STATIC,
+    sample_inertial_worldline, Mesh3D, Simplex4D, DECIDED_AT_STATIC,
 };
 use crate::minkowski::{Vec3, Vec4};
 use crate::renderer::{analytic_decision_age, Frontier};
@@ -39,7 +39,7 @@ pub const HISTORY_WINDOW: f64 = 200.0;
 
 /// Render segments are split at least this often (in lab time), so that the per-vertex
 /// `decided_at` interpolated along a merged segment stays close to the per-step stamps.
-const MAX_SEGMENT_DT: f64 = 50.0;
+pub(crate) const MAX_SEGMENT_DT: f64 = 50.0;
 
 const MATERIAL_RAIL: usize = 6;
 
@@ -393,6 +393,13 @@ impl DynWorld {
     /// with a cap where it currently ends: its frontier tip, or where it left play), the other
     /// ships, and the laser pulses as far as they are known.
     pub fn build_scene(&self) -> Scene4D {
+        self.scene_of(self.scene_simplices(&mut |_, _| {}))
+    }
+
+    /// [`DynWorld::build_scene`]'s geometry, before the BVH. `lap` is called with the name of
+    /// each part as soon as it is built, and the number of simplices so far (the benchmark
+    /// times the parts with it).
+    pub(crate) fn scene_simplices(&self, lap: &mut dyn FnMut(&'static str, usize)) -> Vec<Simplex4D> {
         let o = self.frontier.origin;
         let window = HISTORY_WINDOW as f32;
         let backdrop =
@@ -403,6 +410,7 @@ impl DynWorld {
         for (rail, center) in billiards::rails() {
             simplices.extend(build_worldtube_simplices(&rail, &backdrop(center), MATERIAL_RAIL));
         }
+        lap(SCENE_TABLE, simplices.len());
 
         for body in &self.bodies {
             let keep = render_sample_indices(&body.history);
@@ -413,10 +421,12 @@ impl DynWorld {
             let last = samples.len() - 1;
             simplices.extend(build_worldtube_cap(&body.mesh, &samples[last], decided[last], m));
         }
+        lap(SCENE_BODIES, simplices.len());
 
         for pulse in &self.pulses {
             simplices.extend(pulse.simplices(self.t_origin));
         }
+        lap(SCENE_PULSES, simplices.len());
 
         // The other players' ships: an open hull cage, and the pilot's clock inside it, where
         // the decisions are made. The pilot ends at its last known event; the hull runs on as
@@ -425,6 +435,7 @@ impl DynWorld {
         let (hull_mesh, hull_bars, pilot_mesh) = (Ship::hull_mesh(), Ship::hull_bars(), Ship::pilot_mesh());
         for ship in self.ships.iter().filter(|s| s.player != self.viewer) {
             let ahead = ship.hull_ahead();
+            lap(SCENE_HULL_AHEAD, simplices.len());
             let hull: Vec<_> = ship.hull.iter().chain(&ahead).copied().collect();
             let pilot = match ship.controls {
                 ControlMode::Delayed => &hull,
@@ -437,11 +448,20 @@ impl DynWorld {
             for (bar, center) in &hull_bars {
                 simplices.extend(build_worldtube_cap_about(bar, end, DECIDED_AT_STATIC, m, *center));
             }
+            lap(SCENE_HULL, simplices.len());
             let (samples, m) = (render_ship_samples(pilot), ship.material());
             simplices.extend(build_worldtube_simplices(&pilot_mesh, &samples, m));
             simplices.extend(build_worldtube_cap(&pilot_mesh, samples.last().unwrap(), DECIDED_AT_STATIC, m));
+            lap(SCENE_PILOT, simplices.len());
         }
+        simplices
+    }
 
+    /// The scene of `simplices` (from [`DynWorld::scene_simplices`]): their BVH, and the
+    /// world's lighting and time window.
+    pub(crate) fn scene_of(&self, simplices: Vec<Simplex4D>) -> Scene4D {
+        let o = self.frontier.origin;
+        let window = HISTORY_WINDOW as f32;
         Scene4D {
             demo: self.demo,
             bvh: Bvh4D::build(simplices),
@@ -452,6 +472,16 @@ impl DynWorld {
         }
     }
 }
+
+/// The parts of [`DynWorld::scene_simplices`], in the order they are built: the static table and
+/// rails, the bodies, the laser pulses, and per other ship, the computation of its hull's
+/// settled motion ([`Ship::hull_ahead`]), its hull cage and its pilot.
+pub(crate) const SCENE_TABLE: &str = "table+rails";
+pub(crate) const SCENE_BODIES: &str = "bodies";
+pub(crate) const SCENE_PULSES: &str = "pulses";
+pub(crate) const SCENE_HULL_AHEAD: &str = "hull_ahead()";
+pub(crate) const SCENE_HULL: &str = "hull cage";
+pub(crate) const SCENE_PILOT: &str = "pilot";
 
 /// The worldtube samples to draw a ship's `track` with.
 fn render_ship_samples(track: &[ShipSample]) -> Vec<crate::mesh4d::WorldlineSample> {

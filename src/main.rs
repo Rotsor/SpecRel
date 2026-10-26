@@ -1,4 +1,6 @@
 pub mod app;
+#[cfg(test)]
+mod bench;
 pub mod bvh4d;
 pub mod dynamic;
 pub mod gpu;
