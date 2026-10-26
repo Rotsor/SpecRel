@@ -26,10 +26,14 @@ use super::MAX_SEGMENT_DT;
 use std::ops::Range;
 
 use crate::bvh4d::{top_tree, Bvh4D, BvhNode4D};
+use crate::par;
 use crate::mesh4d::{build_worldtube_simplices_with_decided, Aabb4D, Mesh3D, Simplex4D, WorldlineSample};
 
 /// Lab-time span of a tube chunk (by its segments' first samples).
 pub(crate) const CHUNK_T: f32 = 1.0;
+
+/// A tube with at least this many chunks to make afresh makes them in parallel.
+const PARALLEL_CHUNKS: usize = 8;
 
 /// What a chunk is part of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -155,6 +159,14 @@ impl SceneCache {
 
     /// The chunk `id`, made by `make` unless the cached one was made from the same `key`.
     fn chunk(&mut self, id: (Part, i64), key: &[u32], make: impl FnOnce() -> Vec<Simplex4D>) {
+        if !self.reuse(id, key) {
+            self.install(id, Bvh4D::build(make()));
+        }
+    }
+
+    /// Use the chunk `id` in this snapshot. Returns whether the cached one was made from the
+    /// same `key`; if not, it must be [`install`](SceneCache::install)ed afresh.
+    fn reuse(&mut self, id: (Part, i64), key: &[u32]) -> bool {
         let generation = self.generation;
         let chunk = self.chunks.entry(id).or_insert_with(|| Chunk {
             key: Vec::new(),
@@ -164,22 +176,27 @@ impl SceneCache {
             fresh: None,
             used: 0,
         });
-        if chunk.used != 0 && chunk.key == key {
+        let reused = chunk.used != 0 && chunk.key == key;
+        if reused {
             self.stats.chunks_reused += 1;
             self.stats.simplices_reused += chunk.prims.len();
         } else {
-            let bvh = Bvh4D::build(make());
             self.nodes.free(std::mem::replace(&mut chunk.nodes, 0..0));
             self.prims.free(std::mem::replace(&mut chunk.prims, 0..0));
             chunk.key.clear();
             chunk.key.extend_from_slice(key);
-            self.stats.chunks_built += 1;
-            self.stats.simplices_built += bvh.simplices.len();
-            chunk.fresh = Some(bvh);
         }
         debug_assert_ne!(chunk.used, generation, "chunk {id:?} made twice");
         chunk.used = generation;
         self.order.push(id);
+        reused
+    }
+
+    /// The chunk `id`'s BVH, made afresh this snapshot.
+    fn install(&mut self, id: (Part, i64), bvh: Bvh4D) {
+        self.stats.chunks_built += 1;
+        self.stats.simplices_built += bvh.simplices.len();
+        self.chunks.get_mut(&id).unwrap().fresh = Some(bvh);
     }
 
     /// `mesh` swept along `samples` (with per-sample `decided` stamps, if any), as
@@ -197,6 +214,7 @@ impl SceneCache {
         }
         let fingerprint = mesh_fingerprint(mesh);
         let bucket = |i: usize| (samples[i].center.t / CHUNK_T).floor() as i64;
+        let mut todo = Vec::new();
         let mut first = 0;
         while first < samples.len() - 1 {
             let b = bucket(first);
@@ -212,9 +230,21 @@ impl SceneCache {
                 push_sample(&mut key, sample);
             }
             key.extend(d.into_iter().flatten().map(|x| x.to_bits()));
-            self.chunk((part, b), &key, || build_worldtube_simplices_with_decided(mesh, s, d, material));
+            if !self.reuse((part, b), &key) {
+                todo.push(((part, b), first..end + 1));
+            }
             self.key = key;
             first = end;
+        }
+        // The chunks to make afresh: usually the few at the track's tip, on this thread; a
+        // whole track's worth (after a rebase) in parallel, natively.
+        let make = |(_, r): &((Part, i64), Range<usize>)| {
+            let d = decided.map(|d| &d[r.clone()]);
+            Bvh4D::build(build_worldtube_simplices_with_decided(mesh, &samples[r.clone()], d, material))
+        };
+        let built = if todo.len() < PARALLEL_CHUNKS { todo.iter().map(make).collect() } else { par::map_each(&todo, make) };
+        for ((id, _), bvh) in todo.into_iter().zip(built) {
+            self.install(id, bvh);
         }
     }
 

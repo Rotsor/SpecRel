@@ -30,3 +30,16 @@ pub fn map<T: Sync, U: Send>(xs: &[T], f: impl Fn(&T) -> U + Sync + Send) -> Vec
 pub fn map<T, U>(xs: &[T], f: impl Fn(&T) -> U) -> Vec<U> {
     xs.iter().map(f).collect()
 }
+
+/// `xs.iter().map(f).collect()`, each item potentially on a thread of its own (for a few heavy
+/// items, which [`map`] would keep together).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn map_each<T: Sync, U: Send>(xs: &[T], f: impl Fn(&T) -> U + Sync + Send) -> Vec<U> {
+    xs.par_iter().with_max_len(1).map(f).collect()
+}
+
+/// `xs.iter().map(f).collect()`, each item potentially on a thread of its own.
+#[cfg(target_arch = "wasm32")]
+pub fn map_each<T, U>(xs: &[T], f: impl Fn(&T) -> U) -> Vec<U> {
+    xs.iter().map(f).collect()
+}
