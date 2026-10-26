@@ -654,8 +654,79 @@ pub fn build_worldtube_simplices_with_decided(
     decided_at: Option<&[f32]>,
     material_id: usize,
 ) -> Vec<Simplex4D> {
+    let mut simplices = Vec::new();
+    extend_worldtube_simplices(&mut simplices, mesh, samples, decided_at, material_id);
+    simplices
+}
+
+/// What [`extend_worldtube_simplices`] needs of a surface triangle, the same at every step.
+struct TubeTriangle {
+    /// Vertex indices, sorted so shared prism faces between adjacent triangles always split
+    /// along the exact same diagonal (Dompierre watertight prism split).
+    indices: [usize; 3],
+    /// Rest-frame positions, UVs and barycentric coordinates of the sorted vertices
+    p: [Vec3; 3],
+    uv: [(f32, f32); 3],
+    bary: [Vec3; 3],
+    /// Rest-frame tangents `t_u = dp / du`, `t_v = dp / dv`
+    tu: Vec3,
+    tv: Vec3,
+    normal: Vec3,
+}
+
+impl TubeTriangle {
+    fn new(mesh: &Mesh3D, tri: &Triangle3D) -> Self {
+        let std_bary = [
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        ];
+        let mut perm = [0usize, 1, 2];
+        perm.sort_by_key(|&k| tri.indices[k]);
+        let indices = perm.map(|k| tri.indices[k]);
+        let p = indices.map(|i| mesh.vertices[i]);
+        let uv = perm.map(|k| tri.uv[k]);
+        let bary = perm.map(|k| std_bary[k]);
+
+        // Compute 3D rest-frame tangent vectors (t_u = dp / du, t_v = dp / dv) on this triangle
+        // by inverting the 2x2 UV Jacobian:
+        //   p(u, v) = p_a + (u - u_a) * t_u + (v - v_a) * t_v
+        // Because local material-point proper time on a constant-tau_c slice is
+        //   tau_local(u, v, tau_c) = tau_c + p(u, v) . Phi(tau_c),
+        // its directional derivatives along (u, v) in the rest frame are simply:
+        //   (d_tau / du, d_tau / dv) = (t_u . Phi(tau_c), t_v . Phi(tau_c)).
+        let [pa, pb, pc] = p;
+        let [uva, uvb, uvc] = uv;
+        let dp1 = pb - pa;
+        let dp2 = pc - pa;
+        let du1 = uvb.0 - uva.0;
+        let dv1 = uvb.1 - uva.1;
+        let du2 = uvc.0 - uva.0;
+        let dv2 = uvc.1 - uva.1;
+        let uv_det = du1 * dv2 - dv1 * du2;
+        let (tu, tv) = if uv_det.abs() > 1e-10 {
+            let inv_det = 1.0 / uv_det;
+            (
+                (dp1 * dv2 - dp2 * dv1) * inv_det,
+                (dp2 * du1 - dp1 * du2) * inv_det,
+            )
+        } else {
+            (Vec3::default(), Vec3::default())
+        };
+        Self { indices, p, uv, bary, tu, tv, normal: tri.normal }
+    }
+}
+
+/// [`build_worldtube_simplices_with_decided`], appending to `simplices`.
+pub fn extend_worldtube_simplices(
+    simplices: &mut Vec<Simplex4D>,
+    mesh: &Mesh3D,
+    samples: &[WorldlineSample],
+    decided_at: Option<&[f32]>,
+    material_id: usize,
+) {
     if samples.len() < 2 {
-        return Vec::new();
+        return;
     }
     if let Some(d) = decided_at {
         assert_eq!(d.len(), samples.len(), "one decided_at entry per worldline sample");
@@ -663,12 +734,10 @@ pub fn build_worldtube_simplices_with_decided(
 
     let n_verts = mesh.vertices.len();
     let n_steps = samples.len() - 1;
-    let mut simplices = Vec::with_capacity(n_steps * mesh.triangles.len() * 3);
 
     // Precompute 4D vertex positions and verify the Rindler horizon bound (1 + a_local . p > 0)
-    let mut embedded_verts: Vec<Vec<Vec4>> = Vec::with_capacity(samples.len());
+    let mut embedded_verts: Vec<Vec4> = Vec::with_capacity(samples.len() * n_verts);
     for sample in samples {
-        let mut step_verts = Vec::with_capacity(n_verts);
         for &p_rest in &mesh.vertices {
             let rindler_factor = 1.0 + sample.proper_accel_local.dot(p_rest);
             assert!(
@@ -678,21 +747,14 @@ pub fn build_worldtube_simplices_with_decided(
                 p_rest,
                 sample.proper_accel_local
             );
-            let event = sample.center + sample.tetrad.local_spatial_to_world(p_rest);
-            step_verts.push(event);
+            embedded_verts.push(sample.center + sample.tetrad.local_spatial_to_world(p_rest));
         }
-        embedded_verts.push(step_verts);
     }
+    let triangles: Vec<TubeTriangle> = mesh.triangles.iter().map(|tri| TubeTriangle::new(mesh, tri)).collect();
 
-    let std_bary = [
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-        Vec3::new(0.0, 0.0, 1.0),
-    ];
-
-    for step in 0..n_steps {
-        let v_curr = &embedded_verts[step];
-        let v_next = &embedded_verts[step + 1];
+    let emit_step = |step: usize, simplices: &mut Vec<Simplex4D>| {
+        let v_curr = &embedded_verts[step * n_verts..(step + 1) * n_verts];
+        let v_next = &embedded_verts[(step + 1) * n_verts..(step + 2) * n_verts];
         let s_curr = &samples[step];
         let s_next = &samples[step + 1];
         let (dec0, dec1) = match decided_at {
@@ -705,16 +767,8 @@ pub fn build_worldtube_simplices_with_decided(
         let u_norm = (-u_avg_raw.minkowski_norm_sq()).max(1e-12).sqrt();
         let u_avg = u_avg_raw * (1.0 / u_norm);
 
-        for tri in &mesh.triangles {
-            // Sort triangle vertices by index so shared prism faces between adjacent triangles
-            // always split along the exact same diagonal (Dompierre watertight prism split).
-            let mut perm = [0usize, 1, 2];
-            perm.sort_by_key(|&k| tri.indices[k]);
-
-            let ia = tri.indices[perm[0]];
-            let ib = tri.indices[perm[1]];
-            let ic = tri.indices[perm[2]];
-
+        for tri in &triangles {
+            let [ia, ib, ic] = tri.indices;
             let a0 = v_curr[ia];
             let b0 = v_curr[ib];
             let c0 = v_curr[ic];
@@ -723,9 +777,7 @@ pub fn build_worldtube_simplices_with_decided(
             let c1 = v_next[ic];
 
             // Born-rigid local proper time tau_p = tau_c + p_rest . phi at each vertex
-            let pa = mesh.vertices[ia];
-            let pb = mesh.vertices[ib];
-            let pc = mesh.vertices[ic];
+            let [pa, pb, pc] = tri.p;
             let tau_a0 = s_curr.proper_time + pa.dot(s_curr.phi);
             let tau_b0 = s_curr.proper_time + pb.dot(s_curr.phi);
             let tau_c0 = s_curr.proper_time + pc.dot(s_curr.phi);
@@ -733,40 +785,11 @@ pub fn build_worldtube_simplices_with_decided(
             let tau_b1 = s_next.proper_time + pb.dot(s_next.phi);
             let tau_c1 = s_next.proper_time + pc.dot(s_next.phi);
 
-            let uva = tri.uv[perm[0]];
-            let uvb = tri.uv[perm[1]];
-            let uvc = tri.uv[perm[2]];
-
-            // Compute 3D rest-frame tangent vectors (t_u = dp / du, t_v = dp / dv) on this triangle
-            // by inverting the 2x2 UV Jacobian:
-            //   p(u, v) = p_a + (u - u_a) * t_u + (v - v_a) * t_v
-            // Because local material-point proper time on a constant-tau_c slice is
-            //   tau_local(u, v, tau_c) = tau_c + p(u, v) . Phi(tau_c),
-            // its directional derivatives along (u, v) in the rest frame are simply:
-            //   (d_tau / du, d_tau / dv) = (t_u . Phi(tau_c), t_v . Phi(tau_c)).
-            let dp1 = pb - pa;
-            let dp2 = pc - pa;
-            let du1 = uvb.0 - uva.0;
-            let dv1 = uvb.1 - uva.1;
-            let du2 = uvc.0 - uva.0;
-            let dv2 = uvc.1 - uva.1;
-            let uv_det = du1 * dv2 - dv1 * du2;
-            let (tu, tv) = if uv_det.abs() > 1e-10 {
-                let inv_det = 1.0 / uv_det;
-                (
-                    (dp1 * dv2 - dp2 * dv1) * inv_det,
-                    (dp2 * du1 - dp1 * du2) * inv_det,
-                )
-            } else {
-                (Vec3::default(), Vec3::default())
-            };
-            let uv_world_scale = (tu.length(), tv.length());
-            let tau_uv_0 = (tu.dot(s_curr.phi), tv.dot(s_curr.phi));
-            let tau_uv_1 = (tu.dot(s_next.phi), tv.dot(s_next.phi));
-
-            let ba = std_bary[perm[0]];
-            let bb = std_bary[perm[1]];
-            let bc = std_bary[perm[2]];
+            let [uva, uvb, uvc] = tri.uv;
+            let uv_world_scale = (tri.tu.length(), tri.tv.length());
+            let tau_uv_0 = (tri.tu.dot(s_curr.phi), tri.tv.dot(s_curr.phi));
+            let tau_uv_1 = (tri.tu.dot(s_next.phi), tri.tv.dot(s_next.phi));
+            let [ba, bb, bc] = tri.bary;
 
             // Map the rest-frame outward triangle normal into 4D spacetime using the step's tetrad
             let n4_curr = s_curr.tetrad.local_spatial_to_world(tri.normal);
@@ -822,9 +845,12 @@ pub fn build_worldtube_simplices_with_decided(
                 }
             }
         }
-    }
+    };
 
-    simplices
+    simplices.reserve(n_steps * 3 * triangles.len());
+    for step in 0..n_steps {
+        emit_step(step, simplices);
+    }
 }
 
 /// Seal a Born-rigid worldtube with the body's rest-frame cross-section at `sample` (e.g. where

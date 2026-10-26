@@ -22,7 +22,7 @@ pub mod ship;
 
 use crate::bvh4d::Bvh4D;
 use crate::mesh4d::{
-    build_worldtube_cap, build_worldtube_cap_about, build_worldtube_simplices, build_worldtube_simplices_with_decided,
+    build_worldtube_cap, build_worldtube_cap_about, build_worldtube_simplices, extend_worldtube_simplices,
     sample_inertial_worldline, Mesh3D, Simplex4D, DECIDED_AT_STATIC,
 };
 use crate::minkowski::{Vec3, Vec4};
@@ -420,7 +420,7 @@ impl DynWorld {
             let samples: Vec<_> = keep.iter().map(|&i| body.history[i].sample()).collect();
             let decided: Vec<f32> = keep.iter().map(|&i| body.decided_at[i]).collect();
             let m = body.material_id;
-            simplices.extend(build_worldtube_simplices_with_decided(&body.mesh, &samples, Some(&decided), m));
+            extend_worldtube_simplices(&mut simplices, &body.mesh, &samples, Some(&decided), m);
             let last = samples.len() - 1;
             simplices.extend(build_worldtube_cap(&body.mesh, &samples[last], decided[last], m));
         }
@@ -446,14 +446,14 @@ impl DynWorld {
             };
             let m = ship.hull_material();
             let samples = render_ship_samples(&hull);
-            simplices.extend(build_worldtube_simplices(&hull_mesh, &samples, m));
+            extend_worldtube_simplices(&mut simplices, &hull_mesh, &samples, None, m);
             let end = samples.last().unwrap();
             for (bar, center) in &hull_bars {
                 simplices.extend(build_worldtube_cap_about(bar, end, DECIDED_AT_STATIC, m, *center));
             }
             lap(SCENE_HULL, simplices.len());
             let (samples, m) = (render_ship_samples(pilot), ship.material());
-            simplices.extend(build_worldtube_simplices(&pilot_mesh, &samples, m));
+            extend_worldtube_simplices(&mut simplices, &pilot_mesh, &samples, None, m);
             simplices.extend(build_worldtube_cap(&pilot_mesh, samples.last().unwrap(), DECIDED_AT_STATIC, m));
             lap(SCENE_PILOT, simplices.len());
         }
