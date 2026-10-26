@@ -3,11 +3,11 @@
 //! The world's histories are append-only: between two snapshots only their tips change (the
 //! last segment of a track, its cap, a hull's settled motion ahead, pulses in flight). So the
 //! snapshot is cut into chunks, a body's or ship's tube per [`CHUNK_T`] of lab time and a
-//! laser pulse each, each with its own BVH. A chunk is keyed by everything its geometry is
-//! made from (its worldtube samples, materials, mesh), so it is rebuilt exactly when its
-//! inputs changed, whatever changed them (a new sample, a track pruned at the front, a rebase,
-//! a new world). The few simplices that change every time (the table spanning the time window,
-//! the caps) are built afresh as one more chunk.
+//! laser pulse per piece ([`super::laser::Pulse::pieces`]), each with its own BVH. A chunk is
+//! keyed by everything its geometry is made from (its worldtube samples, materials, mesh), so
+//! it is rebuilt exactly when its inputs changed, whatever changed them (a new sample, a track
+//! pruned at the front, a rebase, a new world). The few simplices that change every time (the
+//! table spanning the time window, the caps) are built afresh as one more chunk.
 //!
 //! The scene's [`Bvh4D`] is the chunks' arena: each chunk's nodes and simplices stay where
 //! they were first written, and a snapshot writes only the new chunks (into the room old ones
@@ -218,9 +218,9 @@ impl SceneCache {
         }
     }
 
-    /// A chunk of its own for `part`, keyed by `key` (the bits of what `make` makes it from).
-    pub(crate) fn single(&mut self, part: Part, key: &[u32], make: impl FnOnce() -> Vec<Simplex4D>) {
-        self.chunk((part, 0), key, make);
+    /// Chunk `index` of `part`, keyed by `key` (the bits of what `make` makes it from).
+    pub(crate) fn piece(&mut self, part: Part, index: i64, key: &[u32], make: impl FnOnce() -> Vec<Simplex4D>) {
+        self.chunk((part, index), key, make);
     }
 
     /// The samples of `full` to draw ([`super::ship::render_indices`]), where `full` is the

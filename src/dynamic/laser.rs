@@ -243,49 +243,101 @@ impl Pulse {
     /// far as it is known. Light has no rest frame, but a pulse does: the one its shooter fired
     /// it in. There it is a rod of [`PULSE_LENGTH`] along the firing direction; shaped in any
     /// other frame (the lab's), it would look skewed to everyone else, as if dragged by an
-    /// aether.
+    /// aether. Its worldtube is cut into the pieces of [`Pulse::pieces`].
     pub fn simplices(&self, t_origin: f64) -> Vec<Simplex4D> {
         self.simplices_in_pieces(t_origin, PULSE_SEGMENT_DT)
     }
 
     /// [`Pulse::simplices`], with its worldtube cut into pieces of at most `piece_dt` lab time.
     fn simplices_in_pieces(&self, t_origin: f64, piece_dt: f64) -> Vec<Simplex4D> {
-        let [vx, vy, vz] = self.vel.map(|c| c as f32);
-        let tetrad = Tetrad::from_beta(Vec3::new(vx, vy, vz));
-        let [x, y, z] = self.dir.map(|c| c as f32);
-        let forward = tetrad.world_to_local_spatial(Vec4::new(1.0, x, y, z)).normalized();
-        let mesh = rod_mesh(forward);
-        let back = tetrad.local_spatial_to_world(forward * (-0.5 * PULSE_LENGTH));
-        let sample = |t: f64| {
-            let [x, y, z] = self.pos_at(t);
-            WorldlineSample {
-                center: Vec4::new(t as f32, x as f32, y as f32, z as f32) + back,
-                proper_time: 0.0,
-                phi: Vec3::default(),
-                proper_accel_local: Vec3::default(),
-                tetrad,
-            }
-        };
-        let (t0, t1) = (self.t0, self.known_to(t_origin));
-        let n = ((t1 - t0) / piece_dt).ceil().max(1.0) as usize;
-        let samples: Vec<_> = (0..=n).map(|i| sample(t0 + (t1 - t0) * i as f64 / n as f64)).collect();
-        let mut simplices =
-            build_worldtube_simplices_with_decided(&mesh, &samples, Some(&vec![self.fired_at; n + 1]), MATERIAL_PULSE);
-        for end in [&samples[0], &samples[n]] {
-            simplices.extend(build_worldtube_cap(&mesh, end, self.fired_at, MATERIAL_PULSE));
+        let shape = self.shape();
+        let pieces = self.pieces_of(t_origin, piece_dt);
+        let mut simplices = Vec::new();
+        for k in 0..pieces {
+            simplices.extend(self.piece_with(&shape, t_origin, piece_dt, k, pieces));
         }
         simplices
     }
 
-    /// The bits of everything [`Pulse::simplices`] makes its geometry from (the scene cache's
-    /// key for it).
-    pub fn render_key(&self, t_origin: f64) -> Vec<u32> {
-        let f64s = [self.t0, self.known_to(t_origin)].into_iter().chain(self.pos0).chain(self.dir).chain(self.vel);
+    /// How many pieces of at most [`PULSE_SEGMENT_DT`] lab time the pulse is drawn in (at
+    /// least one). They are cut on a grid from where it was fired, `[t0 + k dt, t0 + (k + 1) dt]`,
+    /// the last one ending where it is known to: so as the pulse flies on, only its last piece
+    /// changes, and the scene cache reuses the others.
+    pub fn pieces(&self, t_origin: f64) -> usize {
+        self.pieces_of(t_origin, PULSE_SEGMENT_DT)
+    }
+
+    fn pieces_of(&self, t_origin: f64, piece_dt: f64) -> usize {
+        let span = self.known_to(t_origin) - self.t0;
+        // A last piece of no length (the pulse known exactly to a cut) is left out, but for
+        // the first.
+        let full = (span / piece_dt).floor() as usize;
+        if full == 0 {
+            return 1;
+        }
+        full + (full as f64 * piece_dt < span) as usize
+    }
+
+    /// Piece `k` of the [`Pulse::pieces`]: its stretch of the worldtube, with the cap where the
+    /// pulse was fired on the first and the one where it is known to on the last.
+    pub fn piece(&self, t_origin: f64, k: usize) -> Vec<Simplex4D> {
+        self.piece_with(&self.shape(), t_origin, PULSE_SEGMENT_DT, k, self.pieces(t_origin))
+    }
+
+    /// The rod's mesh in the shooter's rest frame, that frame, and the offset from the head to
+    /// the rod's center.
+    fn shape(&self) -> (Mesh3D, Tetrad, Vec4) {
+        let [vx, vy, vz] = self.vel.map(|c| c as f32);
+        let tetrad = Tetrad::from_beta(Vec3::new(vx, vy, vz));
+        let [x, y, z] = self.dir.map(|c| c as f32);
+        let forward = tetrad.world_to_local_spatial(Vec4::new(1.0, x, y, z)).normalized();
+        let back = tetrad.local_spatial_to_world(forward * (-0.5 * PULSE_LENGTH));
+        (rod_mesh(forward), tetrad, back)
+    }
+
+    fn piece_with(
+        &self,
+        (mesh, tetrad, back): &(Mesh3D, Tetrad, Vec4),
+        t_origin: f64,
+        piece_dt: f64,
+        k: usize,
+        pieces: usize,
+    ) -> Vec<Simplex4D> {
+        let sample = |t: f64| {
+            let [x, y, z] = self.pos_at(t);
+            WorldlineSample {
+                center: Vec4::new(t as f32, x as f32, y as f32, z as f32) + *back,
+                proper_time: 0.0,
+                phi: Vec3::default(),
+                proper_accel_local: Vec3::default(),
+                tetrad: *tetrad,
+            }
+        };
+        let (first, last) = (k == 0, k + 1 == pieces);
+        let ta = if first { self.t0 } else { self.t0 + k as f64 * piece_dt };
+        let tb = if last { self.known_to(t_origin) } else { self.t0 + (k + 1) as f64 * piece_dt };
+        let ends = [sample(ta), sample(tb)];
+        let mut simplices =
+            build_worldtube_simplices_with_decided(mesh, &ends, Some(&[self.fired_at; 2]), MATERIAL_PULSE);
+        for (end, capped) in ends.iter().zip([first, last]) {
+            if capped {
+                simplices.extend(build_worldtube_cap(mesh, end, self.fired_at, MATERIAL_PULSE));
+            }
+        }
+        simplices
+    }
+
+    /// The bits of everything [`Pulse::piece`] `k` is made from (the scene cache's key for
+    /// it). A piece but the last stays the same as the pulse flies on.
+    pub fn piece_key(&self, t_origin: f64, k: usize) -> Vec<u32> {
+        let last = k + 1 == self.pieces(t_origin);
+        let end = if last { self.known_to(t_origin) } else { f64::NAN };
+        let f64s = [self.t0, end].into_iter().chain(self.pos0).chain(self.dir).chain(self.vel);
         f64s.flat_map(|x| {
             let b = x.to_bits();
             [b as u32, (b >> 32) as u32]
         })
-        .chain([self.fired_at.to_bits()])
+        .chain([self.fired_at.to_bits(), k as u32, last as u32])
         .collect()
     }
 

@@ -512,8 +512,11 @@ impl DynWorld {
         }
 
         for pulse in &self.pulses {
-            let key = pulse.render_key(self.t_origin);
-            cache.single(Part::Pulse(pulse.shooter, pulse.seq), &key, || pulse.simplices(self.t_origin));
+            // In pieces: one in flight changes only its last.
+            for k in 0..pulse.pieces(self.t_origin) {
+                let key = pulse.piece_key(self.t_origin, k);
+                cache.piece(Part::Pulse(pulse.shooter, pulse.seq), k as i64, &key, || pulse.piece(self.t_origin, k));
+            }
         }
 
         let (hull_mesh, hull_bars, pilot_mesh) = (Ship::hull_mesh(), Ship::hull_bars(), Ship::pilot_mesh());
