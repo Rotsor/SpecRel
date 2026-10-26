@@ -262,6 +262,18 @@ impl Pulse {
         simplices
     }
 
+    /// The bits of everything [`Pulse::simplices`] makes its geometry from (the scene cache's
+    /// key for it).
+    pub fn render_key(&self, t_origin: f64) -> Vec<u32> {
+        let f64s = [self.t0, self.known_to(t_origin)].into_iter().chain(self.pos0).chain(self.dir).chain(self.vel);
+        f64s.flat_map(|x| {
+            let b = x.to_bits();
+            [b as u32, (b >> 32) as u32]
+        })
+        .chain([self.fired_at.to_bits()])
+        .collect()
+    }
+
     /// Shift every event by `dt` in lab time (`t_origin` moves with it).
     pub fn rebase(&mut self, dt: f64) {
         self.t0 += dt;

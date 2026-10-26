@@ -412,27 +412,100 @@ fn state_at(track: &[ShipSample], t: f64) -> ShipSample {
 /// repeats exactly, and an exact test would draw it as if it thrusted all along. (Each drawn
 /// segment of the hull's cage costs ~400 simplices.)
 pub fn render_indices(track: &[ShipSample], max_segment_dt: f64) -> Vec<usize> {
-    let dv = |a: &ShipSample, b: &ShipSample| (0..3).map(|c| (a.vel[c] - b.vel[c]).abs()).fold(0.0, f64::max);
-    let mut keep = vec![0];
-    // The largest velocity change (per component) since the last kept sample: past it, the
-    // track strays from that sample's straight line by at most `drift * dt`.
-    let mut drift = 0.0;
-    for i in 1..track.len() {
-        let last = *keep.last().unwrap();
-        drift = f64::max(drift, dv(&track[i], &track[last]));
-        let strays = drift * (track[i].t - track[last].t) > MAX_STRAY;
+    RenderScan::default().finish(track, max_segment_dt)
+}
+
+/// [`render_indices`]' scan of a track, resumable: a track is only ever appended to (and
+/// pruned at the front), so the choices made over a prefix of it stand, and the scene cache
+/// picks the scan up where it left off instead of redoing it. Picking it up after the track
+/// was pruned ([`RenderScan::realign`]) also keeps the choices made before, where a fresh
+/// scan from the new first sample would choose afresh all along (and the cache would have to
+/// redraw the whole track).
+#[derive(Clone, Debug)]
+pub struct RenderScan {
+    /// The samples kept so far (indices into the track).
+    pub keep: Vec<usize>,
+    /// The largest velocity change (per component) since the last kept sample: past it, the
+    /// track strays from that sample's straight line by at most `drift * dt`.
+    drift: f64,
+    /// The next sample to look at.
+    next: usize,
+}
+
+impl Default for RenderScan {
+    fn default() -> Self {
+        Self { keep: vec![0], drift: 0.0, next: 1 }
+    }
+}
+
+impl RenderScan {
+    /// Look at sample `i` of `track`; `final_sample` says it is the track's last.
+    fn step(&mut self, track: &[ShipSample], i: usize, final_sample: bool, max_segment_dt: f64) {
+        let dv = |a: &ShipSample, b: &ShipSample| (0..3).map(|c| (a.vel[c] - b.vel[c]).abs()).fold(0.0, f64::max);
+        let last = *self.keep.last().unwrap();
+        self.drift = f64::max(self.drift, dv(&track[i], &track[last]));
+        let strays = self.drift * (track[i].t - track[last].t) > MAX_STRAY;
         if strays && last != i - 1 && track[i - 1].t - track[last].t >= THRUST_SAMPLE_DT {
-            keep.push(i - 1); // end of a straight stretch
-            drift = dv(&track[i], &track[i - 1]);
+            self.keep.push(i - 1); // end of a straight stretch
+            self.drift = dv(&track[i], &track[i - 1]);
         }
-        let dt = track[i].t - track[*keep.last().unwrap()].t;
-        let strays = drift * dt > MAX_STRAY;
-        if i == track.len() - 1 || (strays && dt >= THRUST_SAMPLE_DT) || dt >= max_segment_dt {
-            keep.push(i);
-            drift = 0.0;
+        let dt = track[i].t - track[*self.keep.last().unwrap()].t;
+        let strays = self.drift * dt > MAX_STRAY;
+        if final_sample || (strays && dt >= THRUST_SAMPLE_DT) || dt >= max_segment_dt {
+            self.keep.push(i);
+            self.drift = 0.0;
         }
     }
-    keep
+
+    /// Scan on up to (not including) sample `end`, which must not be the track's last: these
+    /// choices stand however the track goes on.
+    pub fn feed(&mut self, track: &[ShipSample], end: usize, max_segment_dt: f64) {
+        debug_assert!(end < track.len());
+        while self.next < end {
+            self.step(track, self.next, false, max_segment_dt);
+            self.next += 1;
+        }
+    }
+
+    /// Scan the rest of `track`, and return the samples to draw.
+    pub fn finish(mut self, track: &[ShipSample], max_segment_dt: f64) -> Vec<usize> {
+        while self.next < track.len() {
+            self.step(track, self.next, self.next == track.len() - 1, max_segment_dt);
+            self.next += 1;
+        }
+        self.keep
+    }
+
+    /// The last sample looked at (to [`realign`](RenderScan::realign) by later).
+    pub fn last_seen<'a>(&self, track: &'a [ShipSample]) -> &'a ShipSample {
+        &track[self.next - 1]
+    }
+
+    /// Carry the scan over to `track`, which the scanned track may have become by being pruned
+    /// at the front and appended to; `seen` is the scan's [`last_seen`](RenderScan::last_seen)
+    /// sample of the scanned track. Choices before the new first sample are dropped, and that
+    /// sample is kept. Starts afresh if `track` did not come about that way (a rebase, a new
+    /// world).
+    pub fn realign(&mut self, seen: &ShipSample, track: &[ShipSample]) {
+        let j = track.partition_point(|s| s.t < seen.t);
+        let found = track[j..].iter().take_while(|s| s.t == seen.t).position(|s| s == seen).map(|k| j + k);
+        let Some(j) = found.filter(|&j| j < self.next) else {
+            *self = Self::default();
+            return;
+        };
+        let shift = self.next - 1 - j;
+        if shift == 0 {
+            return;
+        }
+        self.next -= shift;
+        self.keep.retain(|&k| k >= shift);
+        for k in &mut self.keep {
+            *k -= shift;
+        }
+        if self.keep.first() != Some(&0) {
+            self.keep.insert(0, 0);
+        }
+    }
 }
 
 /// Lab-time spacing of a thrusting ship's rendered samples.

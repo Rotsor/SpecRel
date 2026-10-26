@@ -5,7 +5,7 @@
 
 use crate::dynamic::billiards;
 use crate::dynamic::helm::{self, CommandQueue, ControlMode, Hull, Order};
-use crate::dynamic::{DynWorld, PlayerId, ShipSample};
+use crate::dynamic::{DynWorld, PlayerId, SceneCache, ShipSample};
 use crate::hud::{HudInfo, HudSections};
 use crate::minkowski::{Vec3, Vec4};
 use crate::renderer::{
@@ -122,6 +122,8 @@ pub struct App {
     pub scene_generation: u64,
     world_grew: bool,
     rebuild_timer: f32,
+    /// Dynamic Mode: the geometry of the last snapshot, reused by the next.
+    scene_cache: SceneCache,
     /// Wall-clock interval between geometry snapshots of a growing dynamic world;
     /// [`DYNAMIC_REBUILD_INTERVAL`] unless nothing renders (e.g. headless tests).
     pub rebuild_interval: f32,
@@ -157,6 +159,7 @@ impl App {
             scene_generation: 0,
             world_grew: false,
             rebuild_timer: 0.0,
+            scene_cache: SceneCache::default(),
             rebuild_interval: DYNAMIC_REBUILD_INTERVAL,
             multiplayer: None,
             perf: PerfStats::default(),
@@ -559,7 +562,7 @@ impl App {
             return 0.0;
         };
         let start = perf::now_ms();
-        self.scenes[self.scene_idx] = world.build_scene();
+        world.rebuild_scene(&mut self.scene_cache, &mut self.scenes[self.scene_idx]);
         self.scene_generation += 1;
         self.world_grew = false;
         self.rebuild_timer = 0.0;
@@ -608,6 +611,7 @@ impl App {
         self.steer = None;
         self.commands.clear();
 
+        self.scene_cache = SceneCache::default();
         self.world = demo.is_dynamic().then(|| match player {
             Some(p) => DynWorld::new_match(demo, &game::spawns(), p),
             None => DynWorld::new(demo, self.camera_frontier(), self.camera.tetrad.e[0]),

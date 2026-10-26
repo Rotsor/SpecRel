@@ -1,6 +1,15 @@
 use crate::mesh4d::{Aabb4D, HitRecord4D, Simplex4D, SimplexGeom4D};
 use crate::minkowski::Vec4;
 
+/// The SAH's measure of a box: its spatial surface area, plus its extent in time weighted
+/// against the spatial ones.
+fn box_measure(b: Aabb4D) -> f32 {
+    let e = b.extent();
+    let spatial_sa = e.x * e.y + e.y * e.z + e.z * e.x;
+    let temporal_sa = 0.22 * e.t * (e.x + e.y + e.z);
+    spatial_sa + temporal_sa
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BvhNode4D {
     pub(crate) aabb: Aabb4D,
@@ -30,6 +39,84 @@ impl Bvh4D {
             hot_geoms,
             simplices,
         }
+    }
+
+    /// A BVH over nothing.
+    pub fn empty() -> Self {
+        Self { nodes: Vec::new(), hot_geoms: Vec::new(), simplices: Vec::new() }
+    }
+
+    /// The bounds of everything in it (empty if it holds nothing).
+    pub(crate) fn bounds(&self) -> Aabb4D {
+        self.nodes.first().map_or(Aabb4D::empty(), |n| n.aabb)
+    }
+
+    /// Replace the contents with one BVH over all of `parts`' simplices, reusing this BVH's
+    /// allocations: a small SAH tree over the parts' bounds whose leaves are the parts' own
+    /// trees, copied in with their node and simplex indices relocated. Nothing is re-sorted,
+    /// so this costs a copy of the parts, not a build.
+    pub(crate) fn assemble(&mut self, parts: &[&Bvh4D]) {
+        self.nodes.clear();
+        self.hot_geoms.clear();
+        self.simplices.clear();
+        let mut items: Vec<(Aabb4D, usize)> =
+            parts.iter().enumerate().filter(|(_, p)| !p.nodes.is_empty()).map(|(i, p)| (p.bounds(), i)).collect();
+        let nodes: usize = parts.iter().map(|p| p.nodes.len()).sum();
+        let prims: usize = parts.iter().map(|p| p.simplices.len()).sum();
+        self.nodes.reserve(nodes + items.len());
+        self.hot_geoms.reserve(prims);
+        self.simplices.reserve(prims);
+        if !items.is_empty() {
+            self.assemble_recursive(parts, &mut items);
+        }
+    }
+
+    fn assemble_recursive(&mut self, parts: &[&Bvh4D], items: &mut [(Aabb4D, usize)]) {
+        if let [(_, i)] = *items {
+            let part = parts[i];
+            let (node_base, prim_base) = (self.nodes.len() as u32, self.simplices.len() as u32);
+            self.nodes.extend(part.nodes.iter().map(|n| BvhNode4D {
+                right_or_first: n.right_or_first + if n.count > 0 { prim_base } else { node_base },
+                ..*n
+            }));
+            self.hot_geoms.extend_from_slice(&part.hot_geoms);
+            self.simplices.extend_from_slice(&part.simplices);
+            return;
+        }
+        let bounds = items.iter().fold(Aabb4D::empty(), |b, (a, _)| b.union(*a));
+        let node_idx = self.nodes.len();
+        self.nodes.push(BvhNode4D { aabb: bounds, right_or_first: 0, count: 0 });
+
+        // Full-sweep SAH over the parts' centroids (there are only a few hundred), weighting each
+        // side by its simplices.
+        let weight = |i: usize| parts[i].simplices.len() as f32;
+        let mut best = (f32::INFINITY, 0usize, items.len() / 2);
+        let mut right_box = vec![Aabb4D::empty(); items.len()];
+        let mut right_w = vec![0.0f32; items.len()];
+        for axis in 0..4 {
+            items.sort_by(|a, b| a.0.center().axis(axis).total_cmp(&b.0.center().axis(axis)));
+            let mut acc = (Aabb4D::empty(), 0.0);
+            for k in (1..items.len()).rev() {
+                acc = (acc.0.union(items[k].0), acc.1 + weight(items[k].1));
+                right_box[k] = acc.0;
+                right_w[k] = acc.1;
+            }
+            let mut left = (Aabb4D::empty(), 0.0);
+            for k in 1..items.len() {
+                left = (left.0.union(items[k - 1].0), left.1 + weight(items[k - 1].1));
+                let cost = left.1 * box_measure(left.0) + right_w[k] * box_measure(right_box[k]);
+                if cost < best.0 {
+                    best = (cost, axis, k);
+                }
+            }
+        }
+        let (_, axis, mid) = best;
+        items.sort_by(|a, b| a.0.center().axis(axis).total_cmp(&b.0.center().axis(axis)));
+        let (left, right) = items.split_at_mut(mid);
+        self.assemble_recursive(parts, left);
+        let right_idx = self.nodes.len() as u32;
+        self.assemble_recursive(parts, right);
+        self.nodes[node_idx].right_or_first = right_idx;
     }
 
     /// Flat node array (depth-first; left child of internal node `i` is `i + 1`).
@@ -73,12 +160,6 @@ impl Bvh4D {
         }
 
         let ext = centroid_bounds.extent();
-        let box_measure = |b: Aabb4D| -> f32 {
-            let e = b.extent();
-            let spatial_sa = e.x * e.y + e.y * e.z + e.z * e.x;
-            let temporal_sa = 0.22 * e.t * (e.x + e.y + e.z);
-            spatial_sa + temporal_sa
-        };
 
         // 8-bin 4D SAH across all 4 spacetime axes (t, x, y, z)
         const BINS: usize = 8;

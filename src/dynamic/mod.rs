@@ -17,6 +17,7 @@ pub mod body;
 pub mod collide;
 pub mod helm;
 pub mod laser;
+pub mod scene_cache;
 pub mod ship;
 
 use crate::bvh4d::Bvh4D;
@@ -31,6 +32,8 @@ use body::{distance, is_decided, Body, BodyState, Impulse, STEP_DT};
 use collide::{P4, V3};
 use helm::{Command, ControlMode};
 use laser::{Progress, Pulse, Target};
+use scene_cache::Part;
+pub use scene_cache::SceneCache;
 pub use ship::{PlayerId, Ship, ShipSample};
 
 /// How far behind the camera (in lab time) histories are kept: beyond the renderers' maximum
@@ -460,16 +463,89 @@ impl DynWorld {
     /// The scene of `simplices` (from [`DynWorld::scene_simplices`]): their BVH, and the
     /// world's lighting and time window.
     pub(crate) fn scene_of(&self, simplices: Vec<Simplex4D>) -> Scene4D {
+        let mut scene = self.empty_scene();
+        scene.bvh = Bvh4D::build(simplices);
+        scene
+    }
+
+    /// The world's lighting and time window, with no geometry yet.
+    fn empty_scene(&self) -> Scene4D {
         let o = self.frontier.origin;
         let window = HISTORY_WINDOW as f32;
         Scene4D {
             demo: self.demo,
-            bvh: Bvh4D::build(simplices),
+            bvh: Bvh4D::empty(),
             materials: Scene4D::common_materials(),
             light_pos: Vec3::new(0.0, 6.5, 4.0),
             t_min: o.t - window,
             t_max: o.t + window,
         }
+    }
+
+    /// [`DynWorld::build_scene`], incrementally: overwrite `scene` (reusing its allocations)
+    /// with the world's snapshot, reusing whatever geometry `cache` still holds from the last
+    /// snapshot it made (see [`scene_cache`]). The same simplices as `build_scene`'s (save
+    /// that the ships' tracks are sampled as they were before being pruned, see
+    /// [`ship::RenderScan`]), in a BVH of the same structure within each chunk.
+    pub fn rebuild_scene(&self, cache: &mut SceneCache, scene: &mut Scene4D) {
+        let o = self.frontier.origin;
+        let window = HISTORY_WINDOW as f32;
+        cache.begin();
+        let backdrop =
+            |pos| sample_inertial_worldline(pos, Vec3::default(), o.t - window, o.t + window, 1);
+
+        // The table spans the time window, so it changes every time (it is small).
+        let ground = Mesh3D::ground_grid(24.0, 24.0, billiards::TABLE_Y, 4, 4);
+        let mut volatile = build_worldtube_simplices(&ground, &backdrop(Vec3::default()), 0);
+        for (rail, center) in billiards::rails() {
+            volatile.extend(build_worldtube_simplices(&rail, &backdrop(center), MATERIAL_RAIL));
+        }
+
+        for body in &self.bodies {
+            let keep = render_sample_indices(&body.history);
+            let samples: Vec<_> = keep.iter().map(|&i| body.history[i].sample()).collect();
+            let decided: Vec<f32> = keep.iter().map(|&i| body.decided_at[i]).collect();
+            let m = body.material_id;
+            cache.tube(Part::Body(body.uid), &body.mesh, &samples, Some(&decided), m);
+            let last = samples.len() - 1;
+            volatile.extend(build_worldtube_cap(&body.mesh, &samples[last], decided[last], m));
+        }
+
+        for pulse in &self.pulses {
+            let key = pulse.render_key(self.t_origin);
+            cache.single(Part::Pulse(pulse.shooter, pulse.seq), &key, || pulse.simplices(self.t_origin));
+        }
+
+        let (hull_mesh, hull_bars, pilot_mesh) = (Ship::hull_mesh(), Ship::hull_bars(), Ship::pilot_mesh());
+        for ship in self.ships.iter().filter(|s| s.player != self.viewer) {
+            let ahead = ship.hull_ahead();
+            let hull: Vec<_> = ship.hull.iter().chain(&ahead).copied().collect();
+            let keep = cache.render_indices(ship.player, false, &ship.hull, &hull);
+            let samples: Vec<_> = keep.iter().map(|&i| hull[i].sample()).collect();
+            let m = ship.hull_material();
+            cache.tube(Part::Hull(ship.player), &hull_mesh, &samples, None, m);
+            let end = samples.last().unwrap();
+            for (bar, center) in &hull_bars {
+                volatile.extend(build_worldtube_cap_about(bar, end, DECIDED_AT_STATIC, m, *center));
+            }
+            let samples = match ship.controls {
+                ControlMode::Delayed => samples,
+                ControlMode::Pod => {
+                    let keep = cache.render_indices(ship.player, true, &ship.track, &ship.track);
+                    keep.iter().map(|&i| ship.track[i].sample()).collect()
+                }
+            };
+            let m = ship.material();
+            cache.tube(Part::Pilot(ship.player), &pilot_mesh, &samples, None, m);
+            volatile.extend(build_worldtube_cap(&pilot_mesh, samples.last().unwrap(), DECIDED_AT_STATIC, m));
+        }
+
+        let fresh = self.empty_scene();
+        scene.demo = fresh.demo;
+        scene.materials = fresh.materials;
+        scene.light_pos = fresh.light_pos;
+        (scene.t_min, scene.t_max) = (fresh.t_min, fresh.t_max);
+        cache.finish(&Bvh4D::build(volatile), &mut scene.bvh);
     }
 }
 
@@ -540,8 +616,11 @@ fn decision_time(state: &BodyState, frontier: Frontier, u: Vec4) -> f32 {
 
 /// History steps to keep as worldtube samples: the ends, both sides of every velocity change
 /// (so straight stretches merge into single prisms and kinks stay sharp), and at least one
-/// sample every [`MAX_SEGMENT_DT`].
+/// sample every [`MAX_SEGMENT_DT`] (on a fixed grid of steps, so that pruning the history at
+/// the front leaves the choices after its new start as they were, and the scene cache's chunks
+/// of it valid).
 fn render_sample_indices(history: &[BodyState]) -> Vec<usize> {
+    let segment_steps = (MAX_SEGMENT_DT / STEP_DT).round() as i64;
     let mut keep = vec![0];
     for i in 1..history.len() {
         let last = *keep.last().unwrap();
@@ -549,8 +628,7 @@ fn render_sample_indices(history: &[BodyState]) -> Vec<usize> {
         if kink && last != i - 1 {
             keep.push(i - 1);
         }
-        let last_t = history[*keep.last().unwrap()].t;
-        if kink || i == history.len() - 1 || history[i].t - last_t >= MAX_SEGMENT_DT {
+        if kink || i == history.len() - 1 || history[i].step.rem_euclid(segment_steps) == 0 {
             keep.push(i);
         }
     }
