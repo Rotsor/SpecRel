@@ -414,10 +414,11 @@ fn state_at(track: &[ShipSample], t: f64) -> ShipSample {
 /// (coasting) stretch, and while thrusting at most one sample per [`THRUST_SAMPLE_DT`] (a ship
 /// records one sample per frame), plus one every `max_segment_dt`.
 ///
-/// "Straight" means the drawn segment strays at most about [`MAX_STRAY`] from the track: a
+/// "Straight" means the drawn segment strays at most [`MAX_STRAY`] from the track (as
+/// [`segment_stray`] measures it, bounded by the spread of the velocities along the segment): a
 /// control pod's hull settles onto its pilot only asymptotically, so its velocity never
 /// repeats exactly, and an exact test would draw it as if it thrusted all along. (Each drawn
-/// segment of the hull's cage costs ~400 simplices.)
+/// segment of the hull's cage costs ~300 simplices.)
 pub fn render_indices(track: &[ShipSample], max_segment_dt: f64) -> Vec<usize> {
     RenderScan::default().finish(track, max_segment_dt)
 }
@@ -432,44 +433,64 @@ pub fn render_indices(track: &[ShipSample], max_segment_dt: f64) -> Vec<usize> {
 pub struct RenderScan {
     /// The samples kept so far (indices into the track).
     pub keep: Vec<usize>,
-    /// The largest velocity change (per component) since the last kept sample: past it, the
-    /// track strays from that sample's straight line by at most `drift * dt`.
-    drift: f64,
+    /// The box spanned by the velocities since the last kept sample (its own included; empty
+    /// until the scan looks at it), and their largest speed. A segment whose velocities span
+    /// `range` strays from the track by at most `|range| dt / 4` (its velocity is within the
+    /// box), and its rest frame from the linear blend by at most `|range|`.
+    lo: V3,
+    hi: V3,
+    fastest: f64,
     /// The next sample to look at.
     next: usize,
 }
 
 impl Default for RenderScan {
     fn default() -> Self {
-        Self { keep: vec![0], drift: 0.0, next: 1 }
+        Self { keep: vec![0], lo: [f64::INFINITY; 3], hi: [f64::NEG_INFINITY; 3], fastest: 0.0, next: 1 }
     }
 }
 
 impl RenderScan {
-    /// Look at sample `i` of `track`; `final_sample` says it is the track's last.
-    fn step(&mut self, track: &[ShipSample], i: usize, final_sample: bool, max_segment_dt: f64) {
-        let dv = |a: &ShipSample, b: &ShipSample| (0..3).map(|c| (a.vel[c] - b.vel[c]).abs()).fold(0.0, f64::max);
+    /// Look at sample `i` of `track` (and at the one after it, if any: otherwise `i` is the
+    /// track's last).
+    fn step(&mut self, track: &[ShipSample], i: usize, max_segment_dt: f64) {
+        let speed = |s: &ShipSample| s.vel.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let grow = |lo: &mut V3, hi: &mut V3, s: &ShipSample| {
+            for c in 0..3 {
+                lo[c] = lo[c].min(s.vel[c]);
+                hi[c] = hi[c].max(s.vel[c]);
+            }
+        };
         let last = *self.keep.last().unwrap();
-        self.drift = f64::max(self.drift, dv(&track[i], &track[last]));
-        let strays = self.drift * (track[i].t - track[last].t) > MAX_STRAY;
-        if strays && last != i - 1 && track[i - 1].t - track[last].t >= THRUST_SAMPLE_DT {
-            self.keep.push(i - 1); // end of a straight stretch
-            self.drift = dv(&track[i], &track[i - 1]);
+        if self.lo[0] > self.hi[0] {
+            (self.lo, self.hi, self.fastest) = (track[last].vel, track[last].vel, speed(&track[last]));
         }
-        let dt = track[i].t - track[*self.keep.last().unwrap()].t;
-        let strays = self.drift * dt > MAX_STRAY;
-        if final_sample || (strays && dt >= THRUST_SAMPLE_DT) || dt >= max_segment_dt {
+        grow(&mut self.lo, &mut self.hi, &track[i]);
+        self.fastest = self.fastest.max(speed(&track[i]));
+        let dt = track[i].t - track[last].t;
+        let Some(next) = track.get(i + 1) else {
             self.keep.push(i);
-            self.drift = 0.0;
+            return;
+        };
+        // Would the segment still be straight if it ran on to the next sample?
+        let (mut lo_next, mut hi_next) = (self.lo, self.hi);
+        grow(&mut lo_next, &mut hi_next, next);
+        let spread = (0..3).map(|c| (hi_next[c] - lo_next[c]).powi(2)).sum::<f64>().sqrt();
+        let radius = SHIP_RADIUS * self.fastest.max(speed(next)) / 2.0;
+        let strays = spread * ((next.t - track[last].t) / 4.0 + radius) > MAX_STRAY;
+        if (strays && dt >= THRUST_SAMPLE_DT) || dt >= max_segment_dt {
+            self.keep.push(i);
+            (self.lo, self.hi, self.fastest) = (track[i].vel, track[i].vel, speed(&track[i]));
         }
     }
 
-    /// Scan on up to (not including) sample `end`, which must not be the track's last: these
-    /// choices stand however the track goes on.
+    /// Scan on up to (not including) sample `end`, which must not be the track's last (a
+    /// sample's choice looks at the one after it): these choices stand however the track goes
+    /// on.
     pub fn feed(&mut self, track: &[ShipSample], end: usize, max_segment_dt: f64) {
         debug_assert!(end < track.len());
         while self.next < end {
-            self.step(track, self.next, false, max_segment_dt);
+            self.step(track, self.next, max_segment_dt);
             self.next += 1;
         }
     }
@@ -477,7 +498,7 @@ impl RenderScan {
     /// Scan the rest of `track`, and return the samples to draw.
     pub fn finish(mut self, track: &[ShipSample], max_segment_dt: f64) -> Vec<usize> {
         while self.next < track.len() {
-            self.step(track, self.next, self.next == track.len() - 1, max_segment_dt);
+            self.step(track, self.next, max_segment_dt);
             self.next += 1;
         }
         self.keep
@@ -515,11 +536,31 @@ impl RenderScan {
     }
 }
 
+/// How far the segment of `track` drawn straight from sample `a` to sample `b` strays from it,
+/// at most, at a sample in between (between samples the track is straight): the center's
+/// distance from the segment, plus how far the hull's corners stray off its surface as the
+/// segment blends its ends' rest frames linearly, `|v| |dv| / 2` per unit of radius for a
+/// velocity `dv` off the blend (the rest of `dv` slides them along the hull's worldtube).
+pub fn segment_stray(track: &[ShipSample], a: usize, b: usize) -> f64 {
+    let (sa, sb) = (&track[a], &track[b]);
+    let span = (sb.t - sa.t).max(1e-12);
+    let dist = |x: V3, y: V3| (0..3).map(|c| (x[c] - y[c]).powi(2)).sum::<f64>().sqrt();
+    track[a + 1..b]
+        .iter()
+        .map(|s| {
+            let f = (s.t - sa.t) / span;
+            let lerp = |x: V3, y: V3| [0, 1, 2].map(|c| x[c] + (y[c] - x[c]) * f);
+            let speed = dist(s.vel, [0.0; 3]);
+            dist(s.pos, lerp(sa.pos, sb.pos)) + SHIP_RADIUS * speed * dist(s.vel, lerp(sa.vel, sb.vel)) / 2.0
+        })
+        .fold(0.0, f64::max)
+}
+
 /// Lab-time spacing of a thrusting ship's rendered samples.
 const THRUST_SAMPLE_DT: f64 = 0.25;
 
-/// How far (`c = 1` units) a drawn ship segment may stray from the recorded track, give or
-/// take a factor of two: well within the hull's 0.036-thick bars.
+/// How far (`c = 1` units) a drawn ship segment may stray from the recorded track (unless it
+/// would be shorter than [`THRUST_SAMPLE_DT`]): well within the hull's 0.036-thick bars.
 const MAX_STRAY: f64 = 0.005;
 
 #[cfg(test)]
