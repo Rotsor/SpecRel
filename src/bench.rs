@@ -4,6 +4,10 @@
 //! ```text
 //! cargo test --release -- --ignored --nocapture --test-threads=1 bench_
 //! ```
+//!
+//! The headline figure is the worst frame: a scene rebuild runs synchronously in the frame that
+//! triggers it, so a frame takes up to a whole `build_scene` plus a render. The timings are
+//! noisy on a loaded machine; compare runs on an idle one.
 
 use std::time::Instant;
 
@@ -22,7 +26,7 @@ const SIM_FPS: f64 = 60.0;
 /// The native frontend's frame cap, and the app's `DYNAMIC_REBUILD_INTERVAL`.
 const TARGET_FPS: f64 = 60.0;
 const REBUILD_INTERVAL: f64 = 0.1;
-const BUILD_ITERS: usize = 10;
+const BUILD_ITERS: usize = 20;
 const RENDER_ITERS: usize = 5;
 const RENDER_SIZE: (usize, usize) = (320, 200);
 /// How far behind the other ship's spawn the viewer floats, facing it and the table beyond
@@ -161,11 +165,45 @@ fn rebuild_share(rebuild: f64, render: f64) -> (f64, f64) {
     (rebuilding / wall, rebuilds as f64 / wall)
 }
 
-/// Median and mean of `xs`.
-fn stats(xs: &[f64]) -> (f64, f64) {
+/// Median, 99th percentile (nearest rank), maximum and mean of `xs`.
+fn stats(xs: &[f64]) -> [f64; 4] {
     let mut v = xs.to_vec();
     v.sort_by(f64::total_cmp);
-    (v[v.len() / 2], v.iter().sum::<f64>() / v.len() as f64)
+    let p99 = v[((0.99 * v.len() as f64).ceil() as usize).clamp(1, v.len()) - 1];
+    [v[v.len() / 2], p99, v[v.len() - 1], v.iter().sum::<f64>() / v.len() as f64]
+}
+
+/// How long [`play_frames`] plays from each history length (match time).
+const PLAY_SECS: f64 = 3.0;
+
+/// Play the match on in `scenario` for [`PLAY_SECS`] of match time, frame by frame as the app
+/// does: each frame simulates its `dt_wall` (the previous frame's length, clamped to 0.1 s),
+/// rebuilds the scene through `DynWorld::build_scene` once the frames' `dt_wall` adds up to
+/// [`REBUILD_INTERVAL`] (the world grows every frame), and renders it with `render` (which
+/// returns its milliseconds). Frames are at least `1 / TARGET_FPS` long. Returns each frame's
+/// work in ms (simulation + rebuild + render), and the rebuilds' ms.
+fn play_frames(scenario: &mut Scenario, mut render: impl FnMut(&Scene4D, &Scenario) -> f64) -> (Vec<f64>, Vec<f64>) {
+    let mut scene = scenario.world.build_scene();
+    let (mut frames, mut rebuilds) = (Vec::new(), Vec::new());
+    let (mut timer, mut dt) = (0.0, 1.0 / TARGET_FPS);
+    let end = scenario.time() + PLAY_SECS;
+    while scenario.time() < end {
+        let dt_wall = dt.clamp(0.001, 0.1);
+        let start = Instant::now();
+        scenario.play_until(scenario.time() + dt_wall);
+        timer += dt_wall;
+        if timer >= REBUILD_INTERVAL {
+            let rebuild = Instant::now();
+            scene = scenario.world.build_scene();
+            rebuilds.push(ms(rebuild));
+            timer = 0.0;
+        }
+        render(&scene, scenario);
+        let work = ms(start);
+        frames.push(work);
+        dt = f64::max(1.0 / TARGET_FPS, work / 1e3);
+    }
+    (frames, rebuilds)
 }
 
 fn ms(start: Instant) -> f64 {
@@ -201,10 +239,13 @@ fn bench_scene_rebuild_near_a_control_pod() {
         cfg.height,
         rayon::current_num_threads()
     );
-    println!("Times in ms, median / mean. Rebuild share: of wall time, paced as `main.rs` does ({TARGET_FPS} fps cap,");
-    println!("a rebuild every {REBUILD_INTERVAL} s), with this CPU render, and with a free render (GPU-bound users).");
+    println!("Times in ms: p50 / p99 / max / mean. The rebuild runs synchronously in the frame that triggers it, so");
+    println!("the worst frame is about the worst rebuild plus a render. Then {PLAY_SECS} s of frames played as `main.rs`");
+    println!("paces them ({TARGET_FPS} fps cap, a rebuild every {REBUILD_INTERVAL} s of clamped dt_wall), with the CPU render.");
+    println!("Secondary: the rebuilds' share of wall time, with this CPU render and with a free one (GPU-bound users).");
     let mut scenario = Scenario::new();
     for history in [5.0, 20.0, 60.0, 120.0] {
+        let history = f64::max(history, scenario.time());
         let start = Instant::now();
         scenario.play_until(history);
         let play_ms = ms(start);
@@ -261,10 +302,10 @@ fn bench_scene_rebuild_near_a_control_pod() {
         let render_ms = render(&scene);
         let lit = fb.iter().filter(|&&px| px != 0).count();
 
-        let (total, render) = (stats(&total_ms).0, stats(&render_ms).0);
+        let (total, render) = (stats(&total_ms)[0], stats(&render_ms)[0]);
         let row = |label: &str, xs: &[f64], extra: String| {
-            let (median, mean) = stats(xs);
-            println!("  {label:<22} {median:>9.2} / {mean:>9.2}  {extra}");
+            let [p50, p99, max, mean] = stats(xs);
+            println!("  {label:<26} {p50:>8.2} / {p99:>8.2} / {max:>8.2} / {mean:>8.2}  {extra}");
         };
         println!();
         println!(
@@ -286,6 +327,8 @@ fn bench_scene_rebuild_near_a_control_pod() {
         row("render (CPU)", &render_ms, format!("{lit} lit px of {}", fb.len()));
         row(" without the hull", &render_hullless_ms, String::new());
         row(" without the pulses", &render_pulseless_ms, String::new());
+        let worst = stats(&total_ms)[2] + stats(&render_ms)[0];
+        println!("  WORST FRAME (max rebuild + p50 render): {worst:.1} ms; without the render: {:.1} ms", stats(&total_ms)[2]);
         let ((cpu, cpu_rate), (free, free_rate)) = (rebuild_share(total, render), rebuild_share(total, 0.0));
         println!(
             "  rebuild share of wall time: {:.0}% with the CPU render ({cpu_rate:.1} rebuilds/s), {:.0}% with a free \
@@ -293,5 +336,22 @@ fn bench_scene_rebuild_near_a_control_pod() {
             100.0 * cpu,
             100.0 * free
         );
+
+        // Play on, frame by frame: the geometry grows meanwhile.
+        let mut fb = vec![0u32; cfg.width * cfg.height];
+        let (frames, rebuilds) = play_frames(&mut scenario, |scene, scenario| {
+            let (camera, dynamics) = scenario.view();
+            let start = Instant::now();
+            render_frame(scene, &camera, &cfg, &dynamics, &mut fb);
+            ms(start)
+        });
+        println!(
+            "  played {PLAY_SECS} s on in {} frames with {} rebuilds (now {:.0} s of history):",
+            frames.len(),
+            rebuilds.len(),
+            scenario.time()
+        );
+        row("frame (sim+rebuild+render)", &frames, String::new());
+        row("rebuild in play", &rebuilds, String::new());
     }
 }
