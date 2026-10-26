@@ -490,7 +490,7 @@ impl DynWorld {
     pub fn rebuild_scene(&self, cache: &mut SceneCache, scene: &mut Scene4D) {
         let o = self.frontier.origin;
         let window = HISTORY_WINDOW as f32;
-        cache.begin();
+        cache.begin(&mut scene.bvh);
         let backdrop =
             |pos| sample_inertial_worldline(pos, Vec3::default(), o.t - window, o.t + window, 1);
 
@@ -545,7 +545,7 @@ impl DynWorld {
         scene.materials = fresh.materials;
         scene.light_pos = fresh.light_pos;
         (scene.t_min, scene.t_max) = (fresh.t_min, fresh.t_max);
-        cache.finish(&Bvh4D::build(volatile), &mut scene.bvh);
+        cache.finish(Bvh4D::build(volatile), &mut scene.bvh);
     }
 }
 

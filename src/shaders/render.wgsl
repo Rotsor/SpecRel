@@ -67,7 +67,7 @@ struct Node {
     bmax: vec4<f32>,
     right_or_first: u32,
     count: u32,
-    _pad0: u32,
+    left: u32,
     _pad1: u32,
 };
 
@@ -270,7 +270,7 @@ fn trace(o: vec4<f32>, d: vec4<f32>, t_min: f32, t_max_in: f32) -> TraceHit {
                 }
             }
         } else {
-            let li = ni + 1u;
+            let li = node.left;
             let ri = node.right_or_first;
             let tl = aabb_enter(li, o, inv, t_min, t_max);
             let tr = aabb_enter(ri, o, inv, t_min, t_max);
@@ -336,7 +336,7 @@ fn is_occluded(o: vec4<f32>, d: vec4<f32>, t_min: f32, t_max: f32) -> bool {
                 }
             }
         } else {
-            let li = ni + 1u;
+            let li = node.left;
             let ri = node.right_or_first;
             let hit_l = aabb_enter(li, o, inv, t_min, t_max) >= 0.0;
             let hit_r = aabb_enter(ri, o, inv, t_min, t_max) >= 0.0;

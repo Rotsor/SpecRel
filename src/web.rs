@@ -318,7 +318,8 @@ pub extern "C" fn web_step(dt_secs: f32) {
         s.app.step(dt_wall, &held_input(s.held_keys));
         if s.app.scene_generation != s.packed_generation {
             let start = now_ms();
-            s.packed_scenes[s.app.scene_idx] = PackedSceneGpuData::from_scene(s.app.scene());
+            // Patched with what the rebuild wrote, where it can be (JS still uploads it all).
+            s.packed_scenes[s.app.scene_idx].update(s.app.scene());
             s.app.perf.record("GPU SCENE PACK", since(start));
             s.packed_generation = s.app.scene_generation;
             s.dirty_scene = Some(s.app.scene_idx);

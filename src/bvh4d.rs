@@ -1,5 +1,6 @@
 use crate::mesh4d::{Aabb4D, HitRecord4D, Simplex4D, SimplexGeom4D};
 use crate::minkowski::Vec4;
+use std::ops::Range;
 
 /// The SAH's measure of a box: its spatial surface area, plus its extent in time weighted
 /// against the spatial ones.
@@ -14,16 +15,63 @@ fn box_measure(b: Aabb4D) -> f32 {
 pub(crate) struct BvhNode4D {
     pub(crate) aabb: Aabb4D,
     /// For leaf nodes (`count > 0`): start index into `simplices` / `hot_geoms`.
-    /// For internal nodes (`count == 0`): index of the right child node (left child is `node_idx + 1`).
+    /// For internal nodes (`count == 0`): index of the right child node.
     pub(crate) right_or_first: u32,
     pub(crate) count: u32,
+    /// For internal nodes: index of the left child node. [`Bvh4D::build`] puts it right after
+    /// its parent (`node_idx + 1`); a tree assembled from cached parts
+    /// ([`Bvh4D::write_part`], [`top_tree`]) links them wherever they lie.
+    pub(crate) left: u32,
+}
+
+impl BvhNode4D {
+    /// An internal node that no ray enters (the root of a tree over nothing).
+    pub(crate) const NOTHING: Self = Self { aabb: Aabb4D::empty(), right_or_first: 0, count: 0, left: 0 };
+
+    /// The node, its children moved by `nodes` places and its simplices by `prims`.
+    fn moved(self, nodes: u32, prims: u32) -> Self {
+        if self.count > 0 {
+            Self { right_or_first: self.right_or_first.wrapping_add(prims), ..self }
+        } else {
+            Self {
+                left: self.left.wrapping_add(nodes),
+                right_or_first: self.right_or_first.wrapping_add(nodes),
+                ..self
+            }
+        }
+    }
+}
+
+/// Which arrangement of a [`Bvh4D`]'s arrays a copy of them (GPU buffers) was made from, and
+/// what has been written over them in place since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BvhVersion {
+    /// Changes whenever the arrays are laid out afresh: a copy of another layout is stale.
+    pub(crate) layout: u64,
+    /// Counts the edits ([`Bvh4D::begin_edit`]) made in place since.
+    pub(crate) edit: u64,
+}
+
+fn new_layout() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// 4D Spacetime Bounding Volume Hierarchy over `Simplex4D` primitives.
+///
+/// Besides being built in one go ([`Bvh4D::build`]), it can serve as an arena that a scene
+/// cache edits in place: whole subtrees written into free ranges of its arrays
+/// ([`Bvh4D::write_part`]) under a small tree over them ([`top_tree`]). The ranges each edit
+/// wrote are kept, so that a copy of the arrays (the GPU's) can be patched instead of redone.
 pub struct Bvh4D {
     nodes: Vec<BvhNode4D>,
     hot_geoms: Vec<SimplexGeom4D>,
     pub simplices: Vec<Simplex4D>,
+    version: BvhVersion,
+    /// The node and simplex ranges the latest edit wrote.
+    dirty_nodes: Vec<Range<usize>>,
+    dirty_prims: Vec<Range<usize>>,
 }
 
 impl Bvh4D {
@@ -38,12 +86,15 @@ impl Bvh4D {
             nodes,
             hot_geoms,
             simplices,
+            version: BvhVersion { layout: new_layout(), edit: 0 },
+            dirty_nodes: Vec::new(),
+            dirty_prims: Vec::new(),
         }
     }
 
     /// A BVH over nothing.
     pub fn empty() -> Self {
-        Self { nodes: Vec::new(), hot_geoms: Vec::new(), simplices: Vec::new() }
+        Self::build(Vec::new())
     }
 
     /// The bounds of everything in it (empty if it holds nothing).
@@ -51,75 +102,90 @@ impl Bvh4D {
         self.nodes.first().map_or(Aabb4D::empty(), |n| n.aabb)
     }
 
-    /// Replace the contents with one BVH over all of `parts`' simplices, reusing this BVH's
-    /// allocations: a small SAH tree over the parts' bounds whose leaves are the parts' own
-    /// trees, copied in with their node and simplex indices relocated. Nothing is re-sorted,
-    /// so this costs a copy of the parts, not a build.
-    pub(crate) fn assemble(&mut self, parts: &[&Bvh4D]) {
+    pub(crate) fn version(&self) -> BvhVersion {
+        self.version
+    }
+
+    /// The node and simplex ranges the latest edit wrote (all that changed since the version
+    /// before it, `edit - 1` of the same layout).
+    pub(crate) fn dirty(&self) -> (&[Range<usize>], &[Range<usize>]) {
+        (&self.dirty_nodes, &self.dirty_prims)
+    }
+
+    /// Empty the arrays for use as an arena: a new layout, holding only the root (node 0), a
+    /// tree over nothing.
+    pub(crate) fn reset_arena(&mut self) {
         self.nodes.clear();
         self.hot_geoms.clear();
         self.simplices.clear();
-        let mut items: Vec<(Aabb4D, usize)> =
-            parts.iter().enumerate().filter(|(_, p)| !p.nodes.is_empty()).map(|(i, p)| (p.bounds(), i)).collect();
-        let nodes: usize = parts.iter().map(|p| p.nodes.len()).sum();
-        let prims: usize = parts.iter().map(|p| p.simplices.len()).sum();
-        self.nodes.reserve(nodes + items.len());
-        self.hot_geoms.reserve(prims);
-        self.simplices.reserve(prims);
-        if !items.is_empty() {
-            self.assemble_recursive(parts, &mut items);
-        }
+        self.nodes.push(BvhNode4D::NOTHING);
+        self.version = BvhVersion { layout: new_layout(), edit: 0 };
+        self.dirty_nodes.clear();
+        self.dirty_prims.clear();
     }
 
-    fn assemble_recursive(&mut self, parts: &[&Bvh4D], items: &mut [(Aabb4D, usize)]) {
-        if let [(_, i)] = *items {
-            let part = parts[i];
-            let (node_base, prim_base) = (self.nodes.len() as u32, self.simplices.len() as u32);
-            self.nodes.extend(part.nodes.iter().map(|n| BvhNode4D {
-                right_or_first: n.right_or_first + if n.count > 0 { prim_base } else { node_base },
-                ..*n
-            }));
-            self.hot_geoms.extend_from_slice(&part.hot_geoms);
-            self.simplices.extend_from_slice(&part.simplices);
-            return;
-        }
-        let bounds = items.iter().fold(Aabb4D::empty(), |b, (a, _)| b.union(*a));
-        let node_idx = self.nodes.len();
-        self.nodes.push(BvhNode4D { aabb: bounds, right_or_first: 0, count: 0 });
-
-        // Full-sweep SAH over the parts' centroids (there are only a few hundred), weighting each
-        // side by its simplices.
-        let weight = |i: usize| parts[i].simplices.len() as f32;
-        let mut best = (f32::INFINITY, 0usize, items.len() / 2);
-        let mut right_box = vec![Aabb4D::empty(); items.len()];
-        let mut right_w = vec![0.0f32; items.len()];
-        for axis in 0..4 {
-            items.sort_by(|a, b| a.0.center().axis(axis).total_cmp(&b.0.center().axis(axis)));
-            let mut acc = (Aabb4D::empty(), 0.0);
-            for k in (1..items.len()).rev() {
-                acc = (acc.0.union(items[k].0), acc.1 + weight(items[k].1));
-                right_box[k] = acc.0;
-                right_w[k] = acc.1;
-            }
-            let mut left = (Aabb4D::empty(), 0.0);
-            for k in 1..items.len() {
-                left = (left.0.union(items[k - 1].0), left.1 + weight(items[k - 1].1));
-                let cost = left.1 * box_measure(left.0) + right_w[k] * box_measure(right_box[k]);
-                if cost < best.0 {
-                    best = (cost, axis, k);
-                }
-            }
-        }
-        let (_, axis, mid) = best;
-        items.sort_by(|a, b| a.0.center().axis(axis).total_cmp(&b.0.center().axis(axis)));
-        let (left, right) = items.split_at_mut(mid);
-        self.assemble_recursive(parts, left);
-        let right_idx = self.nodes.len() as u32;
-        self.assemble_recursive(parts, right);
-        self.nodes[node_idx].right_or_first = right_idx;
+    /// Start the next edit in place.
+    pub(crate) fn begin_edit(&mut self) {
+        self.version.edit += 1;
+        self.dirty_nodes.clear();
+        self.dirty_prims.clear();
     }
 
-    /// Flat node array (depth-first; left child of internal node `i` is `i + 1`).
+    /// Write `src`'s nodes `nodes` and simplices `prims` (a whole subtree and the simplices
+    /// under it) to nodes from `node_at` and simplices from `prim_at`, moving its links with
+    /// it. The ranges written to must be free, or just past the arrays' ends.
+    pub(crate) fn write_part(
+        &mut self,
+        src: &Bvh4D,
+        nodes: Range<usize>,
+        prims: Range<usize>,
+        node_at: usize,
+        prim_at: usize,
+    ) {
+        let dn = (node_at as u32).wrapping_sub(nodes.start as u32);
+        let dp = (prim_at as u32).wrapping_sub(prims.start as u32);
+        let moved = src.nodes[nodes.clone()].iter().map(|n| n.moved(dn, dp));
+        put(&mut self.nodes, node_at, nodes.len(), moved);
+        put(&mut self.hot_geoms, prim_at, prims.len(), src.hot_geoms[prims.clone()].iter().copied());
+        put(&mut self.simplices, prim_at, prims.len(), src.simplices[prims.clone()].iter().cloned());
+        self.dirty_nodes.push(node_at..node_at + nodes.len());
+        self.dirty_prims.push(prim_at..prim_at + prims.len());
+    }
+
+    /// Write `nodes` (with their links as they are) from node `at`.
+    pub(crate) fn write_nodes(&mut self, at: usize, nodes: &[BvhNode4D]) {
+        put(&mut self.nodes, at, nodes.len(), nodes.iter().copied());
+        self.dirty_nodes.push(at..at + nodes.len());
+    }
+
+    pub(crate) fn node(&self, i: usize) -> BvhNode4D {
+        self.nodes[i]
+    }
+
+    /// The arrays' lengths: nodes and simplices.
+    pub(crate) fn lens(&self) -> (usize, usize) {
+        (self.nodes.len(), self.simplices.len())
+    }
+
+    /// The simplices in the tree (an arena's arrays also hold free room), and the nodes it
+    /// has.
+    pub fn in_tree(&self) -> (Vec<&Simplex4D>, usize) {
+        let (mut prims, mut nodes) = (Vec::new(), 0);
+        let mut stack: Vec<usize> = if self.nodes.is_empty() { vec![] } else { vec![0] };
+        while let Some(i) = stack.pop() {
+            let n = self.nodes[i];
+            nodes += 1;
+            if n.count > 0 {
+                let first = n.right_or_first as usize;
+                prims.extend(&self.simplices[first..first + n.count as usize]);
+            } else if n.aabb.min.t <= n.aabb.max.t {
+                stack.extend([n.left as usize, n.right_or_first as usize]);
+            }
+        }
+        (prims, nodes)
+    }
+
+    /// Flat node array, rooted at node 0.
     pub(crate) fn nodes(&self) -> &[BvhNode4D] {
         &self.nodes
     }
@@ -136,11 +202,7 @@ impl Bvh4D {
         end: usize,
     ) -> u32 {
         let node_idx = nodes.len() as u32;
-        nodes.push(BvhNode4D {
-            aabb: Aabb4D::empty(),
-            right_or_first: 0,
-            count: 0,
-        });
+        nodes.push(BvhNode4D::NOTHING);
 
         let mut bounds = Aabb4D::empty();
         let mut centroid_bounds = Aabb4D::empty();
@@ -155,6 +217,7 @@ impl Bvh4D {
                 aabb: bounds,
                 right_or_first: start as u32,
                 count: count as u32,
+                left: 0,
             };
             return node_idx;
         }
@@ -227,6 +290,7 @@ impl Bvh4D {
                     aabb: bounds,
                     right_or_first: start as u32,
                     count: count as u32,
+                    left: 0,
                 };
                 return node_idx;
             }
@@ -250,13 +314,14 @@ impl Bvh4D {
             });
         }
 
-        let _left_idx = Self::build_recursive(nodes, simplices, start, mid);
+        let left_idx = Self::build_recursive(nodes, simplices, start, mid);
         let right_idx = Self::build_recursive(nodes, simplices, mid, end);
 
         nodes[node_idx as usize] = BvhNode4D {
             aabb: bounds,
             right_or_first: right_idx,
             count: 0,
+            left: left_idx,
         };
 
         node_idx
@@ -311,7 +376,7 @@ impl Bvh4D {
                     }
                 }
             } else {
-                let left_idx = node_idx + 1;
+                let left_idx = node.left;
                 let right_idx = node.right_or_first;
 
                 let t_left = self.nodes[left_idx as usize]
@@ -388,7 +453,7 @@ impl Bvh4D {
                     }
                 }
             } else {
-                let left_idx = (node_idx + 1) as u32;
+                let left_idx = node.left;
                 let right_idx = node.right_or_first;
                 let hit_l = self.nodes[left_idx as usize]
                     .aabb
@@ -412,4 +477,69 @@ impl Bvh4D {
 
         false
     }
+}
+
+/// Write `n` items from `items` into `v` from index `at` (at most `v.len()`), growing it as
+/// needed.
+fn put<T>(v: &mut Vec<T>, at: usize, n: usize, items: impl Iterator<Item = T>) {
+    debug_assert!(at <= v.len());
+    let overwrite = v.len().min(at + n) - at;
+    let mut items = items;
+    for (slot, item) in v[at..at + overwrite].iter_mut().zip(&mut items) {
+        *slot = item;
+    }
+    v.extend(items);
+}
+
+/// A tree over subtrees already in an arena: `items` are their bounds, their roots' node
+/// indices and their weights (simplex counts), at least two of them. The tree's nodes are
+/// returned in order; the first is the root and goes to node 0, the `k`th to node
+/// `base + k - 1`, and they link to each other and to the subtrees accordingly. A full-sweep
+/// SAH over the subtrees' centroids (there are a few hundred).
+pub(crate) fn top_tree(items: &mut [(Aabb4D, u32, f32)], base: u32) -> Vec<BvhNode4D> {
+    debug_assert!(items.len() >= 2);
+    let mut out = Vec::with_capacity(items.len());
+    top_tree_recursive(items, base, &mut out);
+    out
+}
+
+fn top_tree_recursive(items: &mut [(Aabb4D, u32, f32)], base: u32, out: &mut Vec<BvhNode4D>) -> u32 {
+    if let [(_, root, _)] = *items {
+        return root;
+    }
+    let k = out.len();
+    out.push(BvhNode4D::NOTHING);
+    let at = if k == 0 { 0 } else { base + k as u32 - 1 };
+    let bounds = items.iter().fold(Aabb4D::empty(), |b, item| b.union(item.0));
+
+    let mut best = (f32::INFINITY, 0usize, items.len() / 2);
+    let mut right_box = vec![Aabb4D::empty(); items.len()];
+    let mut right_w = vec![0.0f32; items.len()];
+    let by_axis = |axis: usize| {
+        move |a: &(Aabb4D, u32, f32), b: &(Aabb4D, u32, f32)| a.0.center().axis(axis).total_cmp(&b.0.center().axis(axis))
+    };
+    for axis in 0..4 {
+        items.sort_by(by_axis(axis));
+        let mut acc = (Aabb4D::empty(), 0.0);
+        for j in (1..items.len()).rev() {
+            acc = (acc.0.union(items[j].0), acc.1 + items[j].2);
+            right_box[j] = acc.0;
+            right_w[j] = acc.1;
+        }
+        let mut left = (Aabb4D::empty(), 0.0);
+        for j in 1..items.len() {
+            left = (left.0.union(items[j - 1].0), left.1 + items[j - 1].2);
+            let cost = left.1 * box_measure(left.0) + right_w[j] * box_measure(right_box[j]);
+            if cost < best.0 {
+                best = (cost, axis, j);
+            }
+        }
+    }
+    let (_, axis, mid) = best;
+    items.sort_by(by_axis(axis));
+    let (l, r) = items.split_at_mut(mid);
+    let left = top_tree_recursive(l, base, out);
+    let right = top_tree_recursive(r, base, out);
+    out[k] = BvhNode4D { aabb: bounds, right_or_first: right, count: 0, left };
+    at
 }

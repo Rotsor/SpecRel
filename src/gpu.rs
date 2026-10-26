@@ -9,7 +9,9 @@
 //! which is read back into the caller's framebuffer, so the window/HUD code is identical for
 //! both backends and the CPU path stays available as a reference for image-diff tests.
 
-use crate::mesh4d::SurfacePattern;
+use crate::bvh4d::{BvhNode4D, BvhVersion};
+use crate::mesh4d::{Simplex4D, SimplexGeom4D, SurfacePattern};
+use std::ops::Range;
 use crate::minkowski::Vec4;
 use crate::renderer::{
     gamma_lut, Camera4D, FrameDynamics, RenderConfig, RenderMode, ShadowMode, SliceMode,
@@ -41,7 +43,21 @@ pub(crate) struct GpuNode {
     pub(crate) max: [f32; 4],
     pub(crate) right_or_first: u32,
     pub(crate) count: u32,
-    pub(crate) _pad: [u32; 2],
+    pub(crate) left: u32,
+    pub(crate) _pad: u32,
+}
+
+impl GpuNode {
+    fn pack(n: &BvhNode4D) -> Self {
+        Self {
+            min: v4(n.aabb.min),
+            max: v4(n.aabb.max),
+            right_or_first: n.right_or_first,
+            count: n.count,
+            left: n.left,
+            _pad: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -195,63 +211,18 @@ pub(crate) struct PackedSceneGpuData {
     pub(crate) attrs: Vec<GpuAttr>,
     pub(crate) materials: Vec<GpuMaterial>,
     pub(crate) light_pos: [f32; 4],
+    /// The version of the scene's BVH the arrays were packed from.
+    version: BvhVersion,
 }
 
 impl PackedSceneGpuData {
     pub(crate) fn from_scene(scene: &Scene4D) -> Self {
         let bvh = &scene.bvh;
 
-        let nodes: Vec<GpuNode> = bvh
-            .nodes()
-            .iter()
-            .map(|n| GpuNode {
-                min: v4(n.aabb.min),
-                max: v4(n.aabb.max),
-                right_or_first: n.right_or_first,
-                count: n.count,
-                _pad: [0; 2],
-            })
-            .collect();
+        let nodes: Vec<GpuNode> = bvh.nodes().iter().map(GpuNode::pack).collect();
         let num_nodes = nodes.len() as u32;
-
-        let geoms: Vec<GpuGeom> = bvh
-            .hot_geoms()
-            .iter()
-            .map(|g| GpuGeom {
-                v0: v4(g.v0),
-                n: v4(g.hyperplane_normal),
-                b1: v4(g.dual_b1),
-                b2: v4(g.dual_b2),
-                b3: v4(g.dual_b3),
-            })
-            .collect();
-
-        let attrs: Vec<GpuAttr> = bvh
-            .simplices
-            .iter()
-            .map(|s| {
-                let col = |f: &dyn Fn(usize) -> f32| [f(0), f(1), f(2), f(3)];
-                GpuAttr {
-                    uv_u: col(&|i| s.uv[i].0),
-                    uv_v: col(&|i| s.uv[i].1),
-                    tb_x: col(&|i| s.tri_bary[i].x),
-                    tb_y: col(&|i| s.tri_bary[i].y),
-                    tb_z: col(&|i| s.tri_bary[i].z),
-                    tau: s.proper_time,
-                    grad_u: col(&|i| s.tau_uv_grad[i].0),
-                    grad_v: col(&|i| s.tau_uv_grad[i].1),
-                    normal: v4(s.surface_normal_4d),
-                    four_vel: v4(s.four_velocity),
-                    misc: [
-                        s.uv_world_scale.0,
-                        s.uv_world_scale.1,
-                        f32::from_bits(s.material_id as u32),
-                        0.0,
-                    ],
-                    decided_at: s.decided_at,
-                }
-            })
-            .collect();
+        let geoms: Vec<GpuGeom> = bvh.hot_geoms().iter().map(GpuGeom::pack).collect();
+        let attrs: Vec<GpuAttr> = bvh.simplices.iter().map(GpuAttr::pack).collect();
 
         let materials: Vec<GpuMaterial> = scene
             .materials
@@ -283,6 +254,93 @@ impl PackedSceneGpuData {
             attrs: non_empty(attrs),
             materials: non_empty(materials),
             light_pos: [0.0, lp.x, lp.y, lp.z],
+            version: bvh.version(),
+        }
+    }
+
+    /// Bring the arrays up to date with `scene`: patched with what its BVH's latest edit wrote,
+    /// if they were packed from the version before it ([`Bvh4D::dirty`]), else packed afresh.
+    /// Returns whether they were patched.
+    ///
+    /// [`Bvh4D::dirty`]: crate::bvh4d::Bvh4D::dirty
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn update(&mut self, scene: &Scene4D) -> bool {
+        let bvh = &scene.bvh;
+        let v = bvh.version();
+        if !follows(self.version, v) {
+            *self = Self::from_scene(scene);
+            return false;
+        }
+        let (nodes, prims) = bvh.dirty();
+        patch(&mut self.nodes, bvh.nodes(), nodes, GpuNode::pack);
+        patch(&mut self.geoms, bvh.hot_geoms(), prims, GpuGeom::pack);
+        patch(&mut self.attrs, &bvh.simplices, prims, GpuAttr::pack);
+        self.num_nodes = bvh.nodes().len() as u32;
+        self.version = v;
+        true
+    }
+}
+
+/// A copy made of `copy` can be patched up to `now` with `now`'s dirty ranges.
+fn follows(copy: BvhVersion, now: BvhVersion) -> bool {
+    copy.layout == now.layout && copy.edit + 1 == now.edit
+}
+
+/// Pack `src`'s `ranges` and write them to the same places in `buf`.
+#[cfg(not(target_arch = "wasm32"))]
+fn write_ranges<S, T: Pod>(queue: &wgpu::Queue, buf: &wgpu::Buffer, src: &[S], ranges: &[Range<usize>], pack: impl Fn(&S) -> T) {
+    for r in ranges.iter().filter(|r| !r.is_empty()) {
+        let packed: Vec<T> = src[r.clone()].iter().map(&pack).collect();
+        queue.write_buffer(buf, (r.start * size_of::<T>()) as u64, bytemuck::cast_slice(&packed));
+    }
+}
+
+/// Pack `src`'s `ranges` into `dst` (grown to `src`'s length).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn patch<S, T: Pod + Zeroable>(dst: &mut Vec<T>, src: &[S], ranges: &[Range<usize>], pack: impl Fn(&S) -> T) {
+    if dst.len() < src.len() {
+        dst.resize(src.len(), T::zeroed());
+    }
+    for r in ranges {
+        for (d, s) in dst[r.clone()].iter_mut().zip(&src[r.clone()]) {
+            *d = pack(s);
+        }
+    }
+}
+
+impl GpuGeom {
+    fn pack(g: &SimplexGeom4D) -> Self {
+        Self {
+            v0: v4(g.v0),
+            n: v4(g.hyperplane_normal),
+            b1: v4(g.dual_b1),
+            b2: v4(g.dual_b2),
+            b3: v4(g.dual_b3),
+        }
+    }
+}
+
+impl GpuAttr {
+    fn pack(s: &Simplex4D) -> Self {
+        let col = |f: &dyn Fn(usize) -> f32| [f(0), f(1), f(2), f(3)];
+        GpuAttr {
+            uv_u: col(&|i| s.uv[i].0),
+            uv_v: col(&|i| s.uv[i].1),
+            tb_x: col(&|i| s.tri_bary[i].x),
+            tb_y: col(&|i| s.tri_bary[i].y),
+            tb_z: col(&|i| s.tri_bary[i].z),
+            tau: s.proper_time,
+            grad_u: col(&|i| s.tau_uv_grad[i].0),
+            grad_v: col(&|i| s.tau_uv_grad[i].1),
+            normal: v4(s.surface_normal_4d),
+            four_vel: v4(s.four_velocity),
+            misc: [
+                s.uv_world_scale.0,
+                s.uv_world_scale.1,
+                f32::from_bits(s.material_id as u32),
+                0.0,
+            ],
+            decided_at: s.decided_at,
         }
     }
 }
@@ -292,6 +350,11 @@ struct SceneBuffers {
     bind_group: wgpu::BindGroup,
     num_nodes: u32,
     light_pos: [f32; 4],
+    nodes: wgpu::Buffer,
+    geoms: wgpu::Buffer,
+    attrs: wgpu::Buffer,
+    /// The version of the scene's BVH the buffers hold.
+    version: BvhVersion,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -454,7 +517,7 @@ impl GpuRenderer {
 
         let scenes = scenes
             .iter()
-            .map(|s| Self::upload_scene(&device, &scene_layout, s))
+            .map(|s| Self::upload_scene(&device, &queue, &scene_layout, s))
             .collect();
 
         let timestamps = (!timestamp_feature.is_empty()).then(|| {
@@ -499,6 +562,7 @@ impl GpuRenderer {
 
     fn upload_scene(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         layout: &wgpu::BindGroupLayout,
         scene: &Scene4D,
     ) -> SceneBuffers {
@@ -511,9 +575,26 @@ impl GpuRenderer {
                 usage: wgpu::BufferUsages::STORAGE,
             })
         };
-        let nodes_buf = mk("bvh nodes", bytemuck::cast_slice(&packed.nodes));
-        let geoms_buf = mk("hot geoms", bytemuck::cast_slice(&packed.geoms));
-        let attrs_buf = mk("cold attrs", bytemuck::cast_slice(&packed.attrs));
+        // The arrays of a scene edited in place (Dynamic Mode) are patched and grow: room to
+        // grow by half before they are made afresh.
+        let edited = scene.bvh.version().edit > 0;
+        let mk_growing = |label: &str, bytes: &[u8]| {
+            if !edited {
+                return mk(label, bytes);
+            }
+            let size = (bytes.len() as u64 * 3 / 2).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&buf, 0, bytes);
+            buf
+        };
+        let nodes_buf = mk_growing("bvh nodes", bytemuck::cast_slice(&packed.nodes));
+        let geoms_buf = mk_growing("hot geoms", bytemuck::cast_slice(&packed.geoms));
+        let attrs_buf = mk_growing("cold attrs", bytemuck::cast_slice(&packed.attrs));
         let mats_buf = mk("materials", bytemuck::cast_slice(&packed.materials));
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -543,12 +624,35 @@ impl GpuRenderer {
             bind_group,
             num_nodes: packed.num_nodes,
             light_pos: packed.light_pos,
+            nodes: nodes_buf,
+            geoms: geoms_buf,
+            attrs: attrs_buf,
+            version: packed.version,
         }
     }
 
-    /// Replace `scenes[scene_idx]`'s GPU buffers (a Dynamic Mode scene grew new geometry).
+    /// Bring `scenes[scene_idx]`'s GPU buffers up to date (a Dynamic Mode scene grew new
+    /// geometry): if they hold the version of its BVH before the latest edit, and the edit
+    /// fits, write just what the edit wrote; else upload it all afresh.
     pub fn update_scene(&mut self, scene_idx: usize, scene: &Scene4D) {
-        self.scenes[scene_idx] = Self::upload_scene(&self.device, &self.scene_layout, scene);
+        let bufs = &mut self.scenes[scene_idx];
+        let bvh = &scene.bvh;
+        let fits = |buf: &wgpu::Buffer, len: usize, size: usize| (len * size) as u64 <= buf.size();
+        let (n, p) = bvh.lens();
+        if follows(bufs.version, bvh.version())
+            && fits(&bufs.nodes, n, size_of::<GpuNode>())
+            && fits(&bufs.geoms, p, size_of::<GpuGeom>())
+            && fits(&bufs.attrs, p, size_of::<GpuAttr>())
+        {
+            let (nodes, prims) = bvh.dirty();
+            write_ranges(&self.queue, &bufs.nodes, bvh.nodes(), nodes, GpuNode::pack);
+            write_ranges(&self.queue, &bufs.geoms, bvh.hot_geoms(), prims, GpuGeom::pack);
+            write_ranges(&self.queue, &bufs.attrs, &bvh.simplices, prims, GpuAttr::pack);
+            bufs.num_nodes = n as u32;
+            bufs.version = bvh.version();
+            return;
+        }
+        *bufs = Self::upload_scene(&self.device, &self.queue, &self.scene_layout, scene);
     }
 
     /// Human-readable adapter description, e.g. `"NVIDIA GeForce RTX 4070 (Vulkan)"`.

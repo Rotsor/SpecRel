@@ -138,6 +138,11 @@ impl Scenario {
         }
     }
 
+    /// Play on until `secs` of match time have passed.
+    fn play_until(&mut self, secs: f64) {
+        self.play_until_with(secs, |_, _| {});
+    }
+
     /// The viewer's camera and frame dynamics, as `App` would render them.
     fn view(&self) -> (Camera4D, FrameDynamics) {
         let u = self.viewer.camera.tetrad.e[0];
@@ -254,17 +259,24 @@ fn bench_scene_rebuild_near_a_control_pod() {
     // The incremental rebuild, as the app makes it every `REBUILD_INTERVAL` all along.
     let mut cache = SceneCache::default();
     let mut cached = scenario.world.build_scene();
+    // The GPU's copy of the scene (as the web build keeps it), patched after every rebuild.
+    let mut packed = PackedSceneGpuData::from_scene(&cached);
+    let mut compactions = 0;
     for history in [5.0, 20.0, 60.0, 120.0] {
         let history = f64::max(history, scenario.time());
         let start = Instant::now();
-        let mut incremental: Vec<(f64, f64, CacheStats)> = Vec::new();
+        let mut incremental: Vec<(f64, f64, CacheStats, f64)> = Vec::new();
         let mut incremental_ms = 0.0;
         scenario.play_until_with(history, |world, t| {
             let start = Instant::now();
             world.rebuild_scene(&mut cache, &mut cached);
             let elapsed = ms(start);
-            incremental_ms += elapsed;
-            incremental.push((t, elapsed, cache.stats));
+            let pack_start = Instant::now();
+            packed.update(&cached);
+            let pack_ms = ms(pack_start);
+            incremental_ms += elapsed + pack_ms;
+            compactions += cache.stats.compacted as usize;
+            incremental.push((t, elapsed, cache.stats, pack_ms));
         });
         let play_ms = ms(start) - incremental_ms;
         let world = &scenario.world;
@@ -329,12 +341,14 @@ fn bench_scene_rebuild_near_a_control_pod() {
                 })
                 .collect()
         };
-        let (pack_scratch_ms, pack_cached_ms) = (pack_ms(&scene), pack_ms(&cached));
-        assert_eq!(cached.bvh.simplices.len(), scene.bvh.simplices.len());
+        let pack_scratch_ms = pack_ms(&scene);
+        let (in_tree, tree_nodes) = cached.bvh.in_tree();
+        assert_eq!(in_tree.len(), scene.bvh.simplices.len());
         // The incremental rebuilds over the last few seconds before this point (the first ones
         // after the start fill the cache).
-        let recent: Vec<_> = incremental.iter().filter(|(t, _, _)| *t > history - 4.0).collect();
+        let recent: Vec<_> = incremental.iter().filter(|r| r.0 > history - 4.0).collect();
         let recent_ms: Vec<f64> = recent.iter().map(|r| r.1).collect();
+        let patch_ms: Vec<f64> = recent.iter().map(|r| r.3).collect();
         let max = |xs: &[f64]| xs.iter().copied().fold(0.0, f64::max);
         let mean_of = |f: &dyn Fn(&CacheStats) -> usize| {
             recent.iter().map(|r| f(&r.2)).sum::<usize>() as f64 / recent.len() as f64
@@ -376,13 +390,21 @@ fn bench_scene_rebuild_near_a_control_pod() {
                 mean_of(&|s| s.simplices_reused),
             ),
         );
-        row(" render of it (CPU)", &render_cached_ms, format!("{} nodes", cached.bvh.nodes().len()));
+        row(
+            " render of it (CPU)",
+            &render_cached_ms,
+            format!(
+                "{tree_nodes} nodes; arena {} nodes, {} simplices; {compactions} compactions so far",
+                cached.bvh.nodes().len(),
+                cached.bvh.simplices.len()
+            ),
+        );
         row("GPU pack, from scratch", &pack_scratch_ms, String::new());
-        row("GPU pack, incremental", &pack_cached_ms, String::new());
+        row("GPU pack, patched", &patch_ms, format!("max {:.2}", max(&patch_ms)));
         println!(
             "  worst frame (rebuild max + render): from scratch {:.1}, incremental {:.1}",
-            max(&total_ms) + stats(&render_ms).0,
-            max(&recent_ms) + stats(&render_cached_ms).0
+            max(&total_ms) + stats(&render_ms)[0],
+            max(&recent_ms) + stats(&render_cached_ms)[0]
         );
         row(" without the hull", &render_hullless_ms, String::new());
         row(" without the pulses", &render_pulseless_ms, String::new());
@@ -434,7 +456,7 @@ fn simplex_bits(s: &crate::mesh4d::Simplex4D) -> Vec<u32> {
 }
 
 fn sorted_simplices(scene: &Scene4D) -> Vec<Vec<u32>> {
-    let mut all: Vec<_> = scene.bvh.simplices.iter().map(simplex_bits).collect();
+    let mut all: Vec<_> = scene.bvh.in_tree().0.into_iter().map(simplex_bits).collect();
     all.sort();
     all
 }
@@ -465,10 +487,24 @@ fn incremental_rebuild_matches_a_rebuild_from_scratch() {
     let mut cache = SceneCache::default();
     let mut cached = scenario.world.build_scene();
     let mut stats = Vec::new();
+    // The GPU's copy, patched with what each rebuild wrote, stays the same as one packed afresh.
+    let mut packed = PackedSceneGpuData::from_scene(&cached);
+    let mut patched = 0;
+    let same_as_packed_afresh = |packed: &PackedSceneGpuData, scene: &Scene4D| {
+        let fresh = PackedSceneGpuData::from_scene(scene);
+        let bytes = |p: &PackedSceneGpuData| {
+            let b = |x: &[u8]| x.to_vec();
+            (b(bytemuck::cast_slice(&p.nodes)), b(bytemuck::cast_slice(&p.geoms)), b(bytemuck::cast_slice(&p.attrs)))
+        };
+        bytes(packed) == bytes(&fresh) && packed.num_nodes == fresh.num_nodes
+    };
     scenario.play_until_with(30.0, |world, _| {
         world.rebuild_scene(&mut cache, &mut cached);
+        patched += packed.update(&cached) as usize;
         stats.push(cache.stats);
     });
+    assert!(patched * 10 > stats.len() * 9, "{patched} of {} patched", stats.len());
+    assert!(same_as_packed_afresh(&packed, &cached));
     let scratch = scenario.world.build_scene();
     assert_eq!(sorted_simplices(&cached), sorted_simplices(&scratch));
     let from = scenario.viewer.camera.position;
@@ -476,10 +512,14 @@ fn incremental_rebuild_matches_a_rebuild_from_scratch() {
     let last = stats.last().unwrap();
     assert!(last.simplices_built * 5 < last.simplices_reused, "{last:?}");
 
-    // Shifted in lab time, everything is rebuilt, and still the same.
+    // Shifted in lab time, everything is rebuilt (and the arena compacted), and still the same.
     scenario.world.rebase(-7.25);
     scenario.viewer.camera.position.t -= 7.25;
-    scenario.world.rebuild_scene(&mut cache, &mut cached);
+    for _ in 0..3 {
+        scenario.world.rebuild_scene(&mut cache, &mut cached);
+        packed.update(&cached);
+    }
+    assert!(same_as_packed_afresh(&packed, &cached));
     let scratch = scenario.world.build_scene();
     assert_eq!(sorted_simplices(&cached), sorted_simplices(&scratch));
     assert_eq!(same_hits(&cached, &scratch, scenario.viewer.camera.position), 1.0);
@@ -507,21 +547,9 @@ fn incremental_rebuild_keeps_up_with_pruning() {
     let scratch = scenario.world.build_scene();
     let last = stats.last().unwrap();
     assert!(last.simplices_built * 10 < last.simplices_reused, "{last:?}");
+    // The arena's free room stays bounded.
+    let live = cached.bvh.in_tree().0.len();
+    assert!(last.arena_simplices < 2 * live + (1 << 15), "{live} live: {last:?}");
     let same = same_hits(&cached, &scratch, scenario.viewer.camera.position);
     assert!(same > 0.99, "{same}");
-}
-
-#[test]
-#[ignore]
-fn debug_cache() {
-    let mut scenario = Scenario::new();
-    let mut cache = SceneCache::default();
-    let mut cached = scenario.world.build_scene();
-    scenario.play_until_with(60.0, |world, _| world.rebuild_scene(&mut cache, &mut cached));
-    std::env::set_var("CACHE_DEBUG", "1");
-    scenario.play_until_with(60.25, |world, _| {
-        let s = Instant::now();
-        world.rebuild_scene(&mut cache, &mut cached);
-        eprintln!("total {:?}", s.elapsed());
-    });
 }
