@@ -6,13 +6,13 @@
 //! ```
 //!
 //! The headline figure is the worst frame: a scene rebuild runs synchronously in the frame that
-//! triggers it, so a frame takes up to a whole `build_scene` plus a render. The timings are
-//! noisy on a loaded machine; compare runs on an idle one.
+//! triggers it, so a frame takes up to the slowest (incremental) rebuild plus a render. The
+//! timings are noisy on a loaded machine; compare runs on an idle one.
 
 use std::time::Instant;
 
 use crate::dynamic::helm::{self, ControlMode, Order};
-use crate::dynamic::ship::render_indices;
+use crate::dynamic::ship::{render_indices, segment_stray};
 use crate::dynamic::scene_cache::CacheStats;
 use crate::dynamic::{self, billiards, laser, DynWorld, PlayerId, SceneCache, ShipSample, MAX_SEGMENT_DT};
 use crate::gpu::PackedSceneGpuData;
@@ -156,27 +156,6 @@ impl Scenario {
     }
 }
 
-/// The share of wall time the app spends rebuilding the scene, if a rebuild takes `rebuild`
-/// ms and a render `render` ms, as `main.rs` paces them: frames capped at [`TARGET_FPS`], and a
-/// snapshot once the frames' (clamped) `dt_wall` adds up to [`REBUILD_INTERVAL`] (the world
-/// grows every frame in a match). `dt_wall` is the previous frame's length, so once a rebuild
-/// frame is that long by itself, every frame rebuilds. Also returns the rebuilds per second.
-fn rebuild_share(rebuild: f64, render: f64) -> (f64, f64) {
-    let (mut wall, mut timer, mut dt, mut rebuilding, mut rebuilds) = (0.0, 0.0, 1.0 / TARGET_FPS, 0.0, 0);
-    while wall < 10.0 {
-        timer += dt.clamp(0.001, 0.1);
-        let rebuild_ms = if timer >= REBUILD_INTERVAL { rebuild } else { 0.0 };
-        if rebuild_ms > 0.0 {
-            timer = 0.0;
-            rebuilds += 1;
-        }
-        dt = f64::max(1.0 / TARGET_FPS, (rebuild_ms + render) / 1e3);
-        wall += dt;
-        rebuilding += rebuild_ms / 1e3;
-    }
-    (rebuilding / wall, rebuilds as f64 / wall)
-}
-
 /// Median, 99th percentile (nearest rank), maximum and mean of `xs`.
 fn stats(xs: &[f64]) -> [f64; 4] {
     let mut v = xs.to_vec();
@@ -188,29 +167,38 @@ fn stats(xs: &[f64]) -> [f64; 4] {
 /// How long [`play_frames`] plays from each history length (match time).
 const PLAY_SECS: f64 = 3.0;
 
+/// The longest frame the frontends report (`App`'s `MAX_DT_WALL`).
+const MAX_DT_WALL: f64 = 0.1;
+
 /// Play the match on in `scenario` for [`PLAY_SECS`] of match time, frame by frame as the app
-/// does: each frame simulates its `dt_wall` (the previous frame's length, clamped to 0.1 s),
-/// rebuilds the scene through `DynWorld::build_scene` once the frames' `dt_wall` adds up to
-/// [`REBUILD_INTERVAL`] (the world grows every frame), and renders it with `render` (which
-/// returns its milliseconds). Frames are at least `1 / TARGET_FPS` long. Returns each frame's
-/// work in ms (simulation + rebuild + render), and the rebuilds' ms.
-fn play_frames(scenario: &mut Scenario, mut render: impl FnMut(&Scene4D, &Scenario) -> f64) -> (Vec<f64>, Vec<f64>) {
-    let mut scene = scenario.world.build_scene();
+/// does: each frame simulates its `dt_wall` (the previous frame's length, clamped to
+/// [`MAX_DT_WALL`]), rebuilds `scene` incrementally through `cache` once the frames' `dt_wall`
+/// adds up to [`REBUILD_INTERVAL`] (the world grows every frame; the interval counts from the
+/// end of the last rebuild), and renders it with `render` (which returns its milliseconds).
+/// Frames are at least `1 / TARGET_FPS` long. Returns each frame's work in ms (simulation +
+/// rebuild + render), and the rebuilds' ms.
+fn play_frames(
+    scenario: &mut Scenario,
+    cache: &mut SceneCache,
+    scene: &mut Scene4D,
+    mut render: impl FnMut(&Scene4D, &Scenario) -> f64,
+) -> (Vec<f64>, Vec<f64>) {
     let (mut frames, mut rebuilds) = (Vec::new(), Vec::new());
     let (mut timer, mut dt) = (0.0, 1.0 / TARGET_FPS);
     let end = scenario.time() + PLAY_SECS;
     while scenario.time() < end {
-        let dt_wall = dt.clamp(0.001, 0.1);
+        let dt_wall = dt.clamp(0.001, MAX_DT_WALL);
         let start = Instant::now();
         scenario.play_until(scenario.time() + dt_wall);
         timer += dt_wall;
         if timer >= REBUILD_INTERVAL {
             let rebuild = Instant::now();
-            scene = scenario.world.build_scene();
-            rebuilds.push(ms(rebuild));
-            timer = 0.0;
+            scenario.world.rebuild_scene(cache, scene);
+            let rebuild_ms = ms(rebuild);
+            rebuilds.push(rebuild_ms);
+            timer = -(rebuild_ms / 1e3).min(MAX_DT_WALL);
         }
-        render(&scene, scenario);
+        render(scene, scenario);
         let work = ms(start);
         frames.push(work);
         dt = f64::max(1.0 / TARGET_FPS, work / 1e3);
@@ -223,9 +211,11 @@ fn ms(start: Instant) -> f64 {
 }
 
 /// The `SCENE+BVH REBUILD` phase with the camera close to another player's control pod (users
-/// saw it take ~90% of the frame): `DynWorld::build_scene`, broken down into the geometry it
-/// generates (per part) and the BVH build, then the CPU trace of one frame from that camera,
-/// at several lengths of match history.
+/// saw it take ~90% of the frame), at several lengths of match history: the incremental
+/// rebuild the app makes every [`REBUILD_INTERVAL`] (`DynWorld::rebuild_scene`), one from an
+/// empty cache (a rebase, or a world entered late), and for reference `DynWorld::build_scene`
+/// broken down into the geometry it generates (per part) and the BVH build; then the CPU trace
+/// of one frame from that camera, and a few seconds of frames played as the app plays them.
 #[test]
 #[ignore = "benchmark: run with --release --ignored"]
 fn bench_scene_rebuild_near_a_control_pod() {
@@ -252,9 +242,9 @@ fn bench_scene_rebuild_near_a_control_pod() {
         rayon::current_num_threads()
     );
     println!("Times in ms: p50 / p99 / max / mean. The rebuild runs synchronously in the frame that triggers it, so");
-    println!("the worst frame is about the worst rebuild plus a render. Then {PLAY_SECS} s of frames played as `main.rs`");
-    println!("paces them ({TARGET_FPS} fps cap, a rebuild every {REBUILD_INTERVAL} s of clamped dt_wall), with the CPU render.");
-    println!("Secondary: the rebuilds' share of wall time, with this CPU render and with a free one (GPU-bound users).");
+    println!("the worst frame is about the worst incremental rebuild (all of them since the last history length)");
+    println!("plus a render. Then {PLAY_SECS} s of frames played as `main.rs` paces them ({TARGET_FPS} fps cap, a rebuild");
+    println!("every {REBUILD_INTERVAL} s of clamped dt_wall), with the CPU render.");
     let mut scenario = Scenario::new();
     // The incremental rebuild, as the app makes it every `REBUILD_INTERVAL` all along.
     let mut cache = SceneCache::default();
@@ -262,8 +252,9 @@ fn bench_scene_rebuild_near_a_control_pod() {
     // The GPU's copy of the scene (as the web build keeps it), patched after every rebuild.
     let mut packed = PackedSceneGpuData::from_scene(&cached);
     let mut compactions = 0;
-    for history in [5.0, 20.0, 60.0, 120.0] {
+    for history in [5.0, 20.0, 60.0, 120.0, 215.0] {
         let history = f64::max(history, scenario.time());
+        let since = scenario.time();
         let start = Instant::now();
         let mut incremental: Vec<(f64, f64, CacheStats, f64)> = Vec::new();
         let mut incremental_ms = 0.0;
@@ -283,8 +274,19 @@ fn bench_scene_rebuild_near_a_control_pod() {
         let other = &world.ships[POD as usize];
         let ahead = other.hull_ahead();
         let hull: Vec<_> = other.hull.iter().chain(&ahead).copied().collect();
-        let drawn_hull = render_indices(&hull, MAX_SEGMENT_DT).len();
+        let hull_keep = render_indices(&hull, MAX_SEGMENT_DT);
+        let hull_stray = hull_keep.windows(2).map(|w| segment_stray(&hull, w[0], w[1])).fold(0.0, f64::max);
         let drawn_pilot = render_indices(&other.track, MAX_SEGMENT_DT).len();
+
+        // From an empty cache: what a rebase costs (every chunk moved in lab time).
+        let full_ms: Vec<f64> = (0..BUILD_ITERS)
+            .map(|_| {
+                let mut scene = Scene4D { bvh: crate::bvh4d::Bvh4D::empty(), ..world.build_scene() };
+                let start = Instant::now();
+                world.rebuild_scene(&mut SceneCache::default(), &mut scene);
+                ms(start)
+            })
+            .collect();
 
         let mut part_ms = vec![vec![0.0; BUILD_ITERS]; parts.len()];
         let mut part_simplices = vec![0; parts.len()];
@@ -329,8 +331,8 @@ fn bench_scene_rebuild_near_a_control_pod() {
         };
         let render_hullless_ms = render_without(other.hull_material());
         let render_pulseless_ms = render_without(laser::MATERIAL_PULSE);
-        let render_cached_ms = render(&cached);
-        let render_ms = render(&scene);
+        let render_scratch_ms = render(&scene);
+        let render_ms = render(&cached);
         let lit = fb.iter().filter(|&&px| px != 0).count();
         let pack_ms = |scene: &Scene4D| -> Vec<f64> {
             (0..RENDER_ITERS)
@@ -343,18 +345,20 @@ fn bench_scene_rebuild_near_a_control_pod() {
         };
         let pack_scratch_ms = pack_ms(&scene);
         let (in_tree, tree_nodes) = cached.bvh.in_tree();
-        assert_eq!(in_tree.len(), scene.bvh.simplices.len());
-        // The incremental rebuilds over the last few seconds before this point (the first ones
-        // after the start fill the cache).
-        let recent: Vec<_> = incremental.iter().filter(|r| r.0 > history - 4.0).collect();
+        let live = in_tree.len();
+        if history < dynamic::HISTORY_WINDOW {
+            // (Once tracks are pruned, the incremental scan keeps its earlier choices.)
+            assert_eq!(live, scene.bvh.simplices.len());
+        }
+        // Every incremental rebuild since the last history length (but the match's first
+        // second, which fills the cache).
+        let recent: Vec<_> = incremental.iter().filter(|r| r.0 > since.max(1.0)).collect();
         let recent_ms: Vec<f64> = recent.iter().map(|r| r.1).collect();
         let patch_ms: Vec<f64> = recent.iter().map(|r| r.3).collect();
-        let max = |xs: &[f64]| xs.iter().copied().fold(0.0, f64::max);
         let mean_of = |f: &dyn Fn(&CacheStats) -> usize| {
             recent.iter().map(|r| f(&r.2)).sum::<usize>() as f64 / recent.len() as f64
         };
 
-        let (total, render) = (stats(&total_ms)[0], stats(&render_ms)[0]);
         let row = |label: &str, xs: &[f64], extra: String| {
             let [p50, p99, max, mean] = stats(xs);
             println!("  {label:<26} {p50:>8.2} / {p99:>8.2} / {max:>8.2} / {mean:>8.2}  {extra}");
@@ -362,27 +366,19 @@ fn bench_scene_rebuild_near_a_control_pod() {
         println!();
         println!(
             "History {history:.0} s ({} frames, simulated in {play_ms:.0} ms): pod track {} samples, hull drawn \
-             in {} samples ({} ahead), pilot in {drawn_pilot}; {} bodies, {} pulses",
+             in {} samples ({} ahead, straying up to {hull_stray:.4}), pilot in {drawn_pilot}; {} bodies, {} pulses",
             scenario.frames,
             other.track.len(),
-            drawn_hull,
+            hull_keep.len(),
             ahead.len(),
             world.bodies.len(),
             world.pulses.len(),
         );
-        row("build_scene total", &total_ms, format!("{} simplices", scene.bvh.simplices.len()));
-        row(" simplex generation", &gen_ms, String::new());
-        for (i, part) in parts.iter().enumerate() {
-            row(&format!("   {part}"), &part_ms[i], format!("{} simplices", part_simplices[i]));
-        }
-        row(" Bvh4D::build", &bvh_ms, format!("{} nodes", scene.bvh.nodes().len()));
-        row("render (CPU)", &render_ms, format!("{lit} lit px of {}", fb.len()));
         row(
             "incremental rebuild",
             &recent_ms,
             format!(
-                "max {:.2} over {} rebuilds; per rebuild {:.0} chunks ({:.0} simplices) built, {:.0} ({:.0}) reused",
-                max(&recent_ms),
+                "{} rebuilds; per rebuild {:.0} chunks ({:.0} simplices) built, {:.0} ({:.0}) reused",
                 recent.len(),
                 mean_of(&|s| s.chunks_built),
                 mean_of(&|s| s.simplices_built),
@@ -390,42 +386,41 @@ fn bench_scene_rebuild_near_a_control_pod() {
                 mean_of(&|s| s.simplices_reused),
             ),
         );
+        row(" GPU pack, patched", &patch_ms, String::new());
+        row("rebuild from an empty cache", &full_ms, String::new());
+        row("render (CPU)", &render_ms, format!("{lit} lit px of {}", fb.len()));
         row(
-            " render of it (CPU)",
-            &render_cached_ms,
+            " of build_scene's",
+            &render_scratch_ms,
             format!(
-                "{tree_nodes} nodes; arena {} nodes, {} simplices; {compactions} compactions so far",
+                "{tree_nodes} nodes in the tree; arena {} nodes, {} simplices; {compactions} compactions so far",
                 cached.bvh.nodes().len(),
                 cached.bvh.simplices.len()
             ),
         );
-        row("GPU pack, from scratch", &pack_scratch_ms, String::new());
-        row("GPU pack, patched", &patch_ms, format!("max {:.2}", max(&patch_ms)));
-        println!(
-            "  worst frame (rebuild max + render): from scratch {:.1}, incremental {:.1}",
-            max(&total_ms) + stats(&render_ms)[0],
-            max(&recent_ms) + stats(&render_cached_ms)[0]
-        );
         row(" without the hull", &render_hullless_ms, String::new());
         row(" without the pulses", &render_pulseless_ms, String::new());
-        let worst = stats(&total_ms)[2] + stats(&render_ms)[0];
-        println!("  WORST FRAME (max rebuild + p50 render): {worst:.1} ms; without the render: {:.1} ms", stats(&total_ms)[2]);
-        let ((cpu, cpu_rate), (free, free_rate)) = (rebuild_share(total, render), rebuild_share(total, 0.0));
-        println!(
-            "  rebuild share of wall time: {:.0}% with the CPU render ({cpu_rate:.1} rebuilds/s), {:.0}% with a free \
-             render ({free_rate:.1} rebuilds/s)",
-            100.0 * cpu,
-            100.0 * free
-        );
+        row("build_scene total", &total_ms, format!("{} simplices", scene.bvh.simplices.len()));
+        row(" simplex generation", &gen_ms, String::new());
+        for (i, part) in parts.iter().enumerate() {
+            row(&format!("   {part}"), &part_ms[i], format!("{} simplices", part_simplices[i]));
+        }
+        row(" Bvh4D::build", &bvh_ms, format!("{} nodes", scene.bvh.nodes().len()));
+        row(" GPU pack, from scratch", &pack_scratch_ms, String::new());
+        let [rebuild_p50, rebuild_p99, rebuild_max, _] = stats(&recent_ms);
+        let render_p50 = stats(&render_ms)[0];
+        let worst = rebuild_max + render_p50;
+        println!("  WORST FRAME (max incremental rebuild + p50 render): {worst:.1} ms; without the render: {rebuild_max:.1} ms");
 
         // Play on, frame by frame: the geometry grows meanwhile.
         let mut fb = vec![0u32; cfg.width * cfg.height];
-        let (frames, rebuilds) = play_frames(&mut scenario, |scene, scenario| {
+        let (frames, rebuilds) = play_frames(&mut scenario, &mut cache, &mut cached, |scene, scenario| {
             let (camera, dynamics) = scenario.view();
             let start = Instant::now();
             render_frame(scene, &camera, &cfg, &dynamics, &mut fb);
             ms(start)
         });
+        packed = PackedSceneGpuData::from_scene(&cached);
         println!(
             "  played {PLAY_SECS} s on in {} frames with {} rebuilds (now {:.0} s of history):",
             frames.len(),
@@ -434,6 +429,15 @@ fn bench_scene_rebuild_near_a_control_pod() {
         );
         row("frame (sim+rebuild+render)", &frames, String::new());
         row("rebuild in play", &rebuilds, String::new());
+        let [_, frame_p99, frame_max, _] = stats(&frames);
+        println!(
+            "  SUMMARY {history:.0} s: {} simplices; rebuild p50 {rebuild_p50:.2} p99 {rebuild_p99:.2} max \
+             {rebuild_max:.2}; full build p50 {:.1} max {:.1}; render {render_p50:.1}; worst frame {worst:.1}; played \
+             max {frame_max:.1} p99 {frame_p99:.1}",
+            live,
+            stats(&full_ms)[0],
+            stats(&full_ms)[2],
+        );
     }
 }
 
