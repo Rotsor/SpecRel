@@ -20,6 +20,14 @@ use crate::minkowski::{Tetrad, Vec3, Vec4};
 /// Length of the rod of light a pulse is drawn as, trailing its head, in the shooter's rest
 /// frame at firing (in light-seconds, so it lasts that long there as well).
 pub const PULSE_LENGTH: f32 = 0.5;
+/// Most lab time one piece of a pulse's worldtube spans. The worldtube is straight, so cutting
+/// it leaves it the same; but in one piece its bounding box would be a square in `(t, along)`
+/// as long as its whole flight (up to [`LASER_RANGE`]) around a thin diagonal band, which
+/// rays all over the view pass through and must test (most of the CPU trace time, a minute
+/// into a match). Cut, each piece's box hugs its stretch of the band. Shorter pieces cut the
+/// trace further but grow the BVH build: 8 traces as fast as no pulses at all, for 36 more
+/// simplices per 8 s of flight.
+const PULSE_SEGMENT_DT: f64 = 8.0;
 /// Half the thickness of the rod.
 const PULSE_HALF_WIDTH: f32 = 0.02;
 /// A pulse that has met nothing this far (lab light-seconds) from where it was fired is gone.
@@ -237,6 +245,11 @@ impl Pulse {
     /// other frame (the lab's), it would look skewed to everyone else, as if dragged by an
     /// aether.
     pub fn simplices(&self, t_origin: f64) -> Vec<Simplex4D> {
+        self.simplices_in_pieces(t_origin, PULSE_SEGMENT_DT)
+    }
+
+    /// [`Pulse::simplices`], with its worldtube cut into pieces of at most `piece_dt` lab time.
+    fn simplices_in_pieces(&self, t_origin: f64, piece_dt: f64) -> Vec<Simplex4D> {
         let [vx, vy, vz] = self.vel.map(|c| c as f32);
         let tetrad = Tetrad::from_beta(Vec3::new(vx, vy, vz));
         let [x, y, z] = self.dir.map(|c| c as f32);
@@ -253,10 +266,12 @@ impl Pulse {
                 tetrad,
             }
         };
-        let ends = [sample(self.t0), sample(self.known_to(t_origin))];
+        let (t0, t1) = (self.t0, self.known_to(t_origin));
+        let n = ((t1 - t0) / piece_dt).ceil().max(1.0) as usize;
+        let samples: Vec<_> = (0..=n).map(|i| sample(t0 + (t1 - t0) * i as f64 / n as f64)).collect();
         let mut simplices =
-            build_worldtube_simplices_with_decided(&mesh, &ends, Some(&[self.fired_at; 2]), MATERIAL_PULSE);
-        for end in &ends {
+            build_worldtube_simplices_with_decided(&mesh, &samples, Some(&vec![self.fired_at; n + 1]), MATERIAL_PULSE);
+        for end in [&samples[0], &samples[n]] {
             simplices.extend(build_worldtube_cap(&mesh, end, self.fired_at, MATERIAL_PULSE));
         }
         simplices
@@ -421,5 +436,84 @@ mod tests {
             assert!(r.x <= 1e-4 && r.x >= -PULSE_LENGTH - 1e-4, "{r:?}");
             assert!(r.y.abs() <= 2.0 * PULSE_HALF_WIDTH && r.z.abs() <= 2.0 * PULSE_HALF_WIDTH, "{r:?}");
         }
+    }
+
+    /// Cut into pieces, a pulse looks the same, only sharper: rays all over a long pulse's path
+    /// hit the pieces where they hit it whole, up to its `f32` rounding (simplices 100 long
+    /// around a rod 0.04 thick), which the pieces are rid of.
+    #[test]
+    fn a_pulse_in_pieces_is_the_whole_pulse() {
+        use crate::bvh4d::Bvh4D;
+        let from = ShipSample { t: 0.0, pos: [0.0, 0.0, 0.0], vel: [0.0, 0.0, 0.0], tau: 0.0 };
+        let mut p = Pulse::new(0, 0, from, [0.2, 0.1, 1.0], 0.0, 0.0);
+        p.cleared = (100.0 / STEP_DT) as i64;
+        let p = p;
+        let whole = p.simplices_in_pieces(0.0, f64::INFINITY);
+        let pieces = p.simplices(0.0);
+        assert_eq!(whole.len(), 60);
+        assert!(pieces.len() > 5 * whole.len(), "{}", pieces.len());
+        let (whole, pieces) = (Bvh4D::build(whole), Bvh4D::build(pieces));
+
+        // How far an event is from the rod's surface (shooter at rest: shaped in the lab).
+        let d = Vec3::new(p.dir[0] as f32, p.dir[1] as f32, p.dir[2] as f32);
+        let a = Vec3::new(0.0, 1.0, 0.0).cross(d).normalized();
+        let b = d.cross(a);
+        let off_surface = |e: Vec4| {
+            let h = p.pos_at(e.t as f64).map(|c| c as f32);
+            let r = e.spatial() - Vec3::new(h[0], h[1], h[2]) + d * (0.5 * PULSE_LENGTH);
+            let w = PULSE_HALF_WIDTH;
+            let m = (r.dot(a).abs() / w).max(r.dot(b).abs() / w).max(r.dot(d).abs() / (0.5 * PULSE_LENGTH));
+            (m - 1.0).abs() * w
+        };
+
+        let (mut hits, mut differ) = (0, 0);
+        let (mut off_whole, mut off_pieces, mut d_lambda) = (0.0f32, 0.0f32, 0.0f32);
+        // Past light rays from observers beside the path, at many times, fanned across the rod
+        // where they see it.
+        for i in 0..40 {
+            let t = 5.0 + 2.5 * i as f64;
+            let eye = {
+                let h = p.pos_at(t);
+                [t + 3.0, h[0] + 2.0, h[1] + 0.3, h[2] - 1.0]
+            };
+            // The head's event on the eye's past light cone.
+            let mut seen = t;
+            for _ in 0..100 {
+                let h = p.pos_at(seen);
+                seen = eye[0] - (0..3).map(|c| (eye[c + 1] - h[c]).powi(2)).sum::<f64>().sqrt();
+            }
+            let h = p.pos_at(seen).map(|c| c as f32);
+            let aim = Vec3::new(h[0], h[1], h[2]) - d * (0.5 * PULSE_LENGTH);
+            let eye = Vec4::new(eye[0] as f32, eye[1] as f32, eye[2] as f32, eye[3] as f32);
+            for j in 0..400 {
+                let (u, v) = ((j % 20) as f32 / 19.0 - 0.5, (j / 20) as f32 / 19.0 - 0.5);
+                let n = (aim + Vec3::new(u, v, 2.0 * u - v) * 0.15 - eye.spatial()).normalized();
+                let dir = Vec4::new(-1.0, n.x, n.y, n.z);
+                match (whole.trace(eye, dir, 1e-3, 50.0), pieces.trace(eye, dir, 1e-3, 50.0)) {
+                    (Some(h0), Some(h1)) => {
+                        hits += 1;
+                        off_whole = off_whole.max(off_surface(h0.event));
+                        off_pieces = off_pieces.max(off_surface(h1.event));
+                        let dn = h0.surface_normal_4d - h1.surface_normal_4d;
+                        if dn.euclidean_dot(dn) < 1e-6 {
+                            d_lambda = d_lambda.max((h0.lambda - h1.lambda).abs());
+                        } else {
+                            differ += 1; // through an edge: on either face
+                        }
+                    }
+                    (None, None) => {}
+                    (h0, h1) => {
+                        differ += 1; // grazing an edge
+                        for h in h0.iter().chain(&h1) {
+                            assert!(off_surface(h.event) < 1e-3);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(hits > 3000, "{hits}");
+        assert!(differ * 50 < hits, "{differ} of {hits}");
+        assert!(off_pieces < 5e-5, "{off_pieces}");
+        assert!(off_whole < 2e-3 && d_lambda < 4e-3, "{off_whole} {d_lambda}");
     }
 }
