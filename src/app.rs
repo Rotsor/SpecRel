@@ -27,6 +27,8 @@ const FOV_Y_DEG: f32 = 65.0;
 /// "10 Hz full rebuild"; a thing at distance `D` was decided ~`2D` ago, so the lag is invisible
 /// in the Real Camera and God's Eye views).
 const DYNAMIC_REBUILD_INTERVAL: f32 = 0.1;
+/// The longest frame the frontends report: they clamp `dt_wall` to it.
+const MAX_DT_WALL: f32 = 0.1;
 /// Rebase a dynamic world's lab time once the camera passes this, to keep `f32` render
 /// coordinates precise while time runs forward indefinitely.
 const DYNAMIC_REBASE_AFTER_T: f32 = 1000.0;
@@ -489,7 +491,11 @@ impl App {
 
         self.rebuild_timer += dt_wall;
         if self.world_grew && self.rebuild_timer >= self.rebuild_interval {
-            self.rebuild_dynamic_scene()
+            let ms = self.rebuild_dynamic_scene();
+            // The next frame's `dt_wall` includes this rebuild: count the interval from its
+            // end, or a rebuild longer than the interval would make every frame rebuild.
+            self.rebuild_timer = -(ms / 1e3).min(MAX_DT_WALL);
+            ms
         } else {
             0.0
         }
