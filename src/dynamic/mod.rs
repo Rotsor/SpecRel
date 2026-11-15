@@ -1024,11 +1024,11 @@ mod match_tests {
         world
     }
 
-    /// The players drift toward each other along the line of their spawns, shooting along it.
+    /// The players drift apart along the line of their spawns, shooting along it.
     fn streams() -> [Vec<Input>; 2] {
         [
-            inputs(0, 700, 0.05, |_| Vec3::new(0.0, 0.0, 0.3), 90, [0.0, 0.0, 1.0]),
-            inputs(1, 650, 0.05, |_| Vec3::new(0.0, 0.0, -0.2), 70, [0.0, 0.0, -1.0]),
+            inputs(0, 700, 0.05, |_| Vec3::new(0.0, 0.0, -0.3), 90, [0.0, 0.0, 1.0]),
+            inputs(1, 650, 0.05, |_| Vec3::new(0.0, 0.0, 0.2), 70, [0.0, 0.0, -1.0]),
         ]
     }
 
@@ -1080,8 +1080,8 @@ mod match_tests {
     #[test]
     fn a_dodge_only_changes_pulses_that_end_in_its_future() {
         let (n, dodge) = (700, 500);
-        let drift = |_| Vec3::new(0.0, 0.0, -0.2);
-        let dodging = |i| Vec3::new(if i > dodge { 0.6 } else { 0.0 }, 0.0, -0.2);
+        let drift = |_| Vec3::new(0.0, 0.0, 0.2);
+        let dodging = |i| Vec3::new(if i > dodge { 0.6 } else { 0.0 }, 0.0, 0.2);
         let shooter = inputs(0, n, 0.05, |_| Vec3::default(), 15, [0.0, 0.0, 1.0]);
         let straight = inputs(1, n, 0.05, drift, usize::MAX, [0.0; 3]);
         let a = replica(0, &[shooter.clone(), straight.clone()], 5);

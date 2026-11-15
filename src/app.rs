@@ -992,7 +992,7 @@ mod tests {
             assert!(reach > SHIP_RADIUS + offset, "{controls:?}: drawn only {reach} ahead");
 
             // Whatever the pilot does next, the hull flies as drawn.
-            play(&mut p0, &mut p1, 40, dt, &HeldInput { thrust_back: true, thrust_up: true, ..Default::default() });
+            play(&mut p0, &mut p1, 100, dt, &HeldInput { thrust_back: true, thrust_up: true, ..Default::default() });
             let flown = &p0.world.as_ref().unwrap().ships[0];
             assert!(flown.latest().t > end.t);
             for a in &ahead {
@@ -1062,13 +1062,13 @@ mod tests {
         p0.step(0.05, &HeldInput::default()); // hears the answer
         let line = p0.net_metrics().unwrap();
         assert!(line.starts_with("NET RTT 250MS | CM LEAD "), "{line}");
-        assert!(line.contains("| INTERVAL 25.00LS | CM DIST 25.00LS |"), "{line}"); // the spawns
+        assert!(line.contains("| INTERVAL 4.00LS | CM DIST 4.00LS |"), "{line}"); // the spawns
     }
 
     /// Laser shots, flashes and the worlds they shape are shared: both replicas agree. The
-    /// players spawn 25 ls apart facing each other, so shots straight ahead hit 25 s later;
+    /// players spawn 4 ls apart facing each other, so shots straight ahead hit 4 s later;
     /// each hit lights a flash, and lands on a player's scoreboard once news of it arrives
-    /// there: at once on the hull that was hit, 25 s later back at the shooter.
+    /// there: at once on the hull that was hit, 4 s later back at the shooter.
     #[test]
     fn a_match_shares_lasers_hits_and_flashes() {
         let (mut p0, mut p1) = match_apps();
@@ -1104,9 +1104,10 @@ mod tests {
         assert_eq!((&w0.scores[..], &w1.scores[..]), (&[5, 5][..], &[5, 5][..]));
         // Player 0 heard of the hits on their own hull long before those on player 1's.
         let at = |frame: usize| &boards[frame / 50];
-        assert_eq!(at(400), "LASER HITS  YOU 0 : 0 THEM");
-        assert_eq!(at(950), "LASER HITS  YOU 0 : 5 THEM");
-        assert_eq!(at(1450), "LASER HITS  YOU 5 : 5 THEM");
+        assert_eq!(at(50), "LASER HITS  YOU 0 : 0 THEM");
+        assert_eq!(at(100), "LASER HITS  YOU 0 : 1 THEM");
+        assert_eq!(at(450), "LASER HITS  YOU 3 : 4 THEM");
+        assert_eq!(at(700), "LASER HITS  YOU 5 : 5 THEM");
         let mut compared = 0;
         for x in &w0.bodies {
             let y = w1.bodies.iter().find(|y| y.uid == x.uid).expect("same bodies in both worlds");

@@ -140,18 +140,22 @@ pub fn rails() -> Vec<(Mesh3D, Vec3)> {
     rail_boxes().into_iter().map(|(center, he)| (Mesh3D::cube(he), center)).collect()
 }
 
+/// How far in front of player 0 the others spawn, so that the players start close enough to see
+/// each other clearly.
+pub const SPAWN_GAP: f32 = 4.0;
+
 /// Where `player` spawns, at `t = 0`: player 0 at the open near end of the table, the others
-/// mirrored to the far end.
+/// a short way ahead of them, facing back at them.
 pub fn spawn_event(player: PlayerId) -> Vec4 {
     let near = crate::scene::DemoScene::RelativisticBilliards.initial_camera_pos();
     if player == 0 {
         near
     } else {
-        Vec4::new(near.t, near.x, near.y, (Z_MIN + Z_MAX) as f32 - near.z)
+        Vec4::new(near.t, near.x, near.y, near.z + SPAWN_GAP)
     }
 }
 
-/// The spawn heading (yaw from `+z`): everyone starts facing the table.
+/// The spawn heading (yaw from `+z`): player 0 faces the table, the others face player 0.
 pub fn spawn_yaw(player: PlayerId) -> f32 {
     if player == 0 {
         0.0
