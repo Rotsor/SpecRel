@@ -28,6 +28,7 @@ use crate::mesh4d::{
 use crate::minkowski::{Vec3, Vec4};
 use crate::renderer::{analytic_decision_age, Frontier};
 use crate::scene::{DemoScene, Scene4D};
+use crate::star::PointStar;
 use body::{distance, is_decided, Body, BodyState, Impulse, STEP_DT};
 use collide::{P4, V3};
 use helm::{Command, ControlMode};
@@ -43,6 +44,10 @@ pub const HISTORY_WINDOW: f64 = 200.0;
 /// Render segments are split at least this often (in lab time), so that the per-vertex
 /// `decided_at` interpolated along a merged segment stays close to the per-step stamps.
 pub(crate) const MAX_SEGMENT_DT: f64 = 50.0;
+
+/// Rest-frame intensity of a pilot's star: from across the table, several times the brightest
+/// backdrop star, so its glow stands out.
+const PILOT_STAR_INTENSITY: f32 = 2.0;
 
 const MATERIAL_RAIL: usize = 6;
 
@@ -431,19 +436,14 @@ impl DynWorld {
         }
         lap(SCENE_PULSES, simplices.len());
 
-        // The other players' ships: an open hull cage, and the pilot's clock inside it, where
-        // the decisions are made. The pilot ends at its last known event; the hull runs on as
-        // far as its motion is settled, so that all of it is in view from outside the pilot's
-        // future cone. With delayed controls the pilot rides at the hull's center, as settled.
-        let (hull_mesh, hull_bars, pilot_mesh) = (Ship::hull_mesh(), Ship::hull_bars(), Ship::pilot_mesh());
+        // The other players' ships: an open hull cage, which runs on as far as its motion is
+        // settled, so that all of it is in view from outside the pilot's future cone. The pilot
+        // inside it, where the decisions are made, is a star (`DynWorld::pilot_stars`).
+        let (hull_mesh, hull_bars) = (Ship::hull_mesh(), Ship::hull_bars());
         for ship in self.ships.iter().filter(|s| s.player != self.viewer) {
             let ahead = ship.hull_ahead();
             lap(SCENE_HULL_AHEAD, simplices.len());
             let hull: Vec<_> = ship.hull.iter().chain(&ahead).copied().collect();
-            let pilot = match ship.controls {
-                ControlMode::Delayed => &hull,
-                ControlMode::Pod => &ship.track,
-            };
             let m = ship.hull_material();
             let samples = render_ship_samples(&hull);
             extend_worldtube_simplices(&mut simplices, &hull_mesh, &samples, None, m);
@@ -452,12 +452,34 @@ impl DynWorld {
                 simplices.extend(build_worldtube_cap_about(bar, end, DECIDED_AT_STATIC, m, *center));
             }
             lap(SCENE_HULL, simplices.len());
-            let (samples, m) = (render_ship_samples(pilot), ship.material());
-            extend_worldtube_simplices(&mut simplices, &pilot_mesh, &samples, None, m);
-            simplices.extend(build_worldtube_cap(&pilot_mesh, samples.last().unwrap(), DECIDED_AT_STATIC, m));
-            lap(SCENE_PILOT, simplices.len());
         }
         simplices
+    }
+
+    /// The other players' pilots, as stars in their colors. A pilot's star runs along its
+    /// recorded worldline and ends at its latest event known here, so a ray whose cone crosses
+    /// the worldline later than that sees nothing: it is not known yet. With delayed controls
+    /// the pilot rides at the hull's center, as far as that is settled.
+    fn pilot_stars(&self) -> Vec<PointStar> {
+        self.ships
+            .iter()
+            .filter(|s| s.player != self.viewer)
+            .map(|ship| {
+                let hull;
+                let track = match ship.controls {
+                    ControlMode::Delayed => {
+                        hull = ship.hull.iter().chain(&ship.hull_ahead()).copied().collect::<Vec<_>>();
+                        &hull
+                    }
+                    ControlMode::Pod => &ship.track,
+                };
+                let events: Vec<Vec4> = ship::render_indices(track, MAX_SEGMENT_DT)
+                    .iter()
+                    .map(|&i| track[i].event())
+                    .collect();
+                PointStar::along(&events, ship.star_temperature(), PILOT_STAR_INTENSITY)
+            })
+            .collect()
     }
 
     /// The scene of `simplices` (from [`DynWorld::scene_simplices`]): their BVH, and the
@@ -477,7 +499,7 @@ impl DynWorld {
             bvh: Bvh4D::empty(),
             materials: Scene4D::common_materials(),
             light_pos: Vec3::new(0.0, 6.5, 4.0),
-            stars: Scene4D::backdrop_stars(),
+            stars: Scene4D::backdrop_stars().into_iter().chain(self.pilot_stars()).collect(),
             t_min: o.t - window,
             t_max: o.t + window,
         }
@@ -520,7 +542,7 @@ impl DynWorld {
             }
         }
 
-        let (hull_mesh, hull_bars, pilot_mesh) = (Ship::hull_mesh(), Ship::hull_bars(), Ship::pilot_mesh());
+        let (hull_mesh, hull_bars) = (Ship::hull_mesh(), Ship::hull_bars());
         for ship in self.ships.iter().filter(|s| s.player != self.viewer) {
             let ahead = ship.hull_ahead();
             let hull: Vec<_> = ship.hull.iter().chain(&ahead).copied().collect();
@@ -532,16 +554,6 @@ impl DynWorld {
             for (bar, center) in &hull_bars {
                 volatile.extend(build_worldtube_cap_about(bar, end, DECIDED_AT_STATIC, m, *center));
             }
-            let samples = match ship.controls {
-                ControlMode::Delayed => samples,
-                ControlMode::Pod => {
-                    let keep = cache.render_indices(ship.player, true, &ship.track, &ship.track);
-                    keep.iter().map(|&i| ship.track[i].sample()).collect()
-                }
-            };
-            let m = ship.material();
-            cache.tube(Part::Pilot(ship.player), &pilot_mesh, &samples, None, m);
-            volatile.extend(build_worldtube_cap(&pilot_mesh, samples.last().unwrap(), DECIDED_AT_STATIC, m));
         }
 
         let fresh = self.empty_scene();
@@ -556,13 +568,12 @@ impl DynWorld {
 
 /// The parts of [`DynWorld::scene_simplices`], in the order they are built: the static table and
 /// rails, the bodies, the laser pulses, and per other ship, the computation of its hull's
-/// settled motion ([`Ship::hull_ahead`]), its hull cage and its pilot.
+/// settled motion ([`Ship::hull_ahead`]) and its hull cage (the pilots are stars).
 pub(crate) const SCENE_TABLE: &str = "table+rails";
 pub(crate) const SCENE_BODIES: &str = "bodies";
 pub(crate) const SCENE_PULSES: &str = "pulses";
 pub(crate) const SCENE_HULL_AHEAD: &str = "hull_ahead()";
 pub(crate) const SCENE_HULL: &str = "hull cage";
-pub(crate) const SCENE_PILOT: &str = "pilot";
 
 /// The worldtube samples to draw a ship's `track` with.
 fn render_ship_samples(track: &[ShipSample]) -> Vec<crate::mesh4d::WorldlineSample> {
@@ -1131,7 +1142,7 @@ mod match_tests {
         assert!(lag < 3.0, "lag {lag}");
     }
 
-    /// Each player sees the other's ship as a hull cage with the pilot's clock inside, up to its
+    /// Each player sees the other's ship as a hull cage with the pilot's star inside, up to its
     /// last known event, and not their own.
     #[test]
     fn other_ships_are_drawn_up_to_their_last_known_event() {
@@ -1139,19 +1150,21 @@ mod match_tests {
         let world = replica(0, &streams, 5);
         let scene = world.build_scene();
         let has = |m: usize| scene.bvh.simplices.iter().any(|s| s.material_id == m);
-        assert!(has(world.ships[1].material()), "the other pilot is drawn");
-        assert!(has(world.ships[1].hull_material()), "and their hull");
-        assert!(!has(world.ships[0].material()), "your own ship is not");
-        assert!(!has(world.ships[0].hull_material()));
-        let tip = world.ships[1].latest().t as f32;
-        let latest = scene
-            .bvh
-            .simplices
+        assert!(has(world.ships[1].hull_material()), "the other hull is drawn");
+        assert!(!has(world.ships[0].hull_material()), "your own is not");
+        let pilots: Vec<_> = scene
+            .stars
             .iter()
-            .filter(|s| s.material_id == world.ships[1].material())
-            .map(|s| s.v0.t)
-            .fold(f32::MIN, f32::max);
-        assert!(latest <= tip + 1.0 && latest >= tip - 1.0, "ship drawn to {latest}, known to {tip}");
+            .filter(|s| s.temperature == world.ships[1].star_temperature())
+            .collect();
+        assert_eq!(pilots.len(), 1, "the other pilot is a star");
+        assert!(!scene.stars.iter().any(|s| s.temperature == world.ships[0].star_temperature()));
+        let last = pilots[0].segments.last().expect("a worldline");
+        let end = last.event + last.four_velocity * last.s_max;
+        let tip = world.ships[1].latest();
+        // With delayed controls it rides the hull's center as far as that is settled: up to the
+        // command delay past the pilot's latest event.
+        assert!(end.t >= tip.t as f32 - 1e-2 && end.t <= tip.t as f32 + 1.0, "star drawn to {}, known to {}", end.t, tip.t);
     }
 }
 

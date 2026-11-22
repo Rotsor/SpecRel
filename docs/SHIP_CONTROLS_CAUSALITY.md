@@ -202,7 +202,8 @@ Two corrections to the sketch above:
   track bit for bit.
 
 **Seeing the decision centre.** Other players' ships are drawn as an open cage of bars along the
-hull track (`Ship::hull_mesh`, materials 12–15 in the player's colour), with the pilot's clock cube
-inside it on the pilot's track (`Ship::pilot_mesh`). With delayed controls the clock sits at the
-centre; with a pod it visibly drifts toward the wall the pilot is thrusting at, and the cage
+hull track (`Ship::hull_mesh`, materials 12–15 in the player's colour), with the pilot inside it
+as a star (a size-less light, `crate::star`) on the pilot's track, ending at its latest known event
+(`DynWorld::pilot_stars`). With delayed controls the star sits at the centre; with a pod it visibly
+drifts toward the wall the pilot is thrusting at, and the cage
 catches up about a second later.

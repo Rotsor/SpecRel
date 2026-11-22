@@ -478,6 +478,16 @@ pub extern "C" fn web_scene_stars_byte_len(scene_idx: usize) -> usize {
     with_state(|s| bytemuck::cast_slice::<_, u8>(&s.packed_scenes[scene_idx].stars).len())
 }
 
+#[no_mangle]
+pub extern "C" fn web_scene_star_segments_ptr(scene_idx: usize) -> *const u8 {
+    with_state(|s| bytemuck::cast_slice(&s.packed_scenes[scene_idx].star_segments).as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn web_scene_star_segments_byte_len(scene_idx: usize) -> usize {
+    with_state(|s| bytemuck::cast_slice::<_, u8>(&s.packed_scenes[scene_idx].star_segments).len())
+}
+
 /// Number of pixels in the HDR image plus its bloom pyramid, for a `width x height` frame
 /// (the HDR buffer holds 16 bytes per pixel).
 #[no_mangle]

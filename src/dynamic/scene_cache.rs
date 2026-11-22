@@ -40,7 +40,6 @@ const PARALLEL_CHUNKS: usize = 8;
 pub(crate) enum Part {
     Body(u64),
     Hull(PlayerId),
-    Pilot(PlayerId),
     Pulse(PlayerId, u64),
 }
 

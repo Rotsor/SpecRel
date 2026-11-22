@@ -20,7 +20,7 @@ use crate::renderer::{
 #[cfg(not(target_arch = "wasm32"))]
 use crate::bloom::BLOOM_LEVELS;
 use crate::scene::Scene4D;
-use crate::star::PointStar;
+use crate::star::{PointStar, StarSegment};
 use bytemuck::{Pod, Zeroable};
 #[cfg(not(target_arch = "wasm32"))]
 use wgpu::util::DeviceExt;
@@ -99,24 +99,43 @@ pub(crate) struct GpuMaterial {
     pub(crate) params: [f32; 4],
 }
 
-/// A light-emitting point ([`PointStar`]).
+/// A light-emitting point ([`PointStar`]): `(temperature, color_norm, bitcast(first segment),
+/// bitcast(segment count))`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(crate) struct GpuStar {
-    pub(crate) event: [f32; 4],
-    pub(crate) four_vel: [f32; 4],
-    /// `(temperature, color_norm, 0, 0)`.
     pub(crate) params: [f32; 4],
 }
 
-impl GpuStar {
-    fn pack(s: &PointStar) -> Self {
-        Self {
-            event: v4(s.event),
-            four_vel: v4(s.four_velocity),
-            params: [s.temperature, s.color_norm(), 0.0, 0.0],
-        }
-    }
+/// A straight piece of a star's worldline ([`StarSegment`]).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct GpuStarSegment {
+    pub(crate) event: [f32; 4],
+    pub(crate) four_vel: [f32; 4],
+    /// `(s_min, s_max, 0, 0)`.
+    pub(crate) range: [f32; 4],
+}
+
+/// Pack `stars` into the star and segment tables.
+pub(crate) fn pack_stars(stars: &[PointStar]) -> (Vec<GpuStar>, Vec<GpuStarSegment>) {
+    let mut segs = Vec::new();
+    let table = stars
+        .iter()
+        .map(|star| {
+            let first = segs.len() as u32;
+            segs.extend(star.segments.iter().map(|seg: &StarSegment| GpuStarSegment {
+                event: v4(seg.event),
+                four_vel: v4(seg.four_velocity),
+                range: [seg.s_min, seg.s_max, 0.0, 0.0],
+            }));
+            let count = segs.len() as u32 - first;
+            GpuStar {
+                params: [star.temperature, star.color_norm(), f32::from_bits(first), f32::from_bits(count)],
+            }
+        })
+        .collect();
+    (table, segs)
 }
 
 #[repr(C)]
@@ -238,6 +257,7 @@ pub(crate) struct PackedSceneGpuData {
     pub(crate) materials: Vec<GpuMaterial>,
     pub(crate) light_pos: [f32; 4],
     pub(crate) stars: Vec<GpuStar>,
+    pub(crate) star_segments: Vec<GpuStarSegment>,
     pub(crate) num_stars: u32,
     /// The version of the scene's BVH the arrays were packed from.
     version: BvhVersion,
@@ -275,10 +295,11 @@ impl PackedSceneGpuData {
             .collect();
 
         let lp = scene.light_pos;
-        let stars: Vec<GpuStar> = scene.stars.iter().map(GpuStar::pack).collect();
+        let (stars, star_segments) = pack_stars(&scene.stars);
         Self {
             num_stars: stars.len() as u32,
             stars: non_empty(stars),
+            star_segments: non_empty(star_segments),
             nodes: non_empty(nodes),
             num_nodes,
             geoms: non_empty(geoms),
@@ -309,8 +330,10 @@ impl PackedSceneGpuData {
         patch(&mut self.attrs, p, prims, |i| GpuAttr::pack(bvh.leaf_simplex(i)));
         self.num_nodes = bvh.nodes().len() as u32;
         self.version = v;
-        self.num_stars = scene.stars.len() as u32;
-        self.stars = non_empty(scene.stars.iter().map(GpuStar::pack).collect());
+        let (stars, star_segments) = pack_stars(&scene.stars);
+        self.num_stars = stars.len() as u32;
+        self.stars = non_empty(stars);
+        self.star_segments = non_empty(star_segments);
         true
     }
 }
@@ -389,6 +412,7 @@ struct SceneBuffers {
     num_stars: u32,
     nodes: wgpu::Buffer,
     stars: wgpu::Buffer,
+    star_segments: wgpu::Buffer,
     geoms: wgpu::Buffer,
     attrs: wgpu::Buffer,
     /// The version of the scene's BVH the buffers hold.
@@ -512,6 +536,7 @@ impl GpuRenderer {
                 storage_entry(2, true),
                 storage_entry(3, true),
                 storage_entry(4, true),
+                storage_entry(5, true),
             ],
         });
         let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -656,11 +681,9 @@ impl GpuRenderer {
         let geoms_buf = mk_growing("hot geoms", bytemuck::cast_slice(&packed.geoms));
         let attrs_buf = mk_growing("cold attrs", bytemuck::cast_slice(&packed.attrs));
         let mats_buf = mk("materials", bytemuck::cast_slice(&packed.materials));
-        let stars_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("stars"),
-            contents: bytemuck::cast_slice(&packed.stars),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
+        // A scene's stars can change with each edit (a pilot's worldline grows): room to grow.
+        let stars_buf = mk_growing("stars", bytemuck::cast_slice(&packed.stars));
+        let segs_buf = mk_growing("star segments", bytemuck::cast_slice(&packed.star_segments));
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scene bind group"),
@@ -686,6 +709,10 @@ impl GpuRenderer {
                     binding: 4,
                     resource: stars_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: segs_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -696,6 +723,7 @@ impl GpuRenderer {
             num_stars: packed.num_stars,
             nodes: nodes_buf,
             stars: stars_buf,
+            star_segments: segs_buf,
             geoms: geoms_buf,
             attrs: attrs_buf,
             version: packed.version,
@@ -714,7 +742,12 @@ impl GpuRenderer {
             && fits(&bufs.nodes, n, size_of::<GpuNode>())
             && fits(&bufs.geoms, p, size_of::<GpuGeom>())
             && fits(&bufs.attrs, p, size_of::<GpuAttr>())
-            && scene.stars.len() as u32 == bufs.num_stars
+            && fits(&bufs.stars, scene.stars.len(), size_of::<GpuStar>())
+            && fits(
+                &bufs.star_segments,
+                scene.stars.iter().map(|s| s.segments.len()).sum(),
+                size_of::<GpuStarSegment>(),
+            )
         {
             let (nodes, prims) = bvh.dirty();
             write_ranges(&self.queue, &bufs.nodes, nodes, |i| GpuNode::pack(&bvh.nodes()[i]));
@@ -722,10 +755,10 @@ impl GpuRenderer {
             write_ranges(&self.queue, &bufs.attrs, prims, |i| GpuAttr::pack(bvh.leaf_simplex(i)));
             bufs.num_nodes = n as u32;
             bufs.version = bvh.version();
-            if bufs.num_stars > 0 {
-                let stars: Vec<GpuStar> = scene.stars.iter().map(GpuStar::pack).collect();
-                self.queue.write_buffer(&bufs.stars, 0, bytemuck::cast_slice(&stars));
-            }
+            let (stars, segs) = pack_stars(&scene.stars);
+            self.queue.write_buffer(&bufs.stars, 0, bytemuck::cast_slice(&stars));
+            self.queue.write_buffer(&bufs.star_segments, 0, bytemuck::cast_slice(&segs));
+            bufs.num_stars = stars.len() as u32;
             return;
         }
         *bufs = Self::upload_scene(&self.device, &self.queue, &self.scene_layout, scene);
@@ -1001,6 +1034,7 @@ mod tests {
         check("Geom", size_of::<GpuGeom>(), &[]);
         check("Material", size_of::<GpuMaterial>(), &[]);
         check("Star", size_of::<GpuStar>(), &[("params", offset_of!(GpuStar, params))]);
+        check("StarSegment", size_of::<GpuStarSegment>(), &[("range", offset_of!(GpuStarSegment, range))]);
     }
 
     /// Flash lighting through the per-frame uniform block must match the CPU reference. The

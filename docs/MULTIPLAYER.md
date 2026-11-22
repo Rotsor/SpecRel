@@ -83,8 +83,7 @@ one sent in `Track` messages) and the hull centre's (what bodies collide with in
 and what is drawn). Every replica computes the hull's track from the pilot's as it records it
 (`Ship::record`), in plain `f32` arithmetic with `sqrt` as the only function, so both replicas
 get the same bits. The other player's ship is drawn as an open cage along the hull track, with
-the pilot's clock cube inside it on the pilot's track, so you can see where its decisions are
-made.
+the pilot inside it as a star on the pilot's track, so you can see where its decisions are made.
 
 **The hull is drawn past the pilot's latest event.** Pacing keeps you outside `I⁺(O_remote)` of
 the remote *pilot*, but the hull reaches `SHIP_RADIUS` and more from it, and your past cone meets

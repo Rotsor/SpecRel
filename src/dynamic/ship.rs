@@ -350,10 +350,10 @@ impl Ship {
         bars
     }
 
-    /// What other players see of the pilot: a small clock cube (so they can read this player's
-    /// proper time), where the decisions are made.
-    pub fn pilot_mesh() -> Mesh3D {
-        Mesh3D::cube(Vec3::splat(PILOT_HALF_EXTENT))
+    /// The color other players see the pilot's star in, as a blackbody temperature: blue-white
+    /// for player 0, orange for player 1, and so on.
+    pub fn star_temperature(&self) -> f32 {
+        [9500.0, 3300.0, 5200.0, 16000.0][self.player as usize % 4]
     }
 
     /// Clock-face material: cyan bezel for player 0, coral for player 1, and so on.
@@ -378,9 +378,6 @@ const AHEAD_STEP: f32 = 1.0 / 30.0;
 ///
 /// [`pod_delay`]: super::helm::pod_delay
 const MAX_AHEAD_STEPS: usize = 40;
-
-/// Half the side of the pilot's clock cube. It fits inside the pod's range of motion.
-const PILOT_HALF_EXTENT: f32 = 0.07;
 
 /// Add `part`, shifted by `offset`, to `mesh`.
 fn append(mesh: &mut Mesh3D, part: &Mesh3D, offset: Vec3) {

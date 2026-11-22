@@ -225,7 +225,6 @@ fn bench_scene_rebuild_near_a_control_pod() {
         dynamic::SCENE_PULSES,
         dynamic::SCENE_HULL_AHEAD,
         dynamic::SCENE_HULL,
-        dynamic::SCENE_PILOT,
     ];
     let cfg = RenderConfig {
         width: RENDER_SIZE.0,

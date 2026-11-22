@@ -97,11 +97,15 @@ struct Attr {
     decided_at: vec4<f32>,
 };
 
-// A light-emitting point (`star::PointStar`).
+// A light-emitting point (`star::PointStar`) and the pieces of its worldline.
 struct Star {
+    params: vec4<f32>, // (temperature, color_norm, bitcast(first segment), bitcast(segment count))
+};
+
+struct StarSegment {
     event: vec4<f32>,
     four_vel: vec4<f32>,
-    params: vec4<f32>, // (temperature, color_norm, 0, 0)
+    range: vec4<f32>, // (s_min, s_max, 0, 0)
 };
 
 struct Material {
@@ -115,6 +119,7 @@ struct Material {
 @group(0) @binding(2) var<storage, read> attrs: array<Attr>;
 @group(0) @binding(3) var<storage, read> materials: array<Material>;
 @group(0) @binding(4) var<storage, read> stars: array<Star>;
+@group(0) @binding(5) var<storage, read> star_segments: array<StarSegment>;
 
 @group(1) @binding(0) var<uniform> u: Uniforms;
 // [0, 4096): gamma LUT (u8 values), then 14 glyphs x 7 rows of 5x7 font bits.
@@ -943,24 +948,67 @@ fn blackbody_rgb(temperature: f32) -> vec3<f32> {
     );
 }
 
-// Mirrors `star::worldline_cone_event`.
-fn worldline_cone_event(st: Star, origin: vec4<f32>, e0: vec4<f32>, cone: f32) -> vec4<f32> {
-    let d0 = st.event - origin;
-    let uu = st.four_vel;
-    var s: f32;
+// Mirrors `star::segment_cone_crossing`.
+fn segment_cone_crossing(seg: StarSegment, origin: vec4<f32>, e0: vec4<f32>, cone: f32) -> f32 {
+    let d0 = seg.event - origin;
+    let uu = seg.four_vel;
     if cone == 0.0 {
-        s = mdot(d0, e0) / -mdot(uu, e0);
-    } else {
-        let a = mdot(d0, d0);
-        let b = mdot(d0, uu);
-        let sq = sqrt(max(b * b + a, 0.0));
-        if cone < 0.0 {
-            s = select(b - sq, -a / (b + sq), b > 0.0);
+        return mdot(d0, e0) / -mdot(uu, e0);
+    }
+    let a = mdot(d0, d0);
+    let b = mdot(d0, uu);
+    let sq = sqrt(max(b * b + a, 0.0));
+    if cone < 0.0 {
+        return select(b - sq, -a / (b + sq), b > 0.0);
+    }
+    return select(b + sq, -a / (b - sq), b < 0.0);
+}
+
+// Mirrors `star::past_the_cone`.
+fn past_the_cone(event: vec4<f32>, origin: vec4<f32>, e0: vec4<f32>, cone: f32) -> f32 {
+    let d = event - origin;
+    let tau = -mdot(d, e0);
+    if cone == 0.0 {
+        return tau;
+    }
+    return tau - cone * sqrt(max(mdot(d, d) + tau * tau, 0.0));
+}
+
+struct ConeEvent {
+    found: bool,
+    d: vec4<f32>,
+    u: vec4<f32>,
+};
+
+// Mirrors `star::worldline_cone_event`: binary search for the last segment starting before
+// the cone (or the first), then the crossing on it, if within it.
+fn worldline_cone_event(st: Star, origin: vec4<f32>, e0: vec4<f32>, cone: f32) -> ConeEvent {
+    var r: ConeEvent;
+    r.found = false;
+    let first = bitcast<u32>(st.params.z);
+    let count = bitcast<u32>(st.params.w);
+    if count == 0u {
+        return r;
+    }
+    // partition_point: the number of segments that start before the cone.
+    var lo = 0u;
+    var hi = count;
+    while lo < hi {
+        let mid = (lo + hi) / 2u;
+        if past_the_cone(star_segments[first + mid].event, origin, e0, cone) <= 0.0 {
+            lo = mid + 1u;
         } else {
-            s = select(b + sq, -a / (b - sq), b < 0.0);
+            hi = mid;
         }
     }
-    return d0 + uu * s;
+    let seg = star_segments[first + max(lo, 1u) - 1u];
+    let s = segment_cone_crossing(seg, origin, e0, cone);
+    if s >= seg.range.x && s <= seg.range.y {
+        r.found = true;
+        r.d = seg.event - origin + seg.four_vel * s;
+        r.u = seg.four_vel;
+    }
+    return r;
 }
 
 // Mirrors `star::star_light`: the light of every star whose event on the ray's cone passes
@@ -970,7 +1018,11 @@ fn star_light(origin: vec4<f32>, dir: vec4<f32>, e0: vec4<f32>, cone: f32, width
     var total = vec3<f32>(0.0);
     for (var i = 0u; i < u.num_stars; i++) {
         let st = stars[i];
-        let d = worldline_cone_event(st, origin, e0, cone);
+        let ce = worldline_cone_event(st, origin, e0, cone);
+        if !ce.found {
+            continue;
+        }
+        let d = ce.d;
         let tau = -mdot(d, e0);
         let r = d + e0 * (-tau);
         let along = mdot(r, n);
@@ -989,7 +1041,7 @@ fn star_light(origin: vec4<f32>, dir: vec4<f32>, e0: vec4<f32>, cone: f32, width
         var doppler = 1.0;
         if cone < 0.0 {
             let lambda = sqrt(max(mdot(r, r), 0.0));
-            let du = mdot(d, st.four_vel);
+            let du = mdot(d, ce.u);
             if du > 0.0 {
                 doppler = lambda / du;
             }

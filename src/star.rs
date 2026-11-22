@@ -1,4 +1,5 @@
-//! Light-emitting points ("stars"): size-less isotropic emitters on inertial worldlines.
+//! Light-emitting points ("stars"): size-less isotropic emitters on piecewise-inertial
+//! worldlines.
 //!
 //! A point has no area, so a ray almost never hits one. Instead every ray carries a
 //! **footprint** ([`RayFootprint`]): the width `W(lambda) = width + spread * lambda` of the
@@ -24,6 +25,13 @@
 //! curved mirror of radius `R` adds `-+2 W / R` to `spread`; see Amanatides' ray cones), and
 //! the star seen in it comes out right, dimmed or brightened by the beam's spreading.
 //!
+//! A star's worldline is a chain of straight segments ([`StarSegment`]); an inertial star is
+//! one unbounded segment, a ship's pilot a polyline through its recorded events that ends at
+//! the last one known. Along a timelike worldline, whether an event lies before a ray's cone
+//! (past cone, future cone or simultaneity slice) changes exactly once, so a ray finds the one
+//! segment its cone crosses by binary search, and a worldline that ends before the cone (or
+//! starts after it) is simply not seen.
+//!
 //! Relativity: on the past light cone the star's light is Doppler shifted by
 //! `D = (k . u_cam) / (k . u_star)`; the observed spectrum of a blackbody of temperature `T` is
 //! a blackbody of temperature `D T` ([`blackbody_rgb`]), so approaching stars turn blue and
@@ -41,13 +49,25 @@ pub const KERNEL_CUTOFF_SIGMAS: f32 = 4.0;
 /// White point of [`blackbody_rgb`]: a blackbody at this temperature is neutral white.
 pub const WHITE_POINT_K: f32 = 6504.0;
 
-/// A size-less light source moving inertially: `X(s) = event + s * four_velocity`.
+/// Bound of an unbounded segment's proper-time range (kept finite for the shader).
+pub const UNBOUNDED: f32 = 1e30;
+
+/// A straight piece of a star's worldline: `X(s) = event + s * four_velocity` for
+/// `s_min <= s <= s_max` (proper time from `event`).
 #[derive(Clone, Copy, Debug)]
-pub struct PointStar {
-    /// Any event on the star's worldline.
+pub struct StarSegment {
     pub event: Vec4,
-    /// The star's (unit, future-pointing) four-velocity.
+    /// Unit, future-pointing.
     pub four_velocity: Vec4,
+    pub s_min: f32,
+    pub s_max: f32,
+}
+
+/// A size-less light source. Its segments are in time order, each starting where the last
+/// ended.
+#[derive(Clone, Debug)]
+pub struct PointStar {
+    pub segments: Vec<StarSegment>,
     /// Rest-frame blackbody temperature in kelvin; it sets the star's color.
     pub temperature: f32,
     /// Rest-frame intensity (power per steradian, isotropic): at rest, at distance `r`, the
@@ -61,14 +81,34 @@ impl PointStar {
         Self::moving(pos, Vec3::default(), temperature, intensity)
     }
 
-    /// A star passing through `pos` at `t = 0` with 3-velocity `beta`.
+    /// A star passing through `pos` at `t = 0` with 3-velocity `beta`, forever.
     pub fn moving(pos: Vec3, beta: Vec3, temperature: f32, intensity: f32) -> Self {
-        Self {
+        let segment = StarSegment {
             event: Vec4::from_time_space(0.0, pos),
             four_velocity: Vec4::four_velocity_from_beta(beta),
-            temperature,
-            intensity,
-        }
+            s_min: -UNBOUNDED,
+            s_max: UNBOUNDED,
+        };
+        Self { segments: vec![segment], temperature, intensity }
+    }
+
+    /// A star on the polyline through `events` (in time order, timelike-separated), from the
+    /// first to the last: it doesn't exist before or after them.
+    pub fn along(events: &[Vec4], temperature: f32, intensity: f32) -> Self {
+        let segments = events
+            .windows(2)
+            .filter_map(|w| {
+                let d = w[1] - w[0];
+                let s = (-d.minkowski_norm_sq()).max(0.0).sqrt();
+                (s > 1e-6 && d.t > 0.0).then(|| StarSegment {
+                    event: w[0],
+                    four_velocity: d * (1.0 / s),
+                    s_min: 0.0,
+                    s_max: s,
+                })
+            })
+            .collect();
+        Self { segments, temperature, intensity }
     }
 
     /// Scale from `blackbody_rgb(D * temperature)` to observed radiance-weighted color:
@@ -139,36 +179,59 @@ pub fn blackbody_rgb(temperature: f32) -> Vec3 {
     )
 }
 
-/// Where a star's worldline crosses the cone of rays `k = cone * e0 + n` (`|n| = 1` in the
+/// Where along `seg`'s line it crosses the cone of rays `k = cone * e0 + n` (`|n| = 1` in the
 /// frame `e0`) from `origin`: `cone = -1` is the past light cone, `+1` the future one, `0` the
-/// simultaneity hyperplane. Returns the star's displacement from `origin` there.
-pub fn worldline_cone_event(star: &PointStar, origin: Vec4, e0: Vec4, cone: f32) -> Vec4 {
-    let d0 = star.event - origin;
-    let u = star.four_velocity;
-    let s = if cone == 0.0 {
+/// simultaneity hyperplane. Returns the proper time `s` from `seg.event` there.
+pub fn segment_cone_crossing(seg: &StarSegment, origin: Vec4, e0: Vec4, cone: f32) -> f32 {
+    let d0 = seg.event - origin;
+    let u = seg.four_velocity;
+    if cone == 0.0 {
         // Frame time -<D, e0> = 0.
         let tau0 = -d0.minkowski_dot(e0);
         let gamma = -u.minkowski_dot(e0);
-        -tau0 / gamma
-    } else {
-        // <D0 + s u, D0 + s u> = 0  <=>  s^2 - 2 b s - a = 0; the earlier root is on the past
-        // cone, the later on the future one. Each in the form that doesn't cancel.
-        let a = d0.minkowski_norm_sq();
-        let b = d0.minkowski_dot(u);
-        let sq = (b * b + a).max(0.0).sqrt();
-        if cone < 0.0 {
-            if b > 0.0 {
-                -a / (b + sq)
-            } else {
-                b - sq
-            }
-        } else if b < 0.0 {
-            -a / (b - sq)
+        return -tau0 / gamma;
+    }
+    // <D0 + s u, D0 + s u> = 0  <=>  s^2 - 2 b s - a = 0; the earlier root is on the past cone,
+    // the later on the future one. Each in the form that doesn't cancel.
+    let a = d0.minkowski_norm_sq();
+    let b = d0.minkowski_dot(u);
+    let sq = (b * b + a).max(0.0).sqrt();
+    if cone < 0.0 {
+        if b > 0.0 {
+            -a / (b + sq)
         } else {
-            b + sq
+            b - sq
         }
-    };
-    d0 + u * s
+    } else if b < 0.0 {
+        -a / (b - sq)
+    } else {
+        b + sq
+    }
+}
+
+/// How far `event` is past the cone from `origin`: `tau - cone * rho` in the frame `e0`
+/// (frame time `tau`, distance `rho`). It increases along any timelike worldline.
+#[inline]
+pub fn past_the_cone(event: Vec4, origin: Vec4, e0: Vec4, cone: f32) -> f32 {
+    let d = event - origin;
+    let tau = -d.minkowski_dot(e0);
+    if cone == 0.0 {
+        return tau;
+    }
+    let rho = (d.minkowski_norm_sq() + tau * tau).max(0.0).sqrt();
+    tau - cone * rho
+}
+
+/// The star's displacement from `origin` where its worldline crosses the cone, and its
+/// four-velocity there, if it exists there: the last segment that starts before the cone (or
+/// the first) holds the crossing.
+pub fn worldline_cone_event(star: &PointStar, origin: Vec4, e0: Vec4, cone: f32) -> Option<(Vec4, Vec4)> {
+    let segs = &star.segments;
+    let before = segs.partition_point(|seg| past_the_cone(seg.event, origin, e0, cone) <= 0.0);
+    let seg = segs.get(before.max(1) - 1)?;
+    let s = segment_cone_crossing(seg, origin, e0, cone);
+    let u = seg.four_velocity;
+    (s >= seg.s_min && s <= seg.s_max).then(|| (seg.event - origin + u * s, u))
 }
 
 /// The light of `stars` a ray segment picks up: the ray leaves `origin` along
@@ -186,7 +249,9 @@ pub fn star_light(
     let n = dir - e0 * cone;
     let mut total = Vec3::default();
     for star in stars {
-        let d = worldline_cone_event(star, origin, e0, cone);
+        let Some((d, u)) = worldline_cone_event(star, origin, e0, cone) else {
+            continue;
+        };
         let tau = -d.minkowski_dot(e0);
         let r = d + e0 * (-tau); // d = tau e0 + r
         let along = r.minkowski_dot(n);
@@ -206,7 +271,7 @@ pub fn star_light(
         // seen by e0 over that seen by the star, `<D, e0> / <D, u>` for D on the past cone.
         let doppler = if cone < 0.0 {
             let lambda = (r.minkowski_norm_sq()).max(0.0).sqrt();
-            let du = d.minkowski_dot(star.four_velocity);
+            let du = d.minkowski_dot(u);
             if du > 0.0 {
                 lambda / du
             } else {
@@ -275,12 +340,12 @@ mod tests {
         let star = PointStar::moving(Vec3::new(3.0, 1.0, -4.0), Vec3::new(0.5, 0.0, 0.3), 5000.0, 1.0);
         let origin = Vec4::new(7.0, 0.5, 0.0, 0.0);
         let e0 = Vec4::new(1.0, 0.0, 0.0, 0.0);
-        let d = worldline_cone_event(&star, origin, e0, -1.0);
+        let d = worldline_cone_event(&star, origin, e0, -1.0).unwrap().0;
         assert!(d.minkowski_norm_sq().abs() < 1e-3);
         assert!(d.t < 0.0);
-        let f = worldline_cone_event(&star, origin, e0, 1.0);
+        let f = worldline_cone_event(&star, origin, e0, 1.0).unwrap().0;
         assert!(f.minkowski_norm_sq().abs() < 1e-3 && f.t > 0.0);
-        let s = worldline_cone_event(&star, origin, e0, 0.0);
+        let s = worldline_cone_event(&star, origin, e0, 0.0).unwrap().0;
         assert!(s.t.abs() < 1e-4);
     }
 
@@ -308,6 +373,31 @@ mod tests {
             let expected = 1.0 / (r * r);
             assert!((flux / expected - 1.0).abs() < 0.01, "offset ({ox},{oy}): {flux} vs {expected}");
         }
+    }
+
+    /// A polyline star is seen on whichever segment the cone crosses, and not at all once the
+    /// cone passes its last event (nothing is known of it there yet).
+    #[test]
+    fn polyline_star_is_found_by_segment_and_ends_at_its_last_event() {
+        // At rest at x = 5 until t = 2, then at 0.5c along +y until t = 6.
+        let events = [
+            Vec4::new(-30.0, 5.0, 0.0, 0.0),
+            Vec4::new(2.0, 5.0, 0.0, 0.0),
+            Vec4::new(6.0, 5.0, 2.0, 0.0),
+        ];
+        let star = PointStar::along(&events, 5000.0, 1.0);
+        let e0 = Vec4::new(1.0, 0.0, 0.0, 0.0);
+        let at = |t: f32| worldline_cone_event(&star, Vec4::new(t, 0.0, 0.0, 0.0), e0, -1.0);
+        // Seen at rest (light left at t = 3 - 5 = -2).
+        let (d, u) = at(3.0).unwrap();
+        assert!((d.x - 5.0).abs() < 1e-4 && d.y.abs() < 1e-4 && (u.t - 1.0).abs() < 1e-5);
+        // Seen moving: light from t in (2, 6).
+        let (d, u) = at(9.0).unwrap();
+        assert!(d.y > 0.0 && d.y < 2.0 && u.y > 0.0 && d.minkowski_norm_sq().abs() < 1e-3);
+        // The past cone of t = 20 crosses the worldline after t = 6: unknown, unseen.
+        assert!(at(20.0).is_none());
+        // Before the first event: unseen too.
+        assert!(at(-40.0).is_none());
     }
 
     #[test]
