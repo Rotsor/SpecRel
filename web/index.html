@@ -984,7 +984,6 @@
               { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
               { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
               { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-              { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
             ],
           });
 
@@ -1106,13 +1105,9 @@
               `scene ${i} stars`,
               wasmBytes(wasm, wasm.web_scene_stars_ptr(i), wasm.web_scene_stars_byte_len(i))
             );
-            const starSegsBuf = createStorageBuffer(
-              `scene ${i} star segments`,
-              wasmBytes(wasm, wasm.web_scene_star_segments_ptr(i), wasm.web_scene_star_segments_byte_len(i))
-            );
 
             for (const old of sceneBuffers[i] || []) old.destroy();
-            sceneBuffers[i] = [nodesBuf, geomsBuf, attrsBuf, matsBuf, starsBuf, starSegsBuf];
+            sceneBuffers[i] = [nodesBuf, geomsBuf, attrsBuf, matsBuf, starsBuf];
             return device.createBindGroup({
               label: `scene ${i} bind group`,
               layout: sceneLayout,
@@ -1122,7 +1117,6 @@
                 { binding: 2, resource: { buffer: attrsBuf } },
                 { binding: 3, resource: { buffer: matsBuf } },
                 { binding: 4, resource: { buffer: starsBuf } },
-                { binding: 5, resource: { buffer: starSegsBuf } },
               ],
             });
           };

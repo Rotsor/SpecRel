@@ -97,9 +97,12 @@ struct Attr {
     decided_at: vec4<f32>,
 };
 
-// A light-emitting point (`star::PointStar`) and the pieces of its worldline.
+// A light-emitting point (`star::PointStar`) and the pieces of its worldline, packed into one
+// buffer (`gpu::pack_stars`) to stay within WebGPU's default 8 storage buffers per stage:
+// `u.num_stars` headers `(temperature, color_norm, bitcast(first segment), bitcast(count))`,
+// then the segments, 3 vec4s each, `first` counting from the end of the headers.
 struct Star {
-    params: vec4<f32>, // (temperature, color_norm, bitcast(first segment), bitcast(segment count))
+    params: vec4<f32>,
 };
 
 struct StarSegment {
@@ -118,8 +121,7 @@ struct Material {
 @group(0) @binding(1) var<storage, read> geoms: array<Geom>;
 @group(0) @binding(2) var<storage, read> attrs: array<Attr>;
 @group(0) @binding(3) var<storage, read> materials: array<Material>;
-@group(0) @binding(4) var<storage, read> stars: array<Star>;
-@group(0) @binding(5) var<storage, read> star_segments: array<StarSegment>;
+@group(0) @binding(4) var<storage, read> star_data: array<vec4<f32>>;
 
 @group(1) @binding(0) var<uniform> u: Uniforms;
 // [0, 4096): gamma LUT (u8 values), then 14 glyphs x 7 rows of 5x7 font bits.
@@ -974,6 +976,15 @@ fn past_the_cone(event: vec4<f32>, origin: vec4<f32>, e0: vec4<f32>, cone: f32) 
     return tau - cone * sqrt(max(mdot(d, d) + tau * tau, 0.0));
 }
 
+fn star_at(i: u32) -> Star {
+    return Star(star_data[i]);
+}
+
+fn star_segment(i: u32) -> StarSegment {
+    let base = u.num_stars + 3u * i;
+    return StarSegment(star_data[base], star_data[base + 1u], star_data[base + 2u]);
+}
+
 struct ConeEvent {
     found: bool,
     d: vec4<f32>,
@@ -995,13 +1006,13 @@ fn worldline_cone_event(st: Star, origin: vec4<f32>, e0: vec4<f32>, cone: f32) -
     var hi = count;
     while lo < hi {
         let mid = (lo + hi) / 2u;
-        if past_the_cone(star_segments[first + mid].event, origin, e0, cone) <= 0.0 {
+        if past_the_cone(star_segment(first + mid).event, origin, e0, cone) <= 0.0 {
             lo = mid + 1u;
         } else {
             hi = mid;
         }
     }
-    let seg = star_segments[first + max(lo, 1u) - 1u];
+    let seg = star_segment(first + max(lo, 1u) - 1u);
     let s = segment_cone_crossing(seg, origin, e0, cone);
     if s >= seg.range.x && s <= seg.range.y {
         r.found = true;
@@ -1017,7 +1028,7 @@ fn star_light(origin: vec4<f32>, dir: vec4<f32>, e0: vec4<f32>, cone: f32, width
     let n = dir - e0 * cone;
     var total = vec3<f32>(0.0);
     for (var i = 0u; i < u.num_stars; i++) {
-        let st = stars[i];
+        let st = star_at(i);
         let ce = worldline_cone_event(st, origin, e0, cone);
         if !ce.found {
             continue;
