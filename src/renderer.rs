@@ -2,6 +2,7 @@ use crate::hud::glyph_5x7;
 use crate::mesh4d::{HitRecord4D, Material, SurfacePattern, DECIDED_AT_STATIC};
 use crate::minkowski::{rest_frame_cos, Tetrad, Vec3, Vec4};
 use crate::scene::Scene4D;
+use crate::star::{star_light, RayFootprint};
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::sync::OnceLock;
@@ -346,10 +347,21 @@ pub fn render_frame(
         SliceMode::ProphecySlice => camera.position + camera.tetrad.e[0] * cfg.prophecy_delta,
     };
 
+    // Rays from the camera's eye run along `cone * e0 + n`; the stars are found on that cone.
+    let cone = match cfg.slice_mode {
+        SliceMode::PastLightCone => -1.0,
+        SliceMode::Frontier => 1.0,
+        SliceMode::CameraSimultaneity | SliceMode::ProphecySlice => 0.0,
+    };
+    let e0 = camera.tetrad.e[0];
+    let draw_stars = cfg.mode == RenderMode::RelativisticShaded && !scene.stars.is_empty();
+    let pixel_pitch = 2.0 * half_h / h as f32;
+
+    let mut hdr = vec![Vec3::default(); w * h];
     #[cfg(not(target_arch = "wasm32"))]
-    let rows = framebuffer.par_chunks_mut(w);
+    let rows = hdr.par_chunks_mut(w);
     #[cfg(target_arch = "wasm32")]
-    let rows = framebuffer.chunks_mut(w);
+    let rows = hdr.chunks_mut(w);
 
     rows
         .enumerate()
@@ -371,9 +383,9 @@ pub fn render_frame(
                     SliceMode::Frontier => camera.tetrad.future_light_ray_direction(local_dir),
                 };
 
-                let color = if let Some(hit) = scene.bvh.trace(ray_origin, ray_dir, 1e-3, 180.0)
-                {
-                    let shaded = shade_hit(scene, camera, cfg, dynamics, ray_dir, &hit);
+                let hit = scene.bvh.trace(ray_origin, ray_dir, 1e-3, 180.0);
+                let mut color = if let Some(hit) = &hit {
+                    let shaded = shade_hit(scene, camera, cfg, dynamics, ray_dir, hit);
                     if haze_origins.is_empty() {
                         shaded
                     } else {
@@ -382,10 +394,21 @@ pub fn render_frame(
                 } else {
                     shade_sky(ray_dir)
                 };
-
-                *pixel = pack_rgb_with_lut(color, lut);
+                if draw_stars {
+                    let footprint = RayFootprint::camera_pixel(pixel_pitch, sx, sy);
+                    let lambda_max = hit.as_ref().map_or(f32::INFINITY, |h| h.lambda);
+                    color += star_light(
+                        &scene.stars, ray_origin, ray_dir, e0, cone, footprint, lambda_max,
+                    );
+                }
+                *pixel = color;
             }
         });
+
+    crate::bloom::apply(&mut hdr, w, h);
+    for (pixel, &c) in framebuffer.iter_mut().zip(&hdr) {
+        *pixel = pack_rgb_with_lut(c, lut);
+    }
 }
 
 fn shade_hit(

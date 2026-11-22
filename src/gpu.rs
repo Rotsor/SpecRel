@@ -17,7 +17,10 @@ use crate::renderer::{
     gamma_lut, Camera4D, FrameDynamics, RenderConfig, RenderMode, ShadowMode, SliceMode,
     MAX_FLASHES, MAX_HAZE_ORIGINS,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use crate::bloom::BLOOM_LEVELS;
 use crate::scene::Scene4D;
+use crate::star::PointStar;
 use bytemuck::{Pod, Zeroable};
 #[cfg(not(target_arch = "wasm32"))]
 use wgpu::util::DeviceExt;
@@ -96,6 +99,26 @@ pub(crate) struct GpuMaterial {
     pub(crate) params: [f32; 4],
 }
 
+/// A light-emitting point ([`PointStar`]).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct GpuStar {
+    pub(crate) event: [f32; 4],
+    pub(crate) four_vel: [f32; 4],
+    /// `(temperature, color_norm, 0, 0)`.
+    pub(crate) params: [f32; 4],
+}
+
+impl GpuStar {
+    fn pack(s: &PointStar) -> Self {
+        Self {
+            event: v4(s.event),
+            four_vel: v4(s.four_velocity),
+            params: [s.temperature, s.color_norm(), 0.0, 0.0],
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(crate) struct GpuUniforms {
@@ -114,7 +137,8 @@ pub(crate) struct GpuUniforms {
     pub(crate) frontier_tau: f32,
     pub(crate) prophecy_delta: f32,
     pub(crate) num_haze: u32,
-    pub(crate) _pad: [u32; 3],
+    pub(crate) num_stars: u32,
+    pub(crate) _pad: [u32; 2],
     pub(crate) haze_origin: [[f32; 4]; MAX_HAZE_ORIGINS],
     pub(crate) flash_at: [[f32; 4]; MAX_FLASHES],
     pub(crate) flash_col_width: [[f32; 4]; MAX_FLASHES],
@@ -127,6 +151,7 @@ impl GpuUniforms {
         dynamics: &FrameDynamics,
         num_nodes: u32,
         light_pos: [f32; 4],
+        num_stars: u32,
     ) -> Self {
         let (w, h) = (cfg.width, cfg.height);
         let aspect = w as f32 / h as f32;
@@ -178,7 +203,8 @@ impl GpuUniforms {
             frontier_tau: frontier.proper_time,
             prophecy_delta: cfg.prophecy_delta,
             num_haze: haze.len().min(MAX_HAZE_ORIGINS) as u32,
-            _pad: [0; 3],
+            num_stars,
+            _pad: [0; 2],
             haze_origin,
             flash_at,
             flash_col_width,
@@ -211,6 +237,8 @@ pub(crate) struct PackedSceneGpuData {
     pub(crate) attrs: Vec<GpuAttr>,
     pub(crate) materials: Vec<GpuMaterial>,
     pub(crate) light_pos: [f32; 4],
+    pub(crate) stars: Vec<GpuStar>,
+    pub(crate) num_stars: u32,
     /// The version of the scene's BVH the arrays were packed from.
     version: BvhVersion,
 }
@@ -247,7 +275,10 @@ impl PackedSceneGpuData {
             .collect();
 
         let lp = scene.light_pos;
+        let stars: Vec<GpuStar> = scene.stars.iter().map(GpuStar::pack).collect();
         Self {
+            num_stars: stars.len() as u32,
+            stars: non_empty(stars),
             nodes: non_empty(nodes),
             num_nodes,
             geoms: non_empty(geoms),
@@ -278,6 +309,8 @@ impl PackedSceneGpuData {
         patch(&mut self.attrs, p, prims, |i| GpuAttr::pack(bvh.leaf_simplex(i)));
         self.num_nodes = bvh.nodes().len() as u32;
         self.version = v;
+        self.num_stars = scene.stars.len() as u32;
+        self.stars = non_empty(scene.stars.iter().map(GpuStar::pack).collect());
         true
     }
 }
@@ -353,7 +386,9 @@ struct SceneBuffers {
     bind_group: wgpu::BindGroup,
     num_nodes: u32,
     light_pos: [f32; 4],
+    num_stars: u32,
     nodes: wgpu::Buffer,
+    stars: wgpu::Buffer,
     geoms: wgpu::Buffer,
     attrs: wgpu::Buffer,
     /// The version of the scene's BVH the buffers hold.
@@ -366,6 +401,8 @@ struct FrameBuffers {
     height: usize,
     output: wgpu::Buffer,
     readback: wgpu::Buffer,
+    /// The HDR image and its bloom pyramid.
+    _hdr: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
 }
 
@@ -398,6 +435,11 @@ pub struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    /// `bloom_down` for levels `1..=BLOOM_LEVELS`.
+    bloom_down: Vec<wgpu::ComputePipeline>,
+    /// `bloom_up` for levels `1..BLOOM_LEVELS`.
+    bloom_up: Vec<wgpu::ComputePipeline>,
+    bloom_composite: wgpu::ComputePipeline,
     scene_layout: wgpu::BindGroupLayout,
     frame_layout: wgpu::BindGroupLayout,
     uniform_buf: wgpu::Buffer,
@@ -469,6 +511,7 @@ impl GpuRenderer {
                 storage_entry(1, true),
                 storage_entry(2, true),
                 storage_entry(3, true),
+                storage_entry(4, true),
             ],
         });
         let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -486,6 +529,7 @@ impl GpuRenderer {
                 },
                 storage_entry(1, true),
                 storage_entry(2, false),
+                storage_entry(3, false),
             ],
         });
 
@@ -494,14 +538,24 @@ impl GpuRenderer {
             bind_group_layouts: &[Some(&scene_layout), Some(&frame_layout)],
             ..Default::default()
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("render pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let make_pipeline = |entry: &str, level: Option<usize>| {
+            let constants = level.map(|k| [("BLOOM_LEVEL", k as f64)]);
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some(entry),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: constants.as_ref().map_or(&[], |c| c.as_slice()),
+                    ..Default::default()
+                },
+                cache: None,
+            })
+        };
+        let pipeline = make_pipeline("main", None);
+        let bloom_down = (1..=BLOOM_LEVELS).map(|k| make_pipeline("bloom_down", Some(k))).collect();
+        let bloom_up = (1..BLOOM_LEVELS).map(|k| make_pipeline("bloom_up", Some(k))).collect();
+        let bloom_composite = make_pipeline("bloom_composite", None);
 
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniforms"),
@@ -551,6 +605,9 @@ impl GpuRenderer {
             device,
             queue,
             pipeline,
+            bloom_down,
+            bloom_up,
+            bloom_composite,
             scene_layout,
             frame_layout,
             uniform_buf,
@@ -599,6 +656,11 @@ impl GpuRenderer {
         let geoms_buf = mk_growing("hot geoms", bytemuck::cast_slice(&packed.geoms));
         let attrs_buf = mk_growing("cold attrs", bytemuck::cast_slice(&packed.attrs));
         let mats_buf = mk("materials", bytemuck::cast_slice(&packed.materials));
+        let stars_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("stars"),
+            contents: bytemuck::cast_slice(&packed.stars),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scene bind group"),
@@ -620,6 +682,10 @@ impl GpuRenderer {
                     binding: 3,
                     resource: mats_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: stars_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -627,7 +693,9 @@ impl GpuRenderer {
             bind_group,
             num_nodes: packed.num_nodes,
             light_pos: packed.light_pos,
+            num_stars: packed.num_stars,
             nodes: nodes_buf,
+            stars: stars_buf,
             geoms: geoms_buf,
             attrs: attrs_buf,
             version: packed.version,
@@ -646,6 +714,7 @@ impl GpuRenderer {
             && fits(&bufs.nodes, n, size_of::<GpuNode>())
             && fits(&bufs.geoms, p, size_of::<GpuGeom>())
             && fits(&bufs.attrs, p, size_of::<GpuAttr>())
+            && scene.stars.len() as u32 == bufs.num_stars
         {
             let (nodes, prims) = bvh.dirty();
             write_ranges(&self.queue, &bufs.nodes, nodes, |i| GpuNode::pack(&bvh.nodes()[i]));
@@ -653,6 +722,10 @@ impl GpuRenderer {
             write_ranges(&self.queue, &bufs.attrs, prims, |i| GpuAttr::pack(bvh.leaf_simplex(i)));
             bufs.num_nodes = n as u32;
             bufs.version = bvh.version();
+            if bufs.num_stars > 0 {
+                let stars: Vec<GpuStar> = scene.stars.iter().map(GpuStar::pack).collect();
+                self.queue.write_buffer(&bufs.stars, 0, bytemuck::cast_slice(&stars));
+            }
             return;
         }
         *bufs = Self::upload_scene(&self.device, &self.queue, &self.scene_layout, scene);
@@ -682,6 +755,12 @@ impl GpuRenderer {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let hdr = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hdr + bloom pyramid"),
+            size: (crate::bloom::pyramid_len(width, height) * 16) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("frame bind group"),
             layout: &self.frame_layout,
@@ -698,6 +777,10 @@ impl GpuRenderer {
                     binding: 2,
                     resource: output.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: hdr.as_entire_binding(),
+                },
             ],
         });
         self.frame = Some(FrameBuffers {
@@ -705,6 +788,7 @@ impl GpuRenderer {
             height,
             output,
             readback,
+            _hdr: hdr,
             bind_group,
         });
     }
@@ -728,7 +812,7 @@ impl GpuRenderer {
         let frame = self.frame.as_ref().expect("frame buffers initialised");
 
         let uniforms =
-            GpuUniforms::build(camera, cfg, dynamics, scene.num_nodes, scene.light_pos);
+            GpuUniforms::build(camera, cfg, dynamics, scene.num_nodes, scene.light_pos, scene.num_stars);
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
@@ -746,14 +830,26 @@ impl GpuRenderer {
                     end_of_pass_write_index: Some(1),
                 }),
             });
-            pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &scene.bind_group, &[]);
             pass.set_bind_group(1, &frame.bind_group, &[]);
-            pass.dispatch_workgroups(
-                (w as u32).div_ceil(WORKGROUP_SIZE),
-                (h as u32).div_ceil(WORKGROUP_SIZE),
-                1,
-            );
+            let mut dispatch = |pipeline: &wgpu::ComputePipeline, level: usize| {
+                let (lw, lh) = crate::bloom::level_size(w, h, level);
+                pass.set_pipeline(pipeline);
+                pass.dispatch_workgroups(
+                    (lw as u32).div_ceil(WORKGROUP_SIZE),
+                    (lh as u32).div_ceil(WORKGROUP_SIZE),
+                    1,
+                );
+            };
+            // Trace into the HDR image, bloom it, tone map it into `output`.
+            dispatch(&self.pipeline, 0);
+            for (k, p) in (1..).zip(&self.bloom_down) {
+                dispatch(p, k);
+            }
+            for (k, p) in self.bloom_up.iter().enumerate().rev() {
+                dispatch(p, k + 1);
+            }
+            dispatch(&self.bloom_composite, 0);
         }
         let size = (w * h * 4) as u64;
         encoder.copy_buffer_to_buffer(&frame.output, 0, &frame.readback, 0, size);
@@ -813,6 +909,30 @@ mod tests {
     use crate::scene::DemoScene;
     use crate::minkowski::Vec3;
 
+    /// The kernel must pass naga's full validation (types, uniformity, bindings), with the
+    /// bloom passes' override constant set as the pipelines set it. On machines without a GPU
+    /// adapter this is the only check the shader gets.
+    #[test]
+    fn wgsl_module_validates() {
+        use wgpu::naga;
+
+        let module = naga::front::wgsl::parse_str(RENDER_WGSL).expect("render.wgsl parses");
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::default(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("render.wgsl fails validation: {e:?}"));
+        for k in 1..=BLOOM_LEVELS {
+            let constants = naga::back::PipelineConstants::from([("BLOOM_LEVEL".to_string(), k as f64)]);
+            naga::back::pipeline_constants::process_overrides(&module, &info, None, &constants)
+                .unwrap_or_else(|e| panic!("BLOOM_LEVEL = {k}: {e:?}"));
+        }
+        for entry in ["main", "bloom_down", "bloom_up", "bloom_composite"] {
+            assert!(module.entry_points.iter().any(|e| e.name == entry), "{entry} missing");
+        }
+    }
+
     /// The Rust `#[repr(C)]` mirrors must match the WGSL struct layouts byte for byte, or the
     /// shader silently reads garbage. Naga computes the WGSL side from the shader source.
     #[test]
@@ -863,6 +983,7 @@ mod tests {
                 ("num_flashes", offset_of!(GpuUniforms, num_flashes)),
                 ("frontier_tau", offset_of!(GpuUniforms, frontier_tau)),
                 ("num_haze", offset_of!(GpuUniforms, num_haze)),
+                ("num_stars", offset_of!(GpuUniforms, num_stars)),
                 ("haze_origin", offset_of!(GpuUniforms, haze_origin)),
                 ("flash_at", offset_of!(GpuUniforms, flash_at)),
                 ("flash_col_width", offset_of!(GpuUniforms, flash_col_width)),
@@ -879,6 +1000,7 @@ mod tests {
         check("Node", size_of::<GpuNode>(), &[]);
         check("Geom", size_of::<GpuGeom>(), &[]);
         check("Material", size_of::<GpuMaterial>(), &[]);
+        check("Star", size_of::<GpuStar>(), &[("params", offset_of!(GpuStar, params))]);
     }
 
     /// Flash lighting through the per-frame uniform block must match the CPU reference. The
@@ -1051,6 +1173,7 @@ mod tests {
             bvh: Bvh4D::build(simplices),
             materials: Scene4D::common_materials(),
             light_pos: Vec3::new(0.0, 6.0, 2.0),
+            stars: Vec::new(),
             t_min: -20.0,
             t_max: 0.0,
         };

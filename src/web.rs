@@ -211,6 +211,7 @@ pub extern "C" fn web_init(gpu_available: u32, mp_player: i32) {
         &app.dynamics,
         packed_scenes[app.scene_idx].num_nodes,
         packed_scenes[app.scene_idx].light_pos,
+        packed_scenes[app.scene_idx].num_stars,
     );
 
     let state = WebState {
@@ -333,6 +334,7 @@ pub extern "C" fn web_step(dt_secs: f32) {
             &app.dynamics,
             packed.num_nodes,
             packed.light_pos,
+            packed.num_stars,
         );
 
         let use_gpu = s.gpu_available && s.use_gpu;
@@ -464,6 +466,36 @@ pub extern "C" fn web_scene_materials_ptr(scene_idx: usize) -> *const u8 {
 #[no_mangle]
 pub extern "C" fn web_scene_materials_byte_len(scene_idx: usize) -> usize {
     with_state(|s| bytemuck::cast_slice::<_, u8>(&s.packed_scenes[scene_idx].materials).len())
+}
+
+#[no_mangle]
+pub extern "C" fn web_scene_stars_ptr(scene_idx: usize) -> *const u8 {
+    with_state(|s| bytemuck::cast_slice(&s.packed_scenes[scene_idx].stars).as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn web_scene_stars_byte_len(scene_idx: usize) -> usize {
+    with_state(|s| bytemuck::cast_slice::<_, u8>(&s.packed_scenes[scene_idx].stars).len())
+}
+
+/// Number of pixels in the HDR image plus its bloom pyramid, for a `width x height` frame
+/// (the HDR buffer holds 16 bytes per pixel).
+#[no_mangle]
+pub extern "C" fn web_bloom_pyramid_len(width: usize, height: usize) -> usize {
+    crate::bloom::pyramid_len(width, height)
+}
+
+/// Size of bloom pyramid level `k` (`0` is the full frame), packed as `width << 16 | height`.
+#[no_mangle]
+pub extern "C" fn web_bloom_level_size(width: usize, height: usize, k: usize) -> u32 {
+    let (w, h) = crate::bloom::level_size(width, height, k);
+    ((w as u32) << 16) | h as u32
+}
+
+/// Number of bloom pyramid levels below full resolution.
+#[no_mangle]
+pub extern "C" fn web_bloom_levels() -> usize {
+    crate::bloom::BLOOM_LEVELS
 }
 
 /// Index of a scene whose packed buffers changed since JS last uploaded them (then cleared), or -1.

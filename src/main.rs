@@ -1,6 +1,7 @@
 pub mod app;
 #[cfg(test)]
 mod bench;
+pub mod bloom;
 pub mod bvh4d;
 pub mod dynamic;
 pub mod gpu;
@@ -12,6 +13,7 @@ pub mod par;
 pub mod perf;
 pub mod renderer;
 pub mod scene;
+pub mod star;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 

@@ -31,6 +31,11 @@ Every relativistic optical and geometric phenomenon—**time dilation**, **Loren
   * **Causal views** (groundwork for the planned Dynamic Mode, see [`docs/DYNAMIC_MODE_PLAN.md`](docs/DYNAMIC_MODE_PLAN.md)): **Frontier** traces rays down the camera's *future* light cone, showing the world exactly as it leaves your reach; **Prophecy** pushes the God's-Eye slice $\Delta$ seconds into your future, where the ball of radius $\Delta$ that you can still influence is drawn as violet haze; the **Causal Decision Age** render mode colours every event by how long ago it became immune to anything you do ($T + R$, i.e. $2R$ for everything you see).
   * **Light flashes** (`/`): emit a spherical light pulse from the camera and watch its wavefront sweep the scene, seen with the extra delay of the light coming back to you.
   * Cycle between **Lorentz-Invariant Null Shadows** ($t_{\text{emit}} = t_{\text{hit}} - \|\mathbf{x}_L - \mathbf{x}_{\text{hit}}\|$), **Camera-Slice Faked Shadows** ($\langle X_{\text{emit}} - X_{\text{hit}}, u_{\text{cam}} \rangle_\eta = 0$), and **Shadows Off**.
+* **Stars: size-less light-emitting points** (`src/star.rs`):
+  * A point star is an inertial worldline with a blackbody temperature. Rays can't hit a point, so every ray carries a **footprint** (a ray cone of width `width + spread·λ`, one pixel's angular pitch for camera rays) and picks up each star that its cone event passes within that width, weighted by a normalized Gaussian of the transverse offset. A star's flux lands in the image exactly once wherever it falls between pixel centres, so it moves smoothly at sub-pixel speeds.
+  * The test runs per ray segment, so a future curved mirror or lens only has to update the footprint where it bends the ray (ray cones), and the star seen in it comes out dimmed or brightened right.
+  * Seen down the past light cone, stars are **Doppler shifted** (a blackbody at $T$ is seen as one at $D\,T$, so approaching stars turn blue and much brighter) and **aberrated** (at high speed they crowd ahead of you).
+  * A linear, energy-conserving **screen-space bloom** (`src/bloom.rs`, a ~$1/r^2$ glare halo from an image pyramid) gives the ~1 px points their apparent size, which grows with brightness as a real star's does.
 
 ---
 

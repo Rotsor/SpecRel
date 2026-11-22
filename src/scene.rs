@@ -4,6 +4,7 @@ use crate::mesh4d::{
     sync_proper_time_at, Material, Mesh3D, Simplex4D, SurfacePattern,
 };
 use crate::minkowski::{Vec3, Vec4};
+use crate::star::{starfield, PointStar};
 
 /// Selectable scenes: five precomputed Special Relativity thought experiments (keys 1-5) and
 /// the causal Dynamic Mode scenes (key 6+), whose geometry grows up to the camera's future light cone.
@@ -152,6 +153,8 @@ pub struct Scene4D {
     pub materials: Vec<Material>,
     /// Spatial position of the stationary point light source's worldline (t_L, light_pos)
     pub light_pos: Vec3,
+    /// Light-emitting points, drawn where the rays' footprints pass them (`crate::star`).
+    pub stars: Vec<PointStar>,
     /// Valid lab-time window [t_min, t_max] of the generated 4D worldtubes
     pub t_min: f32,
     pub t_max: f32,
@@ -168,6 +171,11 @@ impl Scene4D {
             DemoScene::RelativisticCarousel => Self::build_carousel(demo, materials),
             DemoScene::RelativisticBilliards => crate::dynamic::DynWorld::spawn(demo).build_scene(),
         }
+    }
+
+    /// The starry backdrop every demo scene shares.
+    pub fn backdrop_stars() -> Vec<PointStar> {
+        starfield(Vec3::new(0.0, 0.0, 0.0), 90, 60.0, 170.0, 7)
     }
 
     pub fn common_materials() -> Vec<Material> {
@@ -364,6 +372,7 @@ impl Scene4D {
             bvh: Bvh4D::build(all_simplices),
             materials,
             light_pos: Vec3::new(2.0, 6.5, 2.0),
+            stars: Self::backdrop_stars(),
             t_min,
             t_max,
         }
@@ -441,6 +450,7 @@ impl Scene4D {
             bvh: Bvh4D::build(all_simplices),
             materials,
             light_pos: Vec3::new(0.0, 6.0, 1.5),
+            stars: Self::backdrop_stars(),
             t_min,
             t_max,
         }
@@ -553,6 +563,7 @@ impl Scene4D {
             bvh: Bvh4D::build(all_simplices),
             materials,
             light_pos: Vec3::new(0.0, 6.5, 4.0),
+            stars: Self::backdrop_stars(),
             t_min,
             t_max,
         }
@@ -627,6 +638,7 @@ impl Scene4D {
             bvh: Bvh4D::build(all_simplices),
             materials,
             light_pos: Vec3::new(0.0, 6.5, 2.0),
+            stars: Self::backdrop_stars(),
             t_min,
             t_max,
         }
@@ -701,6 +713,7 @@ impl Scene4D {
             bvh: Bvh4D::build(all_simplices),
             materials,
             light_pos: Vec3::new(0.0, 6.8, 3.0),
+            stars: Self::backdrop_stars(),
             t_min,
             t_max,
         }

@@ -573,6 +573,12 @@
         const timestamps = adapter.features.has("timestamp-query");
         const device = await adapter.requestDevice({
           requiredFeatures: timestamps ? ["timestamp-query"] : [],
+          // The HDR image + bloom pyramid is ~21 bytes per pixel: past the default 128 MiB
+          // binding limit at 4K.
+          requiredLimits: {
+            maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+            maxBufferSize: adapter.limits.maxBufferSize,
+          },
         });
         const context = canvas.getContext("webgpu");
         if (!context) return null;
@@ -977,6 +983,7 @@
               { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
               { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
               { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+              { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
             ],
           });
 
@@ -986,19 +993,35 @@
               { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
               { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
               { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+              { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
             ],
           });
 
-          const computePipeline = device.createComputePipeline({
-            label: "render compute pipeline",
-            layout: device.createPipelineLayout({
-              bindGroupLayouts: [sceneLayout, frameLayout],
-            }),
+          // The ray tracer writes the HDR image; the bloom passes run down and back up its
+          // pyramid, one dispatch per level (`BLOOM_LEVEL`); the composite tone maps it.
+          const computeLayout = device.createPipelineLayout({
+            bindGroupLayouts: [sceneLayout, frameLayout],
+          });
+          const makeComputePipeline = (entryPoint, level) => device.createComputePipeline({
+            label: level === undefined ? entryPoint : `${entryPoint} ${level}`,
+            layout: computeLayout,
             compute: {
               module: computeModule,
-              entryPoint: "main",
+              entryPoint,
+              ...(level === undefined ? {} : { constants: { BLOOM_LEVEL: level } }),
             },
           });
+          const bloomLevels = wasm.web_bloom_levels();
+          const computePipeline = makeComputePipeline("main");
+          // [pipeline, level] in dispatch order.
+          const bloomPasses = [];
+          for (let k = 1; k <= bloomLevels; k++) {
+            bloomPasses.push([makeComputePipeline("bloom_down", k), k]);
+          }
+          for (let k = bloomLevels - 1; k >= 1; k--) {
+            bloomPasses.push([makeComputePipeline("bloom_up", k), k]);
+          }
+          bloomPasses.push([makeComputePipeline("bloom_composite"), 0]);
 
           const blitLayout = device.createBindGroupLayout({
             label: "blit layout",
@@ -1078,9 +1101,13 @@
               `scene ${i} materials`,
               wasmBytes(wasm, wasm.web_scene_materials_ptr(i), wasm.web_scene_materials_byte_len(i))
             );
+            const starsBuf = createStorageBuffer(
+              `scene ${i} stars`,
+              wasmBytes(wasm, wasm.web_scene_stars_ptr(i), wasm.web_scene_stars_byte_len(i))
+            );
 
             for (const old of sceneBuffers[i] || []) old.destroy();
-            sceneBuffers[i] = [nodesBuf, geomsBuf, attrsBuf, matsBuf];
+            sceneBuffers[i] = [nodesBuf, geomsBuf, attrsBuf, matsBuf, starsBuf];
             return device.createBindGroup({
               label: `scene ${i} bind group`,
               layout: sceneLayout,
@@ -1089,6 +1116,7 @@
                 { binding: 1, resource: { buffer: geomsBuf } },
                 { binding: 2, resource: { buffer: attrsBuf } },
                 { binding: 3, resource: { buffer: matsBuf } },
+                { binding: 4, resource: { buffer: starsBuf } },
               ],
             });
           };
@@ -1121,6 +1149,7 @@
             context: gpu.context,
             adapterLabel,
             computePipeline,
+            bloomPasses,
             blitPipeline,
             frameLayout,
             blitLayout,
@@ -1134,6 +1163,7 @@
             frameWidth: 0,
             frameHeight: 0,
             outputBuf: null,
+            hdrBuf: null,
             frameBindGroup: null,
             blitBindGroup: null,
           };
@@ -1226,6 +1256,7 @@
         function ensureGpuFrameBuffers(g, w, h) {
           if (g.frameWidth === w && g.frameHeight === h && g.outputBuf) return;
           if (g.outputBuf) g.outputBuf.destroy();
+          if (g.hdrBuf) g.hdrBuf.destroy();
           g.frameWidth = w;
           g.frameHeight = h;
           canvas.width = w;
@@ -1235,6 +1266,11 @@
             size: w * h * 4,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
           });
+          g.hdrBuf = g.device.createBuffer({
+            label: "hdr + bloom pyramid",
+            size: wasm.web_bloom_pyramid_len(w, h) * 16,
+            usage: GPUBufferUsage.STORAGE,
+          });
           g.frameBindGroup = g.device.createBindGroup({
             label: "frame bind group",
             layout: g.frameLayout,
@@ -1242,6 +1278,7 @@
               { binding: 0, resource: { buffer: g.uniformBuf } },
               { binding: 1, resource: { buffer: g.tablesBuf } },
               { binding: 2, resource: { buffer: g.outputBuf } },
+              { binding: 3, resource: { buffer: g.hdrBuf } },
             ],
           });
           g.blitBindGroup = g.device.createBindGroup({
@@ -1337,14 +1374,17 @@
                   endOfPassWriteIndex: 1,
                 },
               } : {});
-              cpass.setPipeline(g.computePipeline);
               cpass.setBindGroup(0, g.sceneBindGroups[sceneIdx]);
               cpass.setBindGroup(1, g.frameBindGroup);
-              cpass.dispatchWorkgroups(
-                Math.ceil(w / WORKGROUP_SIZE),
-                Math.ceil(h / WORKGROUP_SIZE),
-                1
-              );
+              for (const [pipeline, level] of [[g.computePipeline, 0], ...g.bloomPasses]) {
+                const size = wasm.web_bloom_level_size(w, h, level);
+                cpass.setPipeline(pipeline);
+                cpass.dispatchWorkgroups(
+                  Math.ceil((size >>> 16) / WORKGROUP_SIZE),
+                  Math.ceil((size & 0xffff) / WORKGROUP_SIZE),
+                  1
+                );
+              }
               cpass.end();
               if (timer && !timer.busy) {
                 encoder.resolveQuerySet(timer.querySet, 0, 2, timer.resolveBuf, 0);

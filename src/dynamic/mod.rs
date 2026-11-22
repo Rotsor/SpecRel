@@ -477,6 +477,7 @@ impl DynWorld {
             bvh: Bvh4D::empty(),
             materials: Scene4D::common_materials(),
             light_pos: Vec3::new(0.0, 6.5, 4.0),
+            stars: Scene4D::backdrop_stars(),
             t_min: o.t - window,
             t_max: o.t + window,
         }
@@ -547,6 +548,7 @@ impl DynWorld {
         scene.demo = fresh.demo;
         scene.materials = fresh.materials;
         scene.light_pos = fresh.light_pos;
+        scene.stars = fresh.stars;
         (scene.t_min, scene.t_max) = (fresh.t_min, fresh.t_max);
         cache.finish(Bvh4D::build(volatile), &mut scene.bvh);
     }

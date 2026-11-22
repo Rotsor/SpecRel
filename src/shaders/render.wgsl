@@ -54,7 +54,7 @@ struct Uniforms {
     prophecy_delta: f32,
     // Apexes of the cones drawn as undetermined haze (`FrameDynamics::haze_origins`).
     num_haze: u32,
-    _pad0: u32,
+    num_stars: u32,
     _pad1: u32,
     _pad2: u32,
     haze_origin: array<vec4<f32>, 5>,
@@ -97,6 +97,13 @@ struct Attr {
     decided_at: vec4<f32>,
 };
 
+// A light-emitting point (`star::PointStar`).
+struct Star {
+    event: vec4<f32>,
+    four_vel: vec4<f32>,
+    params: vec4<f32>, // (temperature, color_norm, 0, 0)
+};
+
 struct Material {
     base: vec4<f32>,    // (rgb, emission)
     checker: vec4<f32>, // (rgb, grid_scale)
@@ -107,11 +114,14 @@ struct Material {
 @group(0) @binding(1) var<storage, read> geoms: array<Geom>;
 @group(0) @binding(2) var<storage, read> attrs: array<Attr>;
 @group(0) @binding(3) var<storage, read> materials: array<Material>;
+@group(0) @binding(4) var<storage, read> stars: array<Star>;
 
 @group(1) @binding(0) var<uniform> u: Uniforms;
 // [0, 4096): gamma LUT (u8 values), then 14 glyphs x 7 rows of 5x7 font bits.
 @group(1) @binding(1) var<storage, read> tables: array<u32>;
 @group(1) @binding(2) var<storage, read_write> out_pixels: array<u32>;
+// The HDR image (level 0) and the bloom pyramid below it (`bloom.rs`'s layout).
+@group(1) @binding(3) var<storage, read_write> hdr: array<vec4<f32>>;
 
 // ---------------------------------------------------------------------------------------------
 // Scalar helpers matching Rust semantics
@@ -911,6 +921,169 @@ fn shade_hit(ray_dir: vec4<f32>, hit: HitRecord) -> vec3<f32> {
     return tint * edge;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Light-emitting points (port of `star.rs`)
+// ---------------------------------------------------------------------------------------------
+
+const STAR_KERNEL_SIGMA: f32 = 0.6;
+const STAR_KERNEL_CUTOFF_SIGMAS: f32 = 4.0;
+const WHITE_POINT_K: f32 = 6504.0;
+
+fn planck(lambda_um: f32, temperature: f32) -> f32 {
+    let x = min(14388.0 / (lambda_um * max(temperature, 1.0)), 80.0);
+    let l2 = lambda_um * lambda_um;
+    return 1.0 / (l2 * l2 * lambda_um * (exp(x) - 1.0));
+}
+
+fn blackbody_rgb(temperature: f32) -> vec3<f32> {
+    return vec3<f32>(
+        planck(0.610, temperature) / planck(0.610, WHITE_POINT_K),
+        planck(0.550, temperature) / planck(0.550, WHITE_POINT_K),
+        planck(0.465, temperature) / planck(0.465, WHITE_POINT_K),
+    );
+}
+
+// Mirrors `star::worldline_cone_event`.
+fn worldline_cone_event(st: Star, origin: vec4<f32>, e0: vec4<f32>, cone: f32) -> vec4<f32> {
+    let d0 = st.event - origin;
+    let uu = st.four_vel;
+    var s: f32;
+    if cone == 0.0 {
+        s = mdot(d0, e0) / -mdot(uu, e0);
+    } else {
+        let a = mdot(d0, d0);
+        let b = mdot(d0, uu);
+        let sq = sqrt(max(b * b + a, 0.0));
+        if cone < 0.0 {
+            s = select(b - sq, -a / (b + sq), b > 0.0);
+        } else {
+            s = select(b + sq, -a / (b - sq), b < 0.0);
+        }
+    }
+    return d0 + uu * s;
+}
+
+// Mirrors `star::star_light`: the light of every star whose event on the ray's cone passes
+// within the ray's footprint `width + spread * lambda`, unless blocked beyond `lambda_max`.
+fn star_light(origin: vec4<f32>, dir: vec4<f32>, e0: vec4<f32>, cone: f32, width: f32, spread: f32, lambda_max: f32) -> vec3<f32> {
+    let n = dir - e0 * cone;
+    var total = vec3<f32>(0.0);
+    for (var i = 0u; i < u.num_stars; i++) {
+        let st = stars[i];
+        let d = worldline_cone_event(st, origin, e0, cone);
+        let tau = -mdot(d, e0);
+        let r = d + e0 * (-tau);
+        let along = mdot(r, n);
+        if along <= 0.0 || along >= lambda_max {
+            continue;
+        }
+        let perp = r - n * along;
+        let d2 = max(mdot(perp, perp), 0.0);
+        let sigma = STAR_KERNEL_SIGMA * (width + spread * along);
+        let cut = STAR_KERNEL_CUTOFF_SIGMAS * sigma;
+        if d2 >= cut * cut {
+            continue;
+        }
+        let inv_2s2 = 1.0 / (2.0 * sigma * sigma);
+        let kernel = exp(-d2 * inv_2s2) * inv_2s2 * (1.0 / PI);
+        var doppler = 1.0;
+        if cone < 0.0 {
+            let lambda = sqrt(max(mdot(r, r), 0.0));
+            let du = mdot(d, st.four_vel);
+            if du > 0.0 {
+                doppler = lambda / du;
+            }
+        }
+        total += blackbody_rgb(st.params.x * doppler) * (st.params.y * kernel);
+    }
+    return total;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Bloom (port of `bloom.rs`): one dispatch per pyramid level, chosen by `BLOOM_LEVEL`.
+// ---------------------------------------------------------------------------------------------
+
+const BLOOM_LEVELS: u32 = 6u;
+const BLOOM_STRENGTH: f32 = 0.04;
+override BLOOM_LEVEL: u32 = 1u;
+
+fn level_size(k: u32) -> vec2<u32> {
+    var s = u.size;
+    for (var i = 0u; i < k; i++) {
+        s = (s + vec2<u32>(1u)) / 2u;
+    }
+    return s;
+}
+
+fn level_offset(k: u32) -> u32 {
+    var off = 0u;
+    var s = u.size;
+    for (var i = 0u; i < k; i++) {
+        off += s.x * s.y;
+        s = (s + vec2<u32>(1u)) / 2u;
+    }
+    return off;
+}
+
+// Level `BLOOM_LEVEL` from level `BLOOM_LEVEL - 1`: a [1 3 3 1] / 8 filter per axis.
+@compute @workgroup_size(8, 8, 1)
+fn bloom_down(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = BLOOM_LEVEL;
+    let ds = level_size(k);
+    if gid.x >= ds.x || gid.y >= ds.y {
+        return;
+    }
+    let ss = level_size(k - 1u);
+    let src = level_offset(k - 1u);
+    let wts = vec4<f32>(0.125, 0.375, 0.375, 0.125);
+    var acc = vec3<f32>(0.0);
+    for (var j = 0; j < 4; j++) {
+        let sy = u32(clamp(2 * i32(gid.y) - 1 + j, 0, i32(ss.y) - 1));
+        var row = vec3<f32>(0.0);
+        for (var i = 0; i < 4; i++) {
+            let sx = u32(clamp(2 * i32(gid.x) - 1 + i, 0, i32(ss.x) - 1));
+            row += hdr[src + sy * ss.x + sx].xyz * wts[i];
+        }
+        acc += row * wts[j];
+    }
+    hdr[level_offset(k) + gid.y * ds.x + gid.x] = vec4<f32>(acc, 0.0);
+}
+
+// Mirrors `bloom::upsample_at`: bilinear 2x upsample of level `k + 1` at pixel `p` of level `k`.
+fn upsample_at(k: u32, p: vec2<u32>) -> vec3<f32> {
+    let cs = level_size(k + 1u);
+    let off = level_offset(k + 1u);
+    let m = p / 2u;
+    let x1 = u32(clamp(select(i32(m.x) + 1, i32(m.x) - 1, p.x % 2u == 0u), 0, i32(cs.x) - 1));
+    let y1 = u32(clamp(select(i32(m.y) + 1, i32(m.y) - 1, p.y % 2u == 0u), 0, i32(cs.y) - 1));
+    let r0 = hdr[off + m.y * cs.x + m.x].xyz * 0.75 + hdr[off + m.y * cs.x + x1].xyz * 0.25;
+    let r1 = hdr[off + y1 * cs.x + m.x].xyz * 0.75 + hdr[off + y1 * cs.x + x1].xyz * 0.25;
+    return r0 * 0.75 + r1 * 0.25;
+}
+
+// Level `BLOOM_LEVEL` += the upsampled level below it (run coarsest first).
+@compute @workgroup_size(8, 8, 1)
+fn bloom_up(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = BLOOM_LEVEL;
+    let s = level_size(k);
+    if gid.x >= s.x || gid.y >= s.y {
+        return;
+    }
+    let idx = level_offset(k) + gid.y * s.x + gid.x;
+    hdr[idx] = vec4<f32>(hdr[idx].xyz + upsample_at(k, gid.xy), 0.0);
+}
+
+// Mix the halo into the full image, tone map and pack.
+@compute @workgroup_size(8, 8, 1)
+fn bloom_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= u.size.x || gid.y >= u.size.y {
+        return;
+    }
+    let idx = gid.y * u.size.x + gid.x;
+    let halo = upsample_at(0u, gid.xy) * (BLOOM_STRENGTH / f32(BLOOM_LEVELS));
+    out_pixels[idx] = pack_rgb(hdr[idx].xyz * (1.0 - BLOOM_STRENGTH) + halo);
+}
+
 // Port of `pack_rgb_with_lut`, using the exact same LUT uploaded from the CPU.
 fn pack_rgb(c: vec3<f32>) -> u32 {
     let mapped = clamp(c / (vec3<f32>(1.0) + c * 0.35), vec3<f32>(0.0), vec3<f32>(1.0));
@@ -963,5 +1136,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         color = shade_sky(ray_dir);
     }
-    out_pixels[gid.y * u.size.x + gid.x] = pack_rgb(color);
+    if u.mode == MODE_SHADED && u.num_stars > 0u {
+        // The pixel's footprint: a cone from the eye, as wide as the pixel's angular pitch.
+        let pitch = 2.0 * u.half_wh.y / h;
+        let inv_len = 1.0 / sqrt(sx * sx + sy * sy + 1.0);
+        let spread = pitch * inv_len * sqrt(inv_len);
+        var cone = 0.0;
+        if u.slice_mode == SLICE_PAST_LIGHT_CONE {
+            cone = -1.0;
+        } else if u.slice_mode == SLICE_FRONTIER {
+            cone = 1.0;
+        }
+        let lambda_max = select(1e30, t.lambda, t.found);
+        color += star_light(ray_origin, ray_dir, u.e0, cone, 0.0, spread, lambda_max);
+    }
+    hdr[gid.y * u.size.x + gid.x] = vec4<f32>(color, 0.0);
 }
